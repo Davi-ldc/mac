@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>local.slack-native</string>
+  <key>CFBundleName</key><string>Slack</string>
+  <key>CFBundleDisplayName</key><string>Slack</string>
+  <key>CFBundleExecutable</key><string>Slack Native</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.1</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>LSMinimumSystemVersion</key><string>14.4</string>
+  <key>NSPrincipalClass</key><string>NSApplication</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSSupportsAutomaticTermination</key><false/>
+  <key>NSMicrophoneUsageDescription</key><string>Slack uses the microphone when you are in a huddle.</string>
+</dict>
+</plist>

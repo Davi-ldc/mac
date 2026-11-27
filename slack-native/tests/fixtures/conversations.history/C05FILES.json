@@ -1,0 +1,486 @@
+{
+ "ok": true,
+ "messages": [
+  {
+   "type": "message",
+   "user": "U02SAM",
+   "ts": "1795403600.000106",
+   "text": "Assets and the brief",
+   "files": [
+    {
+     "id": "F16ASSETS",
+     "created": 1795400000,
+     "timestamp": 1795400000,
+     "name": "icon-assets.zip",
+     "title": "icon-assets.zip",
+     "mimetype": "application/zip",
+     "filetype": "zip",
+     "pretty_type": "Zip",
+     "user": "U02SAM",
+     "user_team": "T0NORTHWND",
+     "editable": false,
+     "size": 7340032,
+     "mode": "hosted",
+     "is_external": false,
+     "external_type": "",
+     "is_public": true,
+     "public_url_shared": false,
+     "display_as_bot": false,
+     "username": "",
+     "has_rich_preview": false,
+     "file_access": "visible",
+     "is_starred": false,
+     "skipped_shares": true,
+     "url_private": "https://files.example.com/files-pri/T0NORTHWND-F16ASSETS/icon-assets.zip",
+     "url_private_download": "https://files.example.com/files-pri/T0NORTHWND-F16ASSETS/download/icon-assets.zip",
+     "permalink": "https://northwind-studio.slack.com/files/U02SAM/F16ASSETS/icon-assets.zip",
+     "permalink_public": "https://slack-files.com/T0NORTHWND-F16ASSETS-0000000000"
+    },
+    {
+     "id": "F17BRIEF",
+     "created": 1795400000,
+     "timestamp": 1795400000,
+     "name": "brief.docx",
+     "title": "Design brief",
+     "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+     "filetype": "docx",
+     "pretty_type": "Word Document",
+     "user": "U02SAM",
+     "user_team": "T0NORTHWND",
+     "editable": false,
+     "size": 51200,
+     "mode": "hosted",
+     "is_external": false,
+     "external_type": "",
+     "is_public": true,
+     "public_url_shared": false,
+     "display_as_bot": false,
+     "username": "",
+     "has_rich_preview": false,
+     "file_access": "visible",
+     "is_starred": false,
+     "skipped_shares": true,
+     "url_private": "https://files.example.com/files-pri/T0NORTHWND-F17BRIEF/brief.docx",
+     "url_private_download": "https://files.example.com/files-pri/T0NORTHWND-F17BRIEF/download/brief.docx",
+     "permalink": "https://northwind-studio.slack.com/files/U02SAM/F17BRIEF/brief.docx",
+     "permalink_public": "https://slack-files.com/T0NORTHWND-F17BRIEF-0000000000"
+    }
+   ],
+   "upload": true,
+   "display_as_bot": false,
+   "blocks": [
+    {
+     "type": "rich_text",
+     "block_id": "f6",
+     "elements": [
+      {
+       "type": "rich_text_section",
+       "elements": [
+        {
+         "type": "text",
+         "text": "Assets and the brief"
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "type": "message",
+   "user": "U02SAM",
+   "ts": "1795403000.000105",
+   "text": "",
+   "files": [
+    {
+     "id": "F15VOICE",
+     "created": 1795400000,
+     "timestamp": 1795400000,
+     "name": "audio_message.m4a",
+     "title": "audio_message.m4a",
+     "mimetype": "audio/mp4",
+     "filetype": "m4a",
+     "pretty_type": "MPEG 4 Audio",
+     "user": "U02SAM",
+     "user_team": "T0NORTHWND",
+     "editable": false,
+     "size": 96512,
+     "mode": "hosted",
+     "is_external": false,
+     "external_type": "",
+     "is_public": true,
+     "public_url_shared": false,
+     "display_as_bot": false,
+     "username": "",
+     "has_rich_preview": false,
+     "file_access": "visible",
+     "is_starred": false,
+     "skipped_shares": true,
+     "url_private": "https://files.example.com/files-pri/T0NORTHWND-F15VOICE/audio_message.m4a",
+     "url_private_download": "https://files.example.com/files-pri/T0NORTHWND-F15VOICE/download/audio_message.m4a",
+     "permalink": "https://northwind-studio.slack.com/files/U02SAM/F15VOICE/audio_message.m4a",
+     "permalink_public": "https://slack-files.com/T0NORTHWND-F15VOICE-0000000000",
+     "subtype": "slack_audio",
+     "media_display_type": "audio",
+     "duration_ms": 14800,
+     "audio_wave_samples": [
+      0,
+      37,
+      74,
+      11,
+      48,
+      85,
+      22,
+      59,
+      96,
+      33,
+      70,
+      7,
+      44,
+      81,
+      18,
+      55,
+      92,
+      29,
+      66,
+      3,
+      40,
+      77,
+      14,
+      51,
+      88,
+      25,
+      62,
+      99,
+      36,
+      73,
+      10,
+      47,
+      84,
+      21,
+      58,
+      95,
+      32,
+      69,
+      6,
+      43,
+      80,
+      17,
+      54,
+      91,
+      28,
+      65,
+      2,
+      39,
+      76,
+      13,
+      50,
+      87,
+      24,
+      61,
+      98,
+      35,
+      72,
+      9,
+      46,
+      83
+     ],
+     "mp4": "https://files.example.com/files-tmb/T0NORTHWND-F15VOICE-cc33/audio_message.m4a",
+     "transcription": {
+      "status": "complete",
+      "locale": "en-US",
+      "preview": {
+       "content": "Quick update on the onboarding screens, the new icons are in.",
+       "has_more": false
+      }
+     }
+    }
+   ],
+   "upload": true,
+   "display_as_bot": false
+  },
+  {
+   "type": "message",
+   "user": "U02SAM",
+   "ts": "1795402400.000104",
+   "text": "",
+   "files": [
+    {
+     "id": "F14HOURS",
+     "created": 1795400000,
+     "timestamp": 1795400000,
+     "name": "hours.csv",
+     "title": "hours.csv",
+     "mimetype": "text/csv",
+     "filetype": "csv",
+     "pretty_type": "CSV",
+     "user": "U02SAM",
+     "user_team": "T0NORTHWND",
+     "editable": true,
+     "size": 4236,
+     "mode": "snippet",
+     "is_external": false,
+     "external_type": "",
+     "is_public": true,
+     "public_url_shared": false,
+     "display_as_bot": false,
+     "username": "",
+     "has_rich_preview": false,
+     "file_access": "visible",
+     "is_starred": false,
+     "skipped_shares": true,
+     "url_private": "https://files.example.com/files-pri/T0NORTHWND-F14HOURS/hours.csv",
+     "url_private_download": "https://files.example.com/files-pri/T0NORTHWND-F14HOURS/download/hours.csv",
+     "permalink": "https://northwind-studio.slack.com/files/U02SAM/F14HOURS/hours.csv",
+     "permalink_public": "https://slack-files.com/T0NORTHWND-F14HOURS-0000000000",
+     "preview": "#,Screen,Owner,Hours,Done\n1,Sign in,Sam,12,80%\n2,Inbox,Priya,7.5,40%\n3,Settings,Casey,3,100%",
+     "preview_highlight": "<div class=\"CodeMirror cm-s-default CodeMirrorServer cm-csv-tsv-wrapper\">\n<div class=\"CodeMirror-code\">\n<div class=\"cm-row cm-hide-line-num\"><div class=\"cm-col\">#</div><div class=\"cm-col\">Screen</div><div class=\"cm-col\">Owner</div><div class=\"cm-col\">Hours</div><div class=\"cm-col\">Done</div></div><div class=\"cm-row cm-hide-line-num\"><div class=\"cm-col cm-num\">1</div><div class=\"cm-col\">Sign in</div><div class=\"cm-col\">Sam</div><div class=\"cm-col cm-num\">12</div><div class=\"cm-col cm-num\">80%</div></div><div class=\"cm-row cm-hide-line-num\"><div class=\"cm-col cm-num\">2</div><div class=\"cm-col\">Inbox</div><div class=\"cm-col\">Priya</div><div class=\"cm-col cm-num\">7.5</div><div class=\"cm-col cm-num\">40%</div></div><div class=\"cm-row cm-hide-line-num\"><div class=\"cm-col cm-num\">3</div><div class=\"cm-col\">Settings</div><div class=\"cm-col\">Casey</div><div class=\"cm-col cm-num\">3</div><div class=\"cm-col cm-num\">100%</div></div></div>\n</div>\n",
+     "lines": 26,
+     "lines_more": 22,
+     "preview_is_truncated": true
+    }
+   ],
+   "upload": true,
+   "display_as_bot": false
+  },
+  {
+   "type": "message",
+   "user": "U02SAM",
+   "ts": "1795401800.000103",
+   "text": "Release notes so far",
+   "files": [
+    {
+     "id": "F13NOTES",
+     "created": 1795400000,
+     "timestamp": 1795400000,
+     "name": "release-notes.txt",
+     "title": "release-notes.txt",
+     "mimetype": "text/plain",
+     "filetype": "text",
+     "pretty_type": "Texto simples",
+     "user": "U02SAM",
+     "user_team": "T0NORTHWND",
+     "editable": true,
+     "size": 18342,
+     "mode": "snippet",
+     "is_external": false,
+     "external_type": "",
+     "is_public": true,
+     "public_url_shared": false,
+     "display_as_bot": false,
+     "username": "",
+     "has_rich_preview": false,
+     "file_access": "visible",
+     "is_starred": false,
+     "skipped_shares": true,
+     "url_private": "https://files.example.com/files-pri/T0NORTHWND-F13NOTES/release-notes.txt",
+     "url_private_download": "https://files.example.com/files-pri/T0NORTHWND-F13NOTES/download/release-notes.txt",
+     "permalink": "https://northwind-studio.slack.com/files/U02SAM/F13NOTES/release-notes.txt",
+     "permalink_public": "https://slack-files.com/T0NORTHWND-F13NOTES-0000000000",
+     "preview": "Step 1: check the colours before shipping\nStep 2: check the spacing before shipping\nStep 3: check the icons before shipping\nStep 4: check the copy before shipping\nStep 5: check the motion before shipping\nStep 6: check the states before shipping",
+     "preview_highlight": "<div class=\"CodeMirror cm-s-default CodeMirrorServer\">\n<div class=\"CodeMirror-code\">\n<div><pre>Step 1: check the colours before shipping</pre></div>\n<div><pre>Step 2: check the spacing before shipping</pre></div>\n<div><pre>Step 3: check the icons before shipping</pre></div>\n<div><pre>Step 4: check the copy before shipping</pre></div>\n<div><pre>Step 5: check the motion before shipping</pre></div>\n<div><pre>Step 6: check the states before shipping</pre></div>\n</div>\n</div>\n",
+     "lines": 212,
+     "lines_more": 206,
+     "preview_is_truncated": true
+    }
+   ],
+   "upload": true,
+   "display_as_bot": false,
+   "blocks": [
+    {
+     "type": "rich_text",
+     "block_id": "f3",
+     "elements": [
+      {
+       "type": "rich_text_section",
+       "elements": [
+        {
+         "type": "text",
+         "text": "Release notes so far"
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "type": "message",
+   "user": "U02SAM",
+   "ts": "1795401200.000102",
+   "text": "",
+   "files": [
+    {
+     "id": "F12GREET",
+     "created": 1795400000,
+     "timestamp": 1795400000,
+     "name": "greet.py",
+     "title": "greet.py",
+     "mimetype": "text/plain",
+     "filetype": "python",
+     "pretty_type": "Python",
+     "user": "U02SAM",
+     "user_team": "T0NORTHWND",
+     "editable": true,
+     "size": 412,
+     "mode": "snippet",
+     "is_external": false,
+     "external_type": "",
+     "is_public": true,
+     "public_url_shared": false,
+     "display_as_bot": false,
+     "username": "",
+     "has_rich_preview": false,
+     "file_access": "visible",
+     "is_starred": false,
+     "skipped_shares": true,
+     "url_private": "https://files.example.com/files-pri/T0NORTHWND-F12GREET/greet.py",
+     "url_private_download": "https://files.example.com/files-pri/T0NORTHWND-F12GREET/download/greet.py",
+     "permalink": "https://northwind-studio.slack.com/files/U02SAM/F12GREET/greet.py",
+     "permalink_public": "https://slack-files.com/T0NORTHWND-F12GREET-0000000000",
+     "preview": "def greet(name):\n    \"\"\"Say hello.\"\"\"\n    message = f\"Hello, {name}!\"\n    print(message)\n    return len(message)\n\nif __name__ == \"__main__\":\n    for person in [\"Ana\", \"Bo\"]:\n        greet(person)\n    total = 42 + 3.5\n    print(total)",
+     "preview_highlight": "<div class=\"CodeMirror cm-s-default CodeMirrorServer\">\n<div class=\"CodeMirror-code\">\n<div><pre><span class=\"cm-keyword\">def</span> <span class=\"cm-def\">greet</span>(<span class=\"cm-variable\">name</span>):</pre></div>\n<div><pre>    <span class=\"cm-string\">&quot;&quot;&quot;Say hello.&quot;&quot;&quot;</span></pre></div>\n<div><pre>    <span class=\"cm-variable\">message</span> <span class=\"cm-operator\">=</span> <span class=\"cm-string\">f&quot;Hello, {name}!&quot;</span></pre></div>\n<div><pre>    <span class=\"cm-builtin\">print</span>(<span class=\"cm-variable\">message</span>)</pre></div>\n<div><pre>    <span class=\"cm-keyword\">return</span> <span class=\"cm-builtin\">len</span>(<span class=\"cm-variable\">message</span>)</pre></div>\n<div><pre></pre></div>\n<div><pre><span class=\"cm-keyword\">if</span> <span class=\"cm-variable\">__name__</span> <span class=\"cm-operator\">==</span> <span class=\"cm-string\">&quot;__main__&quot;</span>:</pre></div>\n<div><pre>    <span class=\"cm-keyword\">for</span> <span class=\"cm-variable\">person</span> <span class=\"cm-keyword\">in</span> [<span class=\"cm-string\">&quot;Ana&quot;</span>, <span class=\"cm-string\">&quot;Bo&quot;</span>]:</pre></div>\n<div><pre>        <span class=\"cm-variable\">greet</span>(<span class=\"cm-variable\">person</span>)</pre></div>\n<div><pre>    <span class=\"cm-variable\">total</span> <span class=\"cm-operator\">=</span> <span class=\"cm-number\">42</span> <span class=\"cm-operator\">+</span> <span class=\"cm-number\">3.5</span></pre></div>\n<div><pre>    <span class=\"cm-builtin\">print</span>(<span class=\"cm-variable\">total</span>)</pre></div>\n</div>\n</div>\n",
+     "lines": 11,
+     "lines_more": 0,
+     "preview_is_truncated": false,
+     "edit_link": "https://northwind-studio.slack.com/files/U02SAM/F12GREET/greet.py/edit"
+    }
+   ],
+   "upload": true,
+   "display_as_bot": false
+  },
+  {
+   "type": "message",
+   "user": "U02SAM",
+   "ts": "1795400600.000101",
+   "text": "The report",
+   "files": [
+    {
+     "id": "F11REPORT",
+     "created": 1795400000,
+     "timestamp": 1795400000,
+     "name": "quarterly-report.pdf",
+     "title": "quarterly-report.pdf",
+     "mimetype": "application/pdf",
+     "filetype": "pdf",
+     "pretty_type": "PDF",
+     "user": "U02SAM",
+     "user_team": "T0NORTHWND",
+     "editable": false,
+     "size": 1029019,
+     "mode": "hosted",
+     "is_external": false,
+     "external_type": "",
+     "is_public": true,
+     "public_url_shared": false,
+     "display_as_bot": false,
+     "username": "",
+     "has_rich_preview": false,
+     "file_access": "visible",
+     "is_starred": false,
+     "skipped_shares": true,
+     "url_private": "https://files.example.com/files-pri/T0NORTHWND-F11REPORT/quarterly-report.pdf",
+     "url_private_download": "https://files.example.com/files-pri/T0NORTHWND-F11REPORT/download/quarterly-report.pdf",
+     "permalink": "https://northwind-studio.slack.com/files/U02SAM/F11REPORT/quarterly-report.pdf",
+     "permalink_public": "https://slack-files.com/T0NORTHWND-F11REPORT-0000000000",
+     "media_display_type": "unknown",
+     "thumb_pdf": "https://files.example.com/files-tmb/T0NORTHWND-F11REPORT-bb22/report_thumb_pdf.png",
+     "thumb_pdf_w": 935,
+     "thumb_pdf_h": 1210
+    }
+   ],
+   "upload": true,
+   "display_as_bot": false,
+   "blocks": [
+    {
+     "type": "rich_text",
+     "block_id": "f1",
+     "elements": [
+      {
+       "type": "rich_text_section",
+       "elements": [
+        {
+         "type": "text",
+         "text": "The report"
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "type": "message",
+   "user": "U02SAM",
+   "ts": "1795400000.000100",
+   "text": "Walkthrough recording",
+   "files": [
+    {
+     "id": "F10CLIP",
+     "created": 1795400000,
+     "timestamp": 1795400000,
+     "name": "sunset-walkthrough.mp4",
+     "title": "sunset-walkthrough.mp4",
+     "mimetype": "video/mp4",
+     "filetype": "mp4",
+     "pretty_type": "MPEG 4 Video",
+     "user": "U02SAM",
+     "user_team": "T0NORTHWND",
+     "editable": false,
+     "size": 2124164,
+     "mode": "hosted",
+     "is_external": false,
+     "external_type": "",
+     "is_public": true,
+     "public_url_shared": false,
+     "display_as_bot": false,
+     "username": "",
+     "has_rich_preview": false,
+     "file_access": "visible",
+     "is_starred": false,
+     "skipped_shares": true,
+     "url_private": "https://files.example.com/files-tmb/T0NORTHWND-F10CLIP-aa11/sunset-walkthrough.mp4",
+     "url_private_download": "https://files.example.com/files-pri/T0NORTHWND-F10CLIP/download/sunset-walkthrough.mp4",
+     "permalink": "https://northwind-studio.slack.com/files/U02SAM/F10CLIP/sunset-walkthrough.mp4",
+     "permalink_public": "https://slack-files.com/T0NORTHWND-F10CLIP-0000000000",
+     "media_display_type": "video",
+     "duration_ms": 8274,
+     "thumb_video_w": 480,
+     "thumb_video_h": 608,
+     "thumb_video": "https://files.example.com/files-tmb/T0NORTHWND-F10CLIP-aa11/clip_thumb_video.png",
+     "mp4": "https://files.example.com/files-tmb/T0NORTHWND-F10CLIP-aa11/sunset-walkthrough.mp4",
+     "transcription": {
+      "status": "none"
+     },
+     "is_transcription_region_supported": true,
+     "media_progress": {
+      "duration_ms": 8274,
+      "offset_ms": 0,
+      "max_offset_ms": 0,
+      "media_watched": false
+     }
+    }
+   ],
+   "upload": true,
+   "display_as_bot": false,
+   "blocks": [
+    {
+     "type": "rich_text",
+     "block_id": "f0",
+     "elements": [
+      {
+       "type": "rich_text_section",
+       "elements": [
+        {
+         "type": "text",
+         "text": "Walkthrough recording"
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "has_more": false
+}

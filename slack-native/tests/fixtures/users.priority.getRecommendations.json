@@ -1,0 +1,9 @@
+{
+  "ok": true,
+  "users": [
+    {"user_id": "U03PRIYA", "source": "org_chart", "reason": "manager"},
+    {"user_id": "U02SAM", "source": "activity", "reason": "frequent_collaborator"},
+    {"user_id": "U07CASEY", "source": "activity", "reason": "frequently_used"},
+    {"user_id": "U04JORDAN", "source": "activity", "reason": "frequently_used"}
+  ]
+}

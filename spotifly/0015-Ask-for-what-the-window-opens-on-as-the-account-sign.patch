@@ -1,0 +1,91 @@
+From 4817bd75e5d5892aeacbe6a08cc2a0483709a8ff Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Thu, 26 Nov 2026 15:24:24 -0300
+Subject: [PATCH 15/19] Ask for what the window opens on as the account signs
+ in, while AppKit makes the window
+
+---
+ Spotifly/PartnerAPI/PathfinderTopContent.swift |  7 +++++++
+ Spotifly/ViewModels/AuthViewModel.swift        |  6 ++++++
+ Spotifly/Views/LoggedInLifecycleModifier.swift | 16 ++++------------
+ Spotifly/Views/StartpageView.swift             |  2 +-
+ 4 files changed, 18 insertions(+), 13 deletions(-)
+
+diff --git a/Spotifly/PartnerAPI/PathfinderTopContent.swift b/Spotifly/PartnerAPI/PathfinderTopContent.swift
+index ba1230d..5d25314 100644
+--- a/Spotifly/PartnerAPI/PathfinderTopContent.swift
++++ b/Spotifly/PartnerAPI/PathfinderTopContent.swift
+@@ -16,6 +16,13 @@ nonisolated enum TopContentRange: String, CaseIterable, Encodable, Sendable {
+     case mid = "MID_TERM"
+     /// About a year.
+     case long = "LONG_TERM"
++
++    /// The start page's range, kept across launches.
++    static let storageKey = "startpageTopTracksRange"
++
++    static var stored: TopContentRange {
++        UserDefaults.standard.string(forKey: storageKey).flatMap(TopContentRange.init(rawValue:)) ?? .mid
++    }
+ }
+ 
+ /// `{ "data": { "me": { "profile": { "topArtists": …, "topTracks": … } } } }`
+diff --git a/Spotifly/ViewModels/AuthViewModel.swift b/Spotifly/ViewModels/AuthViewModel.swift
+index 6803659..66b6a38 100644
+--- a/Spotifly/ViewModels/AuthViewModel.swift
++++ b/Spotifly/ViewModels/AuthViewModel.swift
+@@ -50,6 +50,12 @@ final class AuthViewModel {
+         // This Mac's player, if the user has set Soloist up: it plays for the signed-in account,
+         // so it starts with its session, and `logout()` makes it forget the account.
+         Task { await SoloistEngine.shared.start() }
++        // What the window opens on, asked for here rather than by its tasks, which wait for
++        // AppKit to make it: the requests are out meanwhile, and the tasks join them.
++        Task { await session.profileService.loadForSession() }
++        Task { await session.homeService.loadHome() }
++        Task { try? await session.playlistService.loadUserPlaylists() }
++        Task { await session.homeService.loadTopContent(range: .stored) }
+     }
+ 
+     /// Why the last grant did not take: on the login screen while signed out, and as an alert
+diff --git a/Spotifly/Views/LoggedInLifecycleModifier.swift b/Spotifly/Views/LoggedInLifecycleModifier.swift
+index ec5ff15..c4dd85c 100644
+--- a/Spotifly/Views/LoggedInLifecycleModifier.swift
++++ b/Spotifly/Views/LoggedInLifecycleModifier.swift
+@@ -20,18 +20,10 @@ struct LoggedInLifecycleModifier: ViewModifier {
+     func body(content: Content) -> some View {
+         content
+             .task {
+-                // The session's, which outlives the window (`LoggedInSession`): this runs
+-                // again when a window reopens on it, and each step is one that does nothing
+-                // the second time, or only what a reopened window should, such as asking
+-                // again for a start page that failed. The session follows the player from the
+-                // sign-in (`AuthViewModel.startSession`), not from here.
+-                //
+-                // The profile and the start page are independent requests on the same grant, so
+-                // they run together. Neither blocks: an app that cannot say who you are is
+-                // still an app that plays music.
+-                async let profile: () = profileService.loadForSession()
+-                async let home: () = homeService.loadHome()
+-                _ = await (profile, home)
++                // The session's, which outlives the window (`LoggedInSession`): the sign-in
++                // asked for it (`AuthViewModel.startSession`), and this joins that load, or asks
++                // again for a start page that failed when a window reopens.
++                await homeService.loadHome()
+ 
+                 #if DEBUG
+                     // Headless test scaffolding: SPOTIFLY_DEBUG_AUTOPLAY=1 starts
+diff --git a/Spotifly/Views/StartpageView.swift b/Spotifly/Views/StartpageView.swift
+index e787608..246ce66 100644
+--- a/Spotifly/Views/StartpageView.swift
++++ b/Spotifly/Views/StartpageView.swift
+@@ -20,7 +20,7 @@ struct StartpageView: View {
+     @Environment(NavigationCoordinator.self) private var navigationCoordinator
+ 
+     /// The top tracks' range, kept across launches.
+-    @AppStorage("startpageTopTracksRange") private var range: TopContentRange = .mid
++    @AppStorage(TopContentRange.storageKey) private var range: TopContentRange = .mid
+     @State private var topContentFailed = false
+ 
+     /// How many playlists the row shows; "Alle anzeigen" opens the rest.
+-- 
+2.54.0 (Apple Git-157)
+

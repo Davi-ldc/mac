@@ -1,0 +1,23 @@
+{
+  "ok": true,
+  "team": {
+    "id": "T0NORTHWND",
+    "name": "Northwind Studio",
+    "url": "https://northwind-studio.slack.com/",
+    "domain": "northwind-studio",
+    "email_domain": "northwind.example",
+    "icon": {
+      "image_default": false,
+      "image_34": "https://avatars.example.com/team-88.png",
+      "image_44": "https://avatars.example.com/team-88.png",
+      "image_68": "https://avatars.example.com/team-88.png",
+      "image_88": "https://avatars.example.com/team-88.png",
+      "image_102": "https://avatars.example.com/team-102.png",
+      "image_132": "https://avatars.example.com/team-132.png",
+      "image_230": "https://avatars.example.com/team-230.png"
+    },
+    "avatar_base_url": "https://avatars.example.com/",
+    "is_verified": false,
+    "plan": "std"
+  }
+}

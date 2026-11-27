@@ -1,0 +1,1064 @@
+From 2dc0726fc49a912321bd13a9ae51718bf697f5c8 Mon Sep 17 00:00:00 2001
+From: mini <mini@local>
+Date: Fri, 27 Nov 2026 03:37:38 -0300
+Subject: [PATCH 06/10] Capture macOS shell env with sentinel framing and open
+ git repos asynchronously
+
+Frames /usr/bin/env -0 output with a unique sentinel and skips non-UTF-8
+entries cleanly, avoids permanently pinning GUI repos to /usr/bin/git or
+triggering Xcode CLT prompts before login env loads, caches directory
+environments via OnceLock, upgrades repo git binary/env asynchronously,
+and adds rename-following file_path_at_commit().
+---
+ crates/git/src/repository.rs    | 132 +++++++++++--
+ crates/project/src/git_store.rs | 324 ++++++++++++++++++++------------
+ crates/util/src/shell_env.rs    | 168 ++++++++++++++++-
+ crates/util/src/util.rs         |  31 ++-
+ 4 files changed, 513 insertions(+), 142 deletions(-)
+
+diff --git a/crates/git/src/repository.rs b/crates/git/src/repository.rs
+index e08c001..16d9407 100644
+--- a/crates/git/src/repository.rs
++++ b/crates/git/src/repository.rs
+@@ -828,6 +828,25 @@ pub trait GitRepository: Send + Sync {
+     fn load_revisions(&self, revisions: Vec<String>)
+     -> BoxFuture<'_, Result<Vec<Option<Vec<u8>>>>>;
+ 
++    /// Updates the resolved system git binary and repository shell environment once
++    /// the login/directory shell environment has loaded asynchronously.
++    fn update_environment(
++        &self,
++        _system_git_binary_path: Option<PathBuf>,
++        _env: Arc<HashMap<String, String>>,
++    ) {
++    }
++
++    /// Resolves the historical repo-relative path of `current_path` at `commit`,
++    /// following renames via `git log --follow`.
++    fn file_path_at_commit(
++        &self,
++        _commit: &str,
++        _current_path: &RepoPath,
++    ) -> BoxFuture<'_, Result<Option<String>>> {
++        async move { Ok(None) }.boxed()
++    }
++
+     fn head_sha(&self) -> BoxFuture<'_, Option<String>> {
+         async move {
+             self.revparse_batch(vec!["HEAD".into()])
+@@ -1153,13 +1172,18 @@ impl std::fmt::Debug for dyn GitRepository {
+     }
+ }
+ 
++struct GitRuntimeEnv {
++    system_git_binary_path: Option<PathBuf>,
++    any_git_binary_path: PathBuf,
++    env: Arc<HashMap<String, String>>,
++}
++
+ pub struct RealGitRepository {
+     pub git_dir: PathBuf,
+     pub common_dir: PathBuf,
+     /// `None` only for bare repositories, which do not have a working directory.
+     pub working_directory: Option<PathBuf>,
+-    pub system_git_binary_path: Option<PathBuf>,
+-    pub any_git_binary_path: PathBuf,
++    runtime_env: Arc<parking_lot::RwLock<GitRuntimeEnv>>,
+     any_git_binary_help_output: Arc<Mutex<Option<SharedString>>>,
+     executor: BackgroundExecutor,
+     is_trusted: Arc<AtomicBool>,
+@@ -1256,8 +1280,11 @@ impl RealGitRepository {
+             git_dir,
+             common_dir,
+             working_directory,
+-            system_git_binary_path,
+-            any_git_binary_path,
++            runtime_env: Arc::new(parking_lot::RwLock::new(GitRuntimeEnv {
++                system_git_binary_path,
++                any_git_binary_path,
++                env: Arc::new(HashMap::default()),
++            })),
+             executor,
+             any_git_binary_help_output: Arc::new(Mutex::new(None)),
+             is_trusted: Arc::new(AtomicBool::new(false)),
+@@ -1277,23 +1304,27 @@ impl RealGitRepository {
+     }
+ 
+     fn git_binary_in_worktree(&self) -> Result<GitBinary> {
++        let runtime = self.runtime_env.read();
+         Ok(GitBinary::new(
+-            self.any_git_binary_path.clone(),
++            runtime.any_git_binary_path.clone(),
+             self.working_directory()?,
+             self.path(),
+             self.executor.clone(),
+             self.is_trusted(),
+-        ))
++        )
++        .shared_envs(runtime.env.clone()))
+     }
+ 
+     fn git_binary(&self) -> GitBinary {
++        let runtime = self.runtime_env.read();
+         GitBinary::new(
+-            self.any_git_binary_path.clone(),
++            runtime.any_git_binary_path.clone(),
+             self.command_directory(),
+             self.path(),
+             self.executor.clone(),
+             self.is_trusted(),
+         )
++        .shared_envs(runtime.env.clone())
+     }
+ 
+     fn edit_ref(&self, edit: RefEdit) -> BoxFuture<'_, Result<()>> {
+@@ -1878,6 +1909,69 @@ impl GitRepository for RealGitRepository {
+             .boxed()
+     }
+ 
++    fn update_environment(
++        &self,
++        system_git_binary_path: Option<PathBuf>,
++        env: Arc<HashMap<String, String>>,
++    ) {
++        let mut runtime = self.runtime_env.write();
++        runtime.env = env;
++        if let Some(path) = system_git_binary_path {
++            let changed = runtime.any_git_binary_path != path;
++            runtime.system_git_binary_path = Some(path.clone());
++            runtime.any_git_binary_path = path;
++            drop(runtime);
++            if changed {
++                *self.any_git_binary_help_output.lock() = None;
++            }
++        }
++    }
++
++    fn file_path_at_commit(
++        &self,
++        commit: &str,
++        current_path: &RepoPath,
++    ) -> BoxFuture<'_, Result<Option<String>>> {
++        let git = self.git_binary();
++        let target_commit = commit.to_string();
++        let path_arg = current_path.as_unix_str().to_string();
++        self.executor
++            .spawn(async move {
++                let output = git
++                    .build_command(&[
++                        "log",
++                        "--follow",
++                        "--format=COMMIT:%H",
++                        "--name-only",
++                        "-z",
++                        "--",
++                        &path_arg,
++                    ])
++                    .output()
++                    .await?;
++                if !output.status.success() {
++                    return Ok(None);
++                }
++                let mut found_commit = false;
++                for token in output.stdout.split(|&byte| byte == 0) {
++                    if found_commit {
++                        let path_bytes = token.strip_prefix(b"\n").unwrap_or(token);
++                        if !path_bytes.is_empty() {
++                            return Ok(std::str::from_utf8(path_bytes).ok().map(str::to_string));
++                        }
++                        continue;
++                    }
++                    if let Some(sha) = token.strip_prefix(b"COMMIT:")
++                        && sha == target_commit.as_bytes()
++                    {
++                        found_commit = true;
++                    }
++                }
++                Ok(None)
++            })
++            .boxed()
++    }
++
+     fn merge_message(&self) -> BoxFuture<'_, Option<String>> {
+         let path = self.path().join("MERGE_MSG");
+         self.executor
+@@ -2363,13 +2457,16 @@ impl GitRepository for RealGitRepository {
+         worktree_path: PathBuf,
+         create: bool,
+     ) -> BoxFuture<'_, Result<()>> {
++        let runtime = self.runtime_env.read();
+         let git_binary = GitBinary::new(
+-            self.any_git_binary_path.clone(),
++            runtime.any_git_binary_path.clone(),
+             worktree_path,
+             self.path(),
+             self.executor.clone(),
+             self.is_trusted(),
+-        );
++        )
++        .shared_envs(runtime.env.clone());
++        drop(runtime);
+ 
+         self.executor
+             .spawn(async move {
+@@ -2854,7 +2951,7 @@ impl GitRepository for RealGitRepository {
+         let working_directory = self.command_directory();
+         let git_directory = self.path();
+         let executor = cx.background_executor().clone();
+-        let git_binary_path = self.system_git_binary_path.clone();
++        let git_binary_path = self.runtime_env.read().system_git_binary_path.clone();
+         let is_trusted = self.is_trusted();
+         // Note: Do not spawn this command on the background thread, it might pop open the credential helper
+         // which we want to block on.
+@@ -2896,7 +2993,7 @@ impl GitRepository for RealGitRepository {
+         let working_directory = self.command_directory();
+         let git_directory = self.path();
+         let executor = cx.background_executor().clone();
+-        let git_binary_path = self.system_git_binary_path.clone();
++        let git_binary_path = self.runtime_env.read().system_git_binary_path.clone();
+         let is_trusted = self.is_trusted();
+         // Note: Do not spawn this command on the background thread, it might pop open the credential helper
+         // which we want to block on.
+@@ -2935,7 +3032,7 @@ impl GitRepository for RealGitRepository {
+         let working_directory = self.command_directory();
+         let git_directory = self.path();
+         let remote_name = format!("{}", fetch_options);
+-        let git_binary_path = self.system_git_binary_path.clone();
++        let git_binary_path = self.runtime_env.read().system_git_binary_path.clone();
+         let executor = cx.background_executor().clone();
+         let is_trusted = self.is_trusted();
+         // Note: Do not spawn this command on the background thread, it might pop open the credential helper
+@@ -3684,7 +3781,7 @@ pub(crate) struct GitBinary {
+     git_directory: PathBuf,
+     executor: BackgroundExecutor,
+     index_file_path: Option<PathBuf>,
+-    envs: HashMap<String, String>,
++    envs: Arc<HashMap<String, String>>,
+     is_trusted: bool,
+ }
+ 
+@@ -3702,12 +3799,17 @@ impl GitBinary {
+             git_directory,
+             executor,
+             index_file_path: None,
+-            envs: HashMap::default(),
++            envs: Arc::new(HashMap::default()),
+             is_trusted,
+         }
+     }
+ 
+     fn envs(mut self, envs: HashMap<String, String>) -> Self {
++        self.envs = Arc::new(envs);
++        self
++    }
++
++    fn shared_envs(mut self, envs: Arc<HashMap<String, String>>) -> Self {
+         self.envs = envs;
+         self
+     }
+@@ -3836,7 +3938,7 @@ impl GitBinary {
+         if let Some(index_file_path) = self.index_file_path.as_ref() {
+             command.env("GIT_INDEX_FILE", index_file_path);
+         }
+-        command.envs(&self.envs);
++        command.envs(self.envs.iter());
+         command
+     }
+ 
+diff --git a/crates/project/src/git_store.rs b/crates/project/src/git_store.rs
+index 0cbceb9..e198011 100644
+--- a/crates/project/src/git_store.rs
++++ b/crates/project/src/git_store.rs
+@@ -775,7 +775,43 @@ impl std::ops::Deref for Repository {
+ pub struct LocalRepositoryState {
+     pub fs: Arc<dyn Fs>,
+     pub backend: Arc<dyn GitRepository>,
+-    pub environment: Arc<HashMap<String, String>>,
++    project_environment: WeakEntity<ProjectEnvironment>,
++    work_directory_abs_path: Arc<Path>,
++    cached_environment: Arc<std::sync::OnceLock<Arc<HashMap<String, String>>>>,
++}
++
++/// Resolves an initial git binary without waiting on a per-repo login shell and
++/// without touching macOS's `/usr/bin/git` shim when Xcode CLT is not installed.
++fn find_initial_git_binary() -> Option<PathBuf> {
++    #[cfg(target_os = "macos")]
++    {
++        let has_clt = || {
++            Path::new("/Library/Developer/CommandLineTools/usr/bin/git").is_file()
++                || Path::new("/Applications/Xcode.app/Contents/Developer/usr/bin/git").is_file()
++        };
++        if !util::is_login_shell_environment_loaded() {
++            // Avoid reading PATH via getenv concurrently with load_login_shell_environment.
++            for candidate in ["/opt/homebrew/bin/git", "/usr/local/bin/git"] {
++                let path = Path::new(candidate);
++                if path.is_file() {
++                    return Some(path.to_path_buf());
++                }
++            }
++            if has_clt() && Path::new("/usr/bin/git").is_file() {
++                return Some(PathBuf::from("/usr/bin/git"));
++            }
++            return None;
++        }
++        let path = which::which("git").ok()?;
++        if path == Path::new("/usr/bin/git") && !has_clt() {
++            return None;
++        }
++        Some(path)
++    }
++    #[cfg(not(target_os = "macos"))]
++    {
++        which::which("git").ok()
++    }
+ }
+ 
+ impl LocalRepositoryState {
+@@ -785,39 +821,114 @@ impl LocalRepositoryState {
+         project_environment: WeakEntity<ProjectEnvironment>,
+         fs: Arc<dyn Fs>,
+         is_trusted: bool,
++        repo: WeakEntity<Repository>,
+         cx: &mut AsyncApp,
+     ) -> anyhow::Result<Self> {
+-        let environment = project_environment
++        let cached_environment = Arc::new(std::sync::OnceLock::new());
++        let initial_git = cx
++            .background_spawn(async { find_initial_git_binary() })
++            .await;
++        let system_git = if initial_git.is_some() {
++            initial_git
++        } else {
++            let environment = project_environment
+                 .update(cx, |project_environment, cx| {
+-                    project_environment.local_directory_environment(&Shell::System, work_directory_abs_path.clone(), cx)
++                    project_environment.local_directory_environment(
++                        &Shell::System,
++                        work_directory_abs_path.clone(),
++                        cx,
++                    )
+                 })?
+-                .await
+-                .unwrap_or_else(|| {
+-                    log::error!("failed to get working directory environment for repository {work_directory_abs_path:?}");
+-                    HashMap::default()
+-                });
+-        let search_paths = environment.get("PATH").map(|val| val.to_owned());
++                .await;
++            let search_paths = environment
++                .as_ref()
++                .and_then(|env| env.get("PATH").cloned());
++            if let Some(environment) = environment {
++                let _ = cached_environment.set(Arc::new(environment));
++            }
++            let work_dir = work_directory_abs_path.clone();
++            cx.background_spawn(async move {
++                search_paths.and_then(|paths| which::which_in("git", Some(paths), &work_dir).ok())
++            })
++            .await
++        };
+         let backend = cx
+             .background_spawn({
+                 let fs = fs.clone();
++                let open_git = system_git.clone();
+                 async move {
+-                    let system_git_binary_path = search_paths
+-                        .and_then(|search_paths| {
+-                            which::which_in("git", Some(search_paths), &work_directory_abs_path)
+-                                .ok()
+-                        })
+-                        .or_else(|| which::which("git").ok());
+-                    fs.open_repo(&dot_git_abs_path, system_git_binary_path.as_deref())
++                    fs.open_repo(&dot_git_abs_path, open_git.as_deref())
+                         .with_context(|| format!("opening repository at {dot_git_abs_path:?}"))
+                 }
+             })
+             .await?;
+         backend.set_trusted(is_trusted);
+-        Ok(LocalRepositoryState {
++        if let Some(env) = cached_environment.get() {
++            backend.update_environment(system_git, env.clone());
++        }
++        let state = LocalRepositoryState {
+             backend,
+-            environment: Arc::new(environment),
++            project_environment,
++            work_directory_abs_path,
++            cached_environment,
+             fs,
+-        })
++        };
++        if state.cached_environment.get().is_none() {
++            // Upgrade the repository's git binary (e.g. Homebrew/Nix over /usr/bin/git)
++            // and populate repo PATH/env for read/write git jobs once the directory shell
++            // environment loads, then refresh repo status under the full environment.
++            let state_for_upgrade = state.clone();
++            cx.spawn(async move |cx| {
++                let _ = state_for_upgrade.environment(cx).await;
++                if state_for_upgrade.cached_environment.get().is_some() {
++                    let _ = repo.update(cx, |repo, cx| {
++                        repo.schedule_scan(None, cx);
++                    });
++                }
++            })
++            .detach();
++        }
++        Ok(state)
++    }
++
++    async fn environment(&self, cx: &mut AsyncApp) -> Arc<HashMap<String, String>> {
++        if let Some(env) = self.cached_environment.get() {
++            return env.clone();
++        }
++        let task = self
++            .project_environment
++            .update(cx, |project_environment, cx| {
++                project_environment.local_directory_environment(
++                    &Shell::System,
++                    self.work_directory_abs_path.clone(),
++                    cx,
++                )
++            })
++            .ok();
++        let env = match task {
++            Some(task) => task.await,
++            None => None,
++        };
++        let Some(env) = env else {
++            log::error!(
++                "failed to get working directory environment for repository {:?}",
++                self.work_directory_abs_path
++            );
++            return Arc::new(HashMap::default());
++        };
++        let env = Arc::new(env);
++        let resolved_git = if let Some(search_paths) = env.get("PATH").cloned() {
++            let work_dir = self.work_directory_abs_path.clone();
++            cx.background_spawn(async move {
++                which::which_in("git", Some(search_paths), &work_dir).ok()
++            })
++            .await
++        } else {
++            None
++        };
++        self.backend.update_environment(resolved_git, env.clone());
++        let _ = self.cached_environment.set(env.clone());
++        env
+     }
+ }
+ 
+@@ -6494,6 +6605,7 @@ impl Repository {
+         let work_directory_abs_path = self.snapshot.work_directory_abs_path.clone();
+         let dot_git_abs_path = self.snapshot.dot_git_abs_path.clone();
+ 
++        let repo = cx.weak_entity();
+         let state = cx
+             .spawn(async move |_, cx| {
+                 LocalRepositoryState::new(
+@@ -6502,6 +6614,7 @@ impl Repository {
+                     project_environment,
+                     fs,
+                     is_trusted,
++                    repo,
+                     cx,
+                 )
+                 .await
+@@ -7119,15 +7232,13 @@ impl Repository {
+                 this.send_job(
+                     "checkout_files",
+                     Some(description.into()),
+-                    move |git_repo, _| async move {
++                    move |git_repo, mut cx| async move {
+                         match git_repo {
+-                            RepositoryState::Local(LocalRepositoryState {
+-                                backend,
+-                                environment,
+-                                ..
+-                            }) => {
+-                                backend
+-                                    .checkout_files(commit, paths, environment.clone())
++                            RepositoryState::Local(local) => {
++                                let environment = local.environment(&mut cx).await;
++                                local
++                                    .backend
++                                    .checkout_files(commit, paths, environment)
+                                     .await
+                             }
+                             RepositoryState::Remote(RemoteRepositoryState {
+@@ -7164,13 +7275,12 @@ impl Repository {
+     ) -> oneshot::Receiver<Result<()>> {
+         let id = self.id;
+ 
+-        let receiver = self.send_job("reset", None, move |git_repo, _| async move {
++        let receiver = self.send_job("reset", None, move |git_repo, mut cx| async move {
+             match git_repo {
+-                RepositoryState::Local(LocalRepositoryState {
+-                    backend,
+-                    environment,
+-                    ..
+-                }) => backend.reset(commit, reset_mode, environment).await,
++                RepositoryState::Local(local) => {
++                    let environment = local.environment(&mut cx).await;
++                    local.backend.reset(commit, reset_mode, environment).await
++                }
+                 RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                     client
+                         .request(proto::GitReset {
+@@ -8126,15 +8236,12 @@ impl Repository {
+                                 .unwrap_or_default();
+ 
+                             let result = match git_repo {
+-                                RepositoryState::Local(LocalRepositoryState {
+-                                    backend,
+-                                    environment,
+-                                    ..
+-                                }) => {
++                                RepositoryState::Local(local) => {
++                                    let environment = local.environment(&mut cx).await;
+                                     if stage {
+-                                        backend.stage_paths(entries, environment.clone()).await
++                                        local.backend.stage_paths(entries, environment).await
+                                     } else {
+-                                        backend.unstage_paths(entries, environment.clone()).await
++                                        local.backend.unstage_paths(entries, environment).await
+                                     }
+                                 }
+                                 RepositoryState::Remote(RemoteRepositoryState {
+@@ -8308,13 +8415,12 @@ impl Repository {
+ 
+         cx.spawn(async move |this, cx| {
+             this.update(cx, |this, _| {
+-                this.send_job("stash_entries", None, move |git_repo, _cx| async move {
++                this.send_job("stash_entries", None, move |git_repo, mut cx| async move {
+                     match git_repo {
+-                        RepositoryState::Local(LocalRepositoryState {
+-                            backend,
+-                            environment,
+-                            ..
+-                        }) => backend.stash_paths(entries, message, environment).await,
++                        RepositoryState::Local(local) => {
++                            let environment = local.environment(&mut cx).await;
++                            local.backend.stash_paths(entries, message, environment).await
++                        }
+                         RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                             client
+                                 .request(proto::Stash {
+@@ -8347,13 +8453,12 @@ impl Repository {
+ 
+         cx.spawn(async move |this, cx| {
+             this.update(cx, |this, _| {
+-                this.send_job("stash_staged", None, move |git_repo, _cx| async move {
++                this.send_job("stash_staged", None, move |git_repo, mut cx| async move {
+                     match git_repo {
+-                        RepositoryState::Local(LocalRepositoryState {
+-                            backend,
+-                            environment,
+-                            ..
+-                        }) => backend.stash_staged(message, environment).await,
++                        RepositoryState::Local(local) => {
++                            let environment = local.environment(&mut cx).await;
++                            local.backend.stash_staged(message, environment).await
++                        }
+                         RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                             client
+                                 .request(proto::Stash {
+@@ -8382,13 +8487,12 @@ impl Repository {
+         let id = self.id;
+         cx.spawn(async move |this, cx| {
+             this.update(cx, |this, _| {
+-                this.send_job("stash_pop", None, move |git_repo, _cx| async move {
++                this.send_job("stash_pop", None, move |git_repo, mut cx| async move {
+                     match git_repo {
+-                        RepositoryState::Local(LocalRepositoryState {
+-                            backend,
+-                            environment,
+-                            ..
+-                        }) => backend.stash_pop(index, environment).await,
++                        RepositoryState::Local(local) => {
++                            let environment = local.environment(&mut cx).await;
++                            local.backend.stash_pop(index, environment).await
++                        }
+                         RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                             client
+                                 .request(proto::StashPop {
+@@ -8416,13 +8520,12 @@ impl Repository {
+         let id = self.id;
+         cx.spawn(async move |this, cx| {
+             this.update(cx, |this, _| {
+-                this.send_job("stash_apply", None, move |git_repo, _cx| async move {
++                this.send_job("stash_apply", None, move |git_repo, mut cx| async move {
+                     match git_repo {
+-                        RepositoryState::Local(LocalRepositoryState {
+-                            backend,
+-                            environment,
+-                            ..
+-                        }) => backend.stash_apply(index, environment).await,
++                        RepositoryState::Local(local) => {
++                            let environment = local.environment(&mut cx).await;
++                            local.backend.stash_apply(index, environment).await
++                        }
+                         RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                             client
+                                 .request(proto::StashApply {
+@@ -8549,15 +8652,12 @@ impl Repository {
+         let this = cx.weak_entity();
+         self.send_job("stash_drop", None, move |git_repo, mut cx| async move {
+             match git_repo {
+-                RepositoryState::Local(LocalRepositoryState {
+-                    backend,
+-                    environment,
+-                    ..
+-                }) => {
++                RepositoryState::Local(local) => {
++                    let environment = local.environment(&mut cx).await;
+                     // TODO would be nice to not have to do this manually
+-                    let result = backend.stash_drop(index, environment).await;
++                    let result = local.backend.stash_drop(index, environment).await;
+                     if result.is_ok()
+-                        && let Ok(stash_entries) = backend.stash_entries().await
++                        && let Ok(stash_entries) = local.backend.stash_entries().await
+                     {
+                         let snapshot = this.update(&mut cx, |this, cx| {
+                             this.snapshot.stash_entries = stash_entries;
+@@ -8598,13 +8698,12 @@ impl Repository {
+         self.send_job(
+             "run_hook",
+             Some(format!("git hook {}", hook.as_str()).into()),
+-            move |git_repo, _cx| async move {
++            move |git_repo, mut cx| async move {
+                 match git_repo {
+-                    RepositoryState::Local(LocalRepositoryState {
+-                        backend,
+-                        environment,
+-                        ..
+-                    }) => backend.run_hook(hook, environment.clone()).await,
++                    RepositoryState::Local(local) => {
++                        let environment = local.environment(&mut cx).await;
++                        local.backend.run_hook(hook, environment).await
++                    }
+                     RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+                         client
+                             .request(proto::RunGitHook {
+@@ -8636,14 +8735,12 @@ impl Repository {
+         self.send_job(
+             "commit",
+             Some("git commit".into()),
+-            move |git_repo, _cx| async move {
++            move |git_repo, mut cx| async move {
+                 match git_repo {
+-                    RepositoryState::Local(LocalRepositoryState {
+-                        backend,
+-                        environment,
+-                        ..
+-                    }) => {
+-                        backend
++                    RepositoryState::Local(local) => {
++                        let environment = local.environment(&mut cx).await;
++                        local
++                            .backend
+                             .commit(message, name_and_email, options, askpass, environment)
+                             .await
+                     }
+@@ -8858,19 +8955,18 @@ impl Repository {
+         let status = askpass.is_some().then(|| "git fetch".into());
+         self.send_job("fetch", status, move |git_repo, mut cx| async move {
+             match git_repo {
+-                RepositoryState::Local(LocalRepositoryState {
+-                    backend,
+-                    environment,
+-                    ..
+-                }) => {
+-                    if askpass.is_none() && !backend.is_trusted() {
++                RepositoryState::Local(local) => {
++                    if askpass.is_none() && !local.backend.is_trusted() {
+                         bail!("auto-fetch requires a trusted repository");
+                     }
+-                    let result = backend
++                    let environment = local.environment(&mut cx).await;
++                    let result = local
++                        .backend
+                         .fetch(fetch_options, askpass, environment, cx.clone())
+                         .await;
+                     if result.is_ok() {
+-                        Self::refresh_branch_list(&this, backend, updates_tx, &mut cx).await?;
++                        Self::refresh_branch_list(&this, local.backend, updates_tx, &mut cx)
++                            .await?;
+                     }
+                     result
+                 }
+@@ -8935,25 +9031,24 @@ impl Repository {
+             Some(format!("git push {} {} {}:{}", args, remote, branch, remote_branch).into()),
+             move |git_repo, mut cx| async move {
+                 match git_repo {
+-                    RepositoryState::Local(LocalRepositoryState {
+-                        backend,
+-                        environment,
+-                        ..
+-                    }) => {
+-                        let result = backend
++                    RepositoryState::Local(local) => {
++                        let environment = local.environment(&mut cx).await;
++                        let result = local
++                            .backend
+                             .push(
+                                 branch.to_string(),
+                                 remote_branch.to_string(),
+                                 remote.to_string(),
+                                 options,
+                                 askpass,
+-                                environment.clone(),
++                                environment,
+                                 cx.clone(),
+                             )
+                             .await;
+                         // TODO would be nice to not have to do this manually
+                         if result.is_ok() {
+-                            Self::refresh_branch_list(&this, backend, updates_tx, &mut cx).await?;
++                            Self::refresh_branch_list(&this, local.backend, updates_tx, &mut cx)
++                                .await?;
+                         }
+                         result
+                     }
+@@ -9012,20 +9107,18 @@ impl Repository {
+         self.send_job(
+             "pull",
+             Some(status.into()),
+-            move |git_repo, cx| async move {
++            move |git_repo, mut cx| async move {
+                 match git_repo {
+-                    RepositoryState::Local(LocalRepositoryState {
+-                        backend,
+-                        environment,
+-                        ..
+-                    }) => {
+-                        backend
++                    RepositoryState::Local(local) => {
++                        let environment = local.environment(&mut cx).await;
++                        local
++                            .backend
+                             .pull(
+                                 branch.as_ref().map(|b| b.to_string()),
+                                 remote.to_string(),
+                                 rebase,
+                                 askpass,
+-                                environment.clone(),
++                                environment,
+                                 cx,
+                             )
+                             .await
+@@ -9078,21 +9171,18 @@ impl Repository {
+                 );
+ 
+                 match git_repo {
+-                    RepositoryState::Local(LocalRepositoryState {
+-                        fs,
+-                        backend,
+-                        environment,
+-                        ..
+-                    }) => {
+-                        let executable = match fs.metadata(&abs_path).await {
++                    RepositoryState::Local(local) => {
++                        let executable = match local.fs.metadata(&abs_path).await {
+                             Ok(Some(meta)) => meta.is_executable,
+                             Ok(None) => false,
+                             Err(_err) => false,
+                         };
+                         let content =
+                             content.map(|content| encode_text(content, encoding, has_bom));
+-                        backend
+-                            .set_index_text(path.clone(), content, environment.clone(), executable)
++                        let environment = local.environment(&mut cx).await;
++                        local
++                            .backend
++                            .set_index_text(path.clone(), content, environment, executable)
+                             .await?;
+                     }
+                     RepositoryState::Remote(RemoteRepositoryState { project_id, client }) => {
+diff --git a/crates/util/src/shell_env.rs b/crates/util/src/shell_env.rs
+index 5dea7d6..717ecdf 100644
+--- a/crates/util/src/shell_env.rs
++++ b/crates/util/src/shell_env.rs
+@@ -71,6 +71,54 @@ fn parse_env_output(
+     }
+ }
+ 
++#[cfg(target_os = "macos")]
++fn parse_nul_env_map(
++    output: &[u8],
++    sentinel: &[u8],
++) -> Result<collections::HashMap<String, String>> {
++    let mut marker = Vec::with_capacity(sentinel.len() + 1);
++    marker.extend_from_slice(sentinel);
++    marker.push(0);
++    let Some(marker_pos) = output
++        .windows(marker.len())
++        .position(|window| window == marker.as_slice())
++    else {
++        anyhow::bail!(
++            "Failed to find environment sentinel in shell output: {}",
++            String::from_utf8_lossy(output)
++        );
++    };
++    let payload = &output[marker_pos + marker.len()..];
++
++    let mut env_map = collections::HashMap::default();
++    for entry in payload.split(|&byte| byte == 0) {
++        if entry.is_empty() {
++            continue;
++        }
++        let Some(eq_pos) = entry.iter().position(|&byte| byte == b'=') else {
++            continue;
++        };
++        if eq_pos == 0 {
++            continue;
++        }
++        let (Ok(key), Ok(value)) = (
++            std::str::from_utf8(&entry[..eq_pos]),
++            std::str::from_utf8(&entry[eq_pos + 1..]),
++        ) else {
++            log::debug!("skipping non-UTF-8 environment variable entry from login shell");
++            continue;
++        };
++        env_map.insert(key.to_owned(), value.to_owned());
++    }
++    if env_map.is_empty() {
++        anyhow::bail!(
++            "Failed to find environment variables in shell output: {}",
++            String::from_utf8_lossy(payload)
++        );
++    }
++    Ok(env_map)
++}
++
+ #[cfg(unix)]
+ async fn capture_unix(
+     shell_path: &Path,
+@@ -82,7 +130,11 @@ async fn capture_unix(
+     use crate::command::new_std_command;
+ 
+     let shell_kind = ShellKind::new(shell_path, false);
+-    let quoted_zed_path = super::get_shell_safe_zed_path(shell_kind)?;
++    // On macOS, `/usr/bin/env -0` prints NUL-delimited variables on the dedicated pipe fd
++    // without re-execing the full Zed binary (which pays code-signature verification on every
++    // spawn). Exotic shells keep `--printenv`.
++    let use_system_env =
++        cfg!(target_os = "macos") && matches!(shell_kind, ShellKind::Posix | ShellKind::Fish);
+ 
+     let mut command_string = String::new();
+     let mut command = new_std_command(shell_path);
+@@ -123,12 +175,48 @@ async fn capture_unix(
+         .try_quote(&dir_str)
+         .context("unexpected null in directory name")?;
+ 
++    #[cfg(target_os = "macos")]
++    let env_sentinel = if use_system_env {
++        use std::sync::atomic::{AtomicU64, Ordering};
++        static CAPTURE_SEQ: AtomicU64 = AtomicU64::new(0);
++        Some(format!(
++            "__ZED_ENV_START_{}_{}__",
++            std::process::id(),
++            CAPTURE_SEQ.fetch_add(1, Ordering::Relaxed)
++        ))
++    } else {
++        None
++    };
++
+     // cd into the directory, triggering directory specific side-effects (asdf, direnv, etc)
+     command_string.push_str(&format!("cd {};", quoted_dir));
+     if let Some(prefix) = shell_kind.command_prefix() {
+         command_string.push(prefix);
+     }
+-    command_string.push_str(&format!("{} --printenv {}", quoted_zed_path, redir));
++    if use_system_env {
++        #[cfg(target_os = "macos")]
++        {
++            let sentinel = env_sentinel.as_deref().unwrap_or_default();
++            match shell_kind {
++                ShellKind::Fish => command_string.push_str(&format!(
++                    "begin; /usr/bin/printf '%s\\000' '{}'; /usr/bin/env -0; end {}",
++                    sentinel, redir
++                )),
++                _ => command_string.push_str(&format!(
++                    "{{ /usr/bin/printf '%s\\000' '{}'; /usr/bin/env -0; }} {}",
++                    sentinel, redir
++                )),
++            }
++        }
++        #[cfg(not(target_os = "macos"))]
++        {
++            let quoted_zed_path = super::get_shell_safe_zed_path(shell_kind)?;
++            command_string.push_str(&format!("{} --printenv {}", quoted_zed_path, redir));
++        }
++    } else {
++        let quoted_zed_path = super::get_shell_safe_zed_path(shell_kind)?;
++        command_string.push_str(&format!("{} --printenv {}", quoted_zed_path, redir));
++    }
+ 
+     if let ShellKind::Nushell = shell_kind {
+         command_string.push_str("; exit");
+@@ -139,6 +227,35 @@ async fn capture_unix(
+     super::set_pre_exec_to_start_new_session(&mut command);
+ 
+     let (env_output, process_output) = spawn_and_read_fd(command, fd_num).await?;
++
++    #[cfg(target_os = "macos")]
++    if use_system_env {
++        let sentinel = env_sentinel.as_deref().unwrap_or_default().as_bytes();
++        return match parse_nul_env_map(&env_output, sentinel) {
++            Ok(env_map) => {
++                if !process_output.status.success() {
++                    log::warn!(
++                        "login shell exited with {} but environment was captured successfully. stderr: {:?}",
++                        process_output.status,
++                        String::from_utf8_lossy(&process_output.stderr),
++                    );
++                }
++                Ok(env_map)
++            }
++            Err(parse_error) => {
++                if !process_output.status.success() {
++                    anyhow::bail!(
++                        "login shell exited with {}. stdout: {:?}, stderr: {:?}. {parse_error}",
++                        process_output.status,
++                        String::from_utf8_lossy(&process_output.stdout),
++                        String::from_utf8_lossy(&process_output.stderr),
++                    );
++                }
++                Err(parse_error)
++            }
++        };
++    }
++
+     let env_output = String::from_utf8_lossy(&env_output);
+ 
+     parse_env_output(
+@@ -188,9 +305,10 @@ async fn spawn_and_read_fd(
+     child_fd: std::os::fd::RawFd,
+ ) -> anyhow::Result<(Vec<u8>, std::process::Output)> {
+     use command_fds::{CommandFdExt, FdMapping};
+-    use std::{io::Read, process::Stdio};
++    use futures::AsyncReadExt as _;
++    use std::process::Stdio;
+ 
+-    let (mut reader, writer) = std::io::pipe()?;
++    let (reader, writer) = std::io::pipe()?;
+ 
+     command.fd_mappings(vec![FdMapping {
+         parent_fd: writer.into(),
+@@ -203,10 +321,15 @@ async fn spawn_and_read_fd(
+         .stderr(Stdio::piped())
+         .spawn()?;
+ 
+-    let mut buffer = Vec::new();
+-    reader.read_to_end(&mut buffer)?;
++    let mut async_reader = smol::Async::new(reader)?;
++    let read_env = async {
++        let mut buffer = Vec::new();
++        async_reader.read_to_end(&mut buffer).await?;
++        Ok::<_, std::io::Error>(buffer)
++    };
++    let (buffer, output) = futures::future::try_join(read_env, process.output()).await?;
+ 
+-    Ok((buffer, process.output().await?))
++    Ok((buffer, output))
+ }
+ 
+ #[cfg(windows)]
+@@ -379,4 +502,35 @@ mod tests {
+             Some(path!("/bin/zsh"))
+         );
+     }
++
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn parse_nul_env_map_handles_sentinel_noise_multiline_and_non_utf8() {
++        let sentinel = b"__ZED_ENV_START_TEST__";
++        let mut raw = Vec::new();
++        raw.extend_from_slice(b"noisy stdout before sentinel=broken");
++        raw.extend_from_slice(sentinel);
++        raw.push(0);
++        raw.extend_from_slice(b"PATH=/usr/bin:/bin\0MULTI=line1\nline2=still_val\0EMPTY=\0INVALID\0");
++        raw.extend_from_slice(b"BAD_VAL=foo\xffbar\0BAD_\xffKEY=baz\0AFTER=ok\0");
++        let env_map = parse_nul_env_map(&raw, sentinel).unwrap();
++        assert_eq!(env_map.get("PATH").map(String::as_str), Some("/usr/bin:/bin"));
++        assert_eq!(
++            env_map.get("MULTI").map(String::as_str),
++            Some("line1\nline2=still_val")
++        );
++        assert_eq!(env_map.get("EMPTY").map(String::as_str), Some(""));
++        assert_eq!(env_map.get("AFTER").map(String::as_str), Some("ok"));
++        assert!(!env_map.contains_key("INVALID"));
++        assert!(!env_map.contains_key("BAD_VAL"));
++        assert!(!env_map.contains_key("noisy stdout before sentinel"));
++        assert!(parse_nul_env_map(b"PATH=/usr/bin\0", sentinel).is_err());
++    }
++
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn capture_macos_zsh_environment() {
++        let env_map = smol::block_on(capture("/bin/zsh", &[], "/tmp")).unwrap();
++        assert!(env_map.contains_key("PATH"));
++    }
+ }
+diff --git a/crates/util/src/util.rs b/crates/util/src/util.rs
+index df08f04..6b45c5d 100644
+--- a/crates/util/src/util.rs
++++ b/crates/util/src/util.rs
+@@ -389,6 +389,20 @@ pub fn get_zed_cli_path() -> Result<PathBuf> {
+         })
+ }
+ 
++#[cfg(unix)]
++static LOGIN_SHELL_ENV_LOADED: std::sync::atomic::AtomicBool =
++    std::sync::atomic::AtomicBool::new(false);
++
++#[cfg(unix)]
++pub fn is_login_shell_environment_loaded() -> bool {
++    LOGIN_SHELL_ENV_LOADED.load(std::sync::atomic::Ordering::Acquire)
++}
++
++#[cfg(unix)]
++pub fn mark_login_shell_environment_loaded() {
++    LOGIN_SHELL_ENV_LOADED.store(true, std::sync::atomic::Ordering::Release);
++}
++
+ #[cfg(unix)]
+ pub async fn load_login_shell_environment() -> Result<()> {
+     use anyhow::Context as _;
+@@ -400,10 +414,17 @@ pub async fn load_login_shell_environment() -> Result<()> {
+     // into shell's `cd` command (and hooks) to manipulate env.
+     // We do this so that we get the env a user would have when spawning a shell
+     // in home directory.
+-    for (name, value) in shell_env::capture(get_system_shell(), &[], paths::home_dir())
++    let result = shell_env::capture(get_system_shell(), &[], paths::home_dir())
+         .await
+-        .with_context(|| format!("capturing environment with {:?}", get_system_shell()))?
+-    {
++        .with_context(|| format!("capturing environment with {:?}", get_system_shell()));
++    let env = match result {
++        Ok(env) => env,
++        Err(err) => {
++            mark_login_shell_environment_loaded();
++            return Err(err);
++        }
++    };
++    for (name, value) in env {
+         // Skip SHLVL to prevent it from polluting Zed's process environment.
+         // The login shell used for env capture increments SHLVL, and if we propagate it,
+         // terminals spawned by Zed will inherit it and increment again, causing SHLVL
+@@ -411,8 +432,12 @@ pub async fn load_login_shell_environment() -> Result<()> {
+         if name == "SHLVL" {
+             continue;
+         }
++        if std::env::var_os(&name).as_deref() == Some(std::ffi::OsStr::new(&value)) {
++            continue;
++        }
+         unsafe { std::env::set_var(&name, &value) };
+     }
++    mark_login_shell_environment_loaded();
+ 
+     log::info!(
+         "set environment variables from shell:{}, path:{}",
+-- 
+2.54.0 (Apple Git-157)
+

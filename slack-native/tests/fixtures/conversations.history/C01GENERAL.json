@@ -1,0 +1,263 @@
+{
+  "ok": true,
+  "messages": [
+    {
+      "user": "U03PRIYA",
+      "type": "message",
+      "ts": "1795442100.000105",
+      "client_msg_id": "0470ca02-0000-4000-8000-1dcaa05aeab2",
+      "text": "Shipping the new onboarding flow today :tada:",
+      "team": "T0NORTHWND",
+      "blocks": [
+        {
+          "type": "rich_text",
+          "block_id": "b0946",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                {
+                  "type": "text",
+                  "text": "Shipping the new onboarding flow today "
+                },
+                {
+                  "type": "emoji",
+                  "name": "tada",
+                  "unicode": "1f389"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "reactions": [
+        {
+          "name": "tada",
+          "users": [
+            "U01ALEX",
+            "U02SAM"
+          ],
+          "count": 2
+        },
+        {
+          "name": "+1::skin-tone-3",
+          "users": [
+            "U04JORDAN"
+          ],
+          "count": 1
+        }
+      ]
+    },
+    {
+      "type": "message",
+      "subtype": "bot_message",
+      "text": "Build #482 passed on main",
+      "ts": "1795201320.000104",
+      "bot_id": "B01BUILD",
+      "username": "Build Bot",
+      "bot_profile": {
+        "id": "B01BUILD",
+        "app_id": "A01BUILD",
+        "name": "Build Bot",
+        "icons": {
+          "image_36": "https://avatars.example.com/bot-36.png",
+          "image_48": "https://avatars.example.com/bot-48.png",
+          "image_72": "https://avatars.example.com/bot-72.png"
+        },
+        "deleted": false,
+        "team_id": "T0NORTHWND"
+      },
+      "attachments": [
+        {
+          "id": 1,
+          "color": "2eb67d",
+          "fallback": "Build #482 passed",
+          "title": "Build #482",
+          "title_link": "https://ci.example.com/builds/482",
+          "text": "All 312 checks passed in 6m 12s",
+          "footer": "CI"
+        }
+      ]
+    },
+    {
+      "user": "U01ALEX",
+      "type": "message",
+      "ts": "1795192800.000103",
+      "client_msg_id": "9286f600-0000-4000-8000-0c6c349e1809",
+      "text": "Design review notes are up in the doc",
+      "team": "T0NORTHWND",
+      "blocks": [
+        {
+          "type": "rich_text",
+          "block_id": "b1272",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                {
+                  "type": "text",
+                  "text": "Design review notes are up in the doc"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "thread_ts": "1795192800.000103",
+      "reply_count": 2,
+      "reply_users_count": 2,
+      "latest_reply": "1795194600.000107",
+      "reply_users": [
+        "U03PRIYA",
+        "U02SAM"
+      ],
+      "is_locked": false,
+      "subscribed": true,
+      "last_read": "1795194600.000107"
+    },
+    {
+      "user": "U02SAM",
+      "type": "message",
+      "ts": "1795187100.000102",
+      "client_msg_id": "f3660d71-0000-4000-8000-121391ebdbab",
+      "text": "mockups for the welcome screens",
+      "team": "T0NORTHWND",
+      "blocks": [
+        {
+          "type": "rich_text",
+          "block_id": "b9872",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                {
+                  "type": "text",
+                  "text": "mockups for the welcome screens"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "files": [
+        {
+          "id": "F01MOCKUPS",
+          "created": 1795187100,
+          "timestamp": 1795187100,
+          "name": "onboarding-mockups.png",
+          "title": "onboarding-mockups.png",
+          "mimetype": "image/png",
+          "filetype": "png",
+          "pretty_type": "PNG",
+          "user": "U02SAM",
+          "user_team": "T0NORTHWND",
+          "editable": false,
+          "size": 482113,
+          "mode": "hosted",
+          "is_external": false,
+          "external_type": "",
+          "is_public": true,
+          "public_url_shared": false,
+          "display_as_bot": false,
+          "username": "",
+          "url_private": "https://files.example.com/files-pri/T0NORTHWND-F01MOCKUPS/onboarding-mockups.png",
+          "url_private_download": "https://files.example.com/files-pri/T0NORTHWND-F01MOCKUPS/download/onboarding-mockups.png",
+          "media_display_type": "unknown",
+          "thumb_64": "https://files.example.com/files-tmb/T0NORTHWND-F01MOCKUPS-a1b2c3/onboarding-mockups_64.png",
+          "thumb_80": "https://files.example.com/files-tmb/T0NORTHWND-F01MOCKUPS-a1b2c3/onboarding-mockups_80.png",
+          "thumb_360": "https://files.example.com/files-tmb/T0NORTHWND-F01MOCKUPS-a1b2c3/onboarding-mockups_360.png",
+          "thumb_480": "https://files.example.com/files-tmb/T0NORTHWND-F01MOCKUPS-a1b2c3/onboarding-mockups_480.png",
+          "thumb_720": "https://files.example.com/files-tmb/T0NORTHWND-F01MOCKUPS-a1b2c3/onboarding-mockups_720.png",
+          "thumb_800": "https://files.example.com/files-tmb/T0NORTHWND-F01MOCKUPS-a1b2c3/onboarding-mockups_800.png",
+          "thumb_960": "https://files.example.com/files-tmb/T0NORTHWND-F01MOCKUPS-a1b2c3/onboarding-mockups_960.png",
+          "thumb_1024": "https://files.example.com/files-tmb/T0NORTHWND-F01MOCKUPS-a1b2c3/onboarding-mockups_1024.png",
+          "thumb_360_w": 360,
+          "thumb_360_h": 240,
+          "thumb_480_w": 480,
+          "thumb_480_h": 320,
+          "thumb_160": "https://files.example.com/files-tmb/T0NORTHWND-F01MOCKUPS-a1b2c3/onboarding-mockups_160.png",
+          "original_w": 2400,
+          "original_h": 1600,
+          "thumb_tiny": "AwAQABg=",
+          "permalink": "https://northwind-studio.slack.com/files/U02SAM/F01MOCKUPS/onboarding-mockups.png",
+          "permalink_public": "https://slack-files.example.com/T0NORTHWND-F01MOCKUPS-0d1e2f",
+          "is_starred": false,
+          "has_rich_preview": false
+        }
+      ],
+      "upload": false,
+      "display_as_bot": false
+    },
+    {
+      "user": "U04JORDAN",
+      "type": "message",
+      "subtype": "channel_join",
+      "ts": "1795185000.000101",
+      "text": "<@U04JORDAN> has joined the channel"
+    },
+    {
+      "user": "U01ALEX",
+      "type": "message",
+      "ts": "1795183920.000100",
+      "client_msg_id": "909077ad-0000-4000-8000-0fe87a49dc75",
+      "text": "Morning! Agenda for today is in the channel topic, ping @Priya Patel with questions",
+      "team": "T0NORTHWND",
+      "blocks": [
+        {
+          "type": "rich_text",
+          "block_id": "b5017",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                {
+                  "type": "text",
+                  "text": "Morning! "
+                },
+                {
+                  "type": "text",
+                  "text": "Agenda",
+                  "style": {
+                    "bold": true
+                  }
+                },
+                {
+                  "type": "text",
+                  "text": " for today is in the "
+                },
+                {
+                  "type": "link",
+                  "url": "https://docs.example.com/agenda",
+                  "text": "agenda doc"
+                },
+                {
+                  "type": "text",
+                  "text": ", ping "
+                },
+                {
+                  "type": "user",
+                  "user_id": "U03PRIYA"
+                },
+                {
+                  "type": "text",
+                  "text": " with questions"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "edited": {
+        "user": "U01ALEX",
+        "ts": "1795184040.000112"
+      }
+    }
+  ],
+  "has_more": false,
+  "pin_count": 0,
+  "channel_actions_ts": null,
+  "channel_actions_count": 0,
+  "response_metadata": {
+    "next_cursor": ""
+  }
+}

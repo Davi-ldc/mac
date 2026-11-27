@@ -1,0 +1,16 @@
+"sidebar.page.threads" = "Threads";
+"sidebar.page.huddles" = "Huddles";
+"sidebar.page.drafts" = "Drafts & sent";
+"sidebar.page.directories" = "Directories";
+"sidebar.section.stars" = "Starred";
+"sidebar.section.channels" = "Channels";
+"sidebar.section.dms" = "Direct messages";
+"sidebar.section.apps" = "Apps";
+"sidebar.section.connect" = "External connections";
+"sidebar.stars.hint" = "Drag and drop important stuff here";
+"sidebar.add.channels" = "Add channels";
+"sidebar.filter.placeholder" = "Find a conversation...";
+"sidebar.filter.empty" = "No conversations to show…";
+"sidebar.filter.search" = "Search %@";
+"sidebar.settings" = "Manage my sidebar";
+"sidebar.compose" = "New message";

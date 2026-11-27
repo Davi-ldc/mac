@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>local.slack-native.keychain</string>
+  <key>CFBundleName</key><string>Slack Native Keychain</string>
+  <key>CFBundleExecutable</key><string>Slack Native Keychain</string>
+  <key>CFBundlePackageType</key><string>XPC!</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <!-- The user's security session: the login keychain, and the prompt that grants it once. -->
+  <key>XPCService</key><dict><key>ServiceType</key><string>Application</string><key>JoinExistingSession</key><true/></dict>
+</dict>
+</plist>

@@ -1,0 +1,136 @@
+From 209edfb5c6f47c61e931b37b0c3b8897bc4c2671 Mon Sep 17 00:00:00 2001
+From: mini <mini@local>
+Date: Sun, 22 Nov 2026 12:52:01 -0300
+Subject: [PATCH] EXPERIMENT (not in the series): env toggles for drawable
+ count, the legacy display link and parking drawables of unseen windows
+
+---
+ crates/gpui_apple/src/metal_renderer.rs | 38 ++++++++++++++++++++++++-
+ crates/gpui_macos/src/window.rs         | 16 ++++++++++-
+ 2 files changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/crates/gpui_apple/src/metal_renderer.rs b/crates/gpui_apple/src/metal_renderer.rs
+index 2feb70a..9d03f6b 100644
+--- a/crates/gpui_apple/src/metal_renderer.rs
++++ b/crates/gpui_apple/src/metal_renderer.rs
+@@ -135,6 +135,8 @@ pub struct MetalRenderer {
+     is_unified_memory: bool,
+     presents_with_transaction: bool,
+     display_link_mode: DisplayLinkMode,
++    /// The drawable size to go back to when a parked (not visible) window is shown again.
++    parked_drawable_size: Option<CGSize>,
+     /// For headless rendering, tracks whether output should be opaque
+     opaque: bool,
+     command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+@@ -214,7 +216,12 @@ impl MetalRenderer {
+         // Support direct-to-display rendering if the window is not transparent
+         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
+         layer.setOpaque(!transparent);
+-        layer.setMaximumDrawableCount(3);
++        layer.setMaximumDrawableCount(
++            std::env::var("MINI_EXP_DRAWABLES")
++                .ok()
++                .and_then(|count| count.parse().ok())
++                .unwrap_or(3),
++        );
+         // Allow texture reading for visual tests and UI automation screenshots
+         // (captures without ScreenCaptureKit). Only debug builds pay the
+         // presentation cost, even when `test-support` is compiled in.
+@@ -422,6 +429,7 @@ impl MetalRenderer {
+             layer,
+             presents_with_transaction: false,
+             display_link_mode: DisplayLinkMode::Detached,
++            parked_drawable_size: None,
+             is_apple_gpu,
+             is_unified_memory,
+             opaque,
+@@ -508,7 +516,33 @@ impl MetalRenderer {
+         }
+     }
+ 
++    /// Shrinks the layer's drawables to one pixel while its window cannot be seen, so
++    /// Core Animation lets go of the window-sized ones.
++    pub fn park(&mut self) {
++        if let Some(layer) = &self.layer
++            && self.parked_drawable_size.is_none()
++        {
++            self.parked_drawable_size = Some(layer.drawableSize());
++            layer.setDrawableSize(CGSize::new(1., 1.));
++            self.path_intermediate_texture = None;
++            self.path_intermediate_msaa_texture = None;
++        }
++    }
++
++    pub fn unpark(&mut self) {
++        if let Some(size) = self.parked_drawable_size.take()
++            && let Some(layer) = &self.layer
++        {
++            layer.setDrawableSize(size);
++        }
++    }
++
+     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
++        if self.parked_drawable_size.is_some() {
++            self.parked_drawable_size =
++                Some(CGSize::new(size.width.0 as f64, size.height.0 as f64));
++            return;
++        }
+         if let Some(layer) = &self.layer {
+             layer.setDrawableSize(CGSize::new(size.width.0 as f64, size.height.0 as f64));
+         }
+@@ -592,6 +626,8 @@ impl MetalRenderer {
+     }
+ 
+     pub fn draw(&mut self, scene: &Scene) {
++        // A frame drawn while parked would be one pixel large.
++        self.unpark();
+         let layer = match &self.layer {
+             Some(l) => l.clone(),
+             None => {
+diff --git a/crates/gpui_macos/src/window.rs b/crates/gpui_macos/src/window.rs
+index 32a6a54..4e09307 100644
+--- a/crates/gpui_macos/src/window.rs
++++ b/crates/gpui_macos/src/window.rs
+@@ -1108,7 +1108,9 @@ impl MacWindow {
+             let native_view: *mut AnyObject = msg_send![native_view, initWithFrame: content_bounds];
+             assert!(!native_view.is_null());
+ 
+-            let metal_frames = MetalFrameSource::is_available().then(Rc::<MetalFrames>::default);
++            let metal_frames = (MetalFrameSource::is_available()
++                && std::env::var_os("MINI_EXP_LEGACY_LINK").is_none())
++            .then(Rc::<MetalFrames>::default);
+             let state = Rc::new(Mutex::new(MacWindowState {
+                 handle,
+                 foreground_executor,
+@@ -3061,9 +3063,13 @@ extern "C" fn window_did_change_occlusion_state(this: &AnyObject, _: Sel, _: *mu
+         .contains(NSWindowOcclusionState::Visible)
+     {
+         lock.move_traffic_light();
++        lock.renderer.unpark();
+         lock.start_display_link(&window_state);
+     } else {
+         lock.stop_display_link();
++        if std::env::var_os("MINI_EXP_PARK").is_some() {
++            lock.renderer.park();
++        }
+     }
+     drop(lock);
+     // The only visibility source: AppKit posts this for covering, minimizing,
+@@ -3405,6 +3411,14 @@ extern "C" fn display_layer(this: &AnyObject, _: Sel, _: *mut AnyObject) {
+         lock.request_frame_callback = Some(callback);
+         lock.renderer.set_presents_with_transaction(false);
+         lock.start_display_link(&window_state);
++        if std::env::var_os("MINI_EXP_PARK").is_some()
++            && !lock
++                .native_window()
++                .occlusionState()
++                .contains(NSWindowOcclusionState::Visible)
++        {
++            lock.renderer.park();
++        }
+     }
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

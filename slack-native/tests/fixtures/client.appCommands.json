@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "commands": [
+    {"name": "/remind", "canonical_name": "/remind", "desc": "Set a reminder", "usage": "[@someone or #channel] [what] [when]", "type": "core", "is_runnable_from_thread": true},
+    {"name": "/giphy", "canonical_name": "/giphy", "desc": "Post a random GIF", "usage": "[text]", "type": "app", "app": "A0FIXGIPHY"},
+    {"name": "/shrug", "canonical_name": "/shrug", "desc": "Appends ¯\\_(ツ)_/¯ to your message", "usage": "[your message]", "type": "core"},
+    {"name": "/me", "canonical_name": "/me", "desc": "Display action text", "usage": "your text", "type": "core"},
+    {"name": "/who", "canonical_name": "/who", "desc": "List users in the current channel", "usage": "", "type": "core"},
+    {"name": "/standup", "canonical_name": "/standup", "desc": "Start the daily standup", "usage": "[team]", "type": "custom", "service_name": "Standup Bot"},
+    {"name": "/away", "canonical_name": "/away", "desc": "Toggle your away status", "usage": "", "type": "core"},
+    {"name": "/poll", "canonical_name": "/poll", "desc": "Create a poll", "usage": "\"question\" \"option 1\" \"option 2\"", "type": "app", "app": "A0FIXPOLLS"},
+    {"name": "/vote", "alias_of": "/poll", "type": "app", "app": "A0FIXPOLLS"},
+    {"name": "/hidden", "canonical_name": "/hidden", "desc": "Not offered in the list", "usage": "", "type": "app", "app": "A0FIXHIDDN", "autocomplete": false}
+  ],
+  "app_actions": [],
+  "cache_ts": "1795400000"
+}

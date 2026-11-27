@@ -1,0 +1,5 @@
+"auth.window.title" = "Sign in to Slack";
+"auth.waiting.title" = "Continue in your browser";
+"auth.waiting.body" = "Sign in to Slack in the browser window that opened. This window closes by itself when you're done.";
+"auth.waiting.retry" = "Open the browser again";
+"auth.waiting.page" = "Sign in in this window";

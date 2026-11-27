@@ -1,0 +1,203 @@
+From bf39e42b13eb653fddc2478fea3081a0d4f89ffd Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Sun, 22 Nov 2026 22:57:51 -0300
+Subject: [PATCH 2/4] Keep Soloist's volume across launches and restarts, and
+ show it while Soloist is idle
+
+---
+ Spotifly/Soloist/SoloistEngine.swift        | 46 ++++++++++++++++++-
+ Spotifly/ViewModels/PlaybackViewModel.swift | 51 +++++++++++++--------
+ 2 files changed, 76 insertions(+), 21 deletions(-)
+
+diff --git a/Spotifly/Soloist/SoloistEngine.swift b/Spotifly/Soloist/SoloistEngine.swift
+index 7de291f..3806451 100644
+--- a/Spotifly/Soloist/SoloistEngine.swift
++++ b/Spotifly/Soloist/SoloistEngine.swift
+@@ -57,11 +57,20 @@ final class SoloistEngine {
+         UserDefaults.standard.bool(forKey: setUpKey)
+     }
+ 
++    /// The `UserDefaults` key of the volume, in percent, the user last gave Soloist in this app.
++    /// Soloist starts at its own default, 40, at every start, so the engine sets this one each
++    /// time Soloist becomes ready.
++    nonisolated static let volumeKey = "soloistVolume"
++
+     /// The device to play on: Soloist, while it is set up and ready.
+     var readyDeviceId: String? {
+         status == .ready ? deviceId : nil
+     }
+ 
++    /// Soloist's volume, in percent, as its socket last reported it; nil while it does not run.
++    /// The cluster only says the active device's, and a Soloist just started is not active.
++    private(set) var volume: Int?
++
+     private var process: Process?
+     private var socket: URLSessionWebSocketTask?
+     private var isStarting = false
+@@ -159,7 +168,6 @@ final class SoloistEngine {
+         let process = Process()
+         process.executableURL = executable
+         // The key can only be passed as an argument (soloist#12): `ps` shows it to local users.
+-        // No volume: Soloist starts at its own default, 40, and keeps its own after that.
+         process.arguments = [
+             "-n", Self.deviceName,
+             "-k", key,
+@@ -202,6 +210,7 @@ final class SoloistEngine {
+         process = nil
+         socket?.cancel()
+         socket = nil
++        volume = nil
+ 
+         if exitStatus == 10 {
+             SoloistInstaller.forget(in: Self.root)
+@@ -226,6 +235,7 @@ final class SoloistEngine {
+     func stop() async {
+         socket?.cancel()
+         socket = nil
++        volume = nil
+         guard let process else { return }
+         self.process = nil
+         process.terminate()
+@@ -324,19 +334,51 @@ final class SoloistEngine {
+     }
+ 
+     func apply(_ event: SoloistEvent) {
++        if let reported = event.volume {
++            volume = reported
++        }
+         guard let loggedIn = event.loggedIn else { return }
++        let becomesReady = loggedIn && status != .ready
+         status = loggedIn ? .ready : .waitingForPairing
+         if loggedIn {
+             restartsInARow = 0
+         }
++        if becomesReady, let remembered = UserDefaults.standard.object(forKey: Self.volumeKey) as? Int {
++            send(volume: remembered)
++        }
++    }
++
++    // MARK: - Volume
++
++    /// Sets the volume the user chose, and remembers it for Soloist's next start. Over the
++    /// socket, which reaches Soloist whether or not it is the active device.
++    func setVolume(percent: Int) {
++        let percent = min(100, max(0, percent))
++        UserDefaults.standard.set(percent, forKey: Self.volumeKey)
++        send(volume: percent)
++    }
++
++    private func send(volume percent: Int) {
++        guard let socket else { return }
++        let command = #"{"type":"command","command":"set_volume","volume":\#(percent)}"#
++        Task {
++            do {
++                try await socket.send(.string(command))
++            } catch {
++                debugLog("Soloist", "Volume not sent: \(error)")
++            }
++        }
+     }
+ }
+ 
+-/// The part of a Soloist socket message the engine reads: `auth_state` says whether it is paired.
++/// The parts of a Soloist socket message the engine reads: `auth_state` says whether it is
++/// paired, and `volume_changed` and `playback_state` its volume.
+ nonisolated struct SoloistEvent: Decodable, Equatable {
+     let loggedIn: Bool?
++    var volume: Int?
+ 
+     enum CodingKeys: String, CodingKey {
+         case loggedIn = "logged_in"
++        case volume
+     }
+ }
+diff --git a/Spotifly/ViewModels/PlaybackViewModel.swift b/Spotifly/ViewModels/PlaybackViewModel.swift
+index 051136b..7759b92 100644
+--- a/Spotifly/ViewModels/PlaybackViewModel.swift
++++ b/Spotifly/ViewModels/PlaybackViewModel.swift
+@@ -121,37 +121,44 @@ final class PlaybackViewModel {
+     }
+ 
+     /// What the bar's slider shows: the active device's volume, Soloist's while it plays for
+-    /// this Mac, which keeps its own. Nothing while no device is active.
++    /// this Mac, which keeps its own. With no device active, a ready Soloist's, as the next play
++    /// goes to it: after every start it is ready but not active, and the slider showed nothing.
+     ///
+     /// Read from the player model, not kept: a copy kept up by the window's `onChange`s went
+     /// stale in the mini player, which has none, and showed one device's volume while moving
+     /// the other's. A drag shows its own value until the device reports a new volume.
+     var sliderVolume: Double {
+-        guard let deviceId = player.activeDeviceId else { return 0 }
+-        let reported = player.activeDevice?.volumePercent
+-        if let dragged = draggedVolume, dragged.deviceId == deviceId,
+-           dragged.reportedPercent == reported
++        guard let device = sliderDevice else { return 0 }
++        if let dragged = draggedVolume, dragged.deviceId == device.id,
++           dragged.reportedPercent == device.reportedPercent
+         {
+             return dragged.volume
+         }
+         // Unknown only while the device list has not caught up with the active id.
+-        return reported.map { Double($0) / 100 } ?? 0
++        return device.reportedPercent.map { Double($0) / 100 } ?? 0
+     }
+ 
+-    /// Whether the slider moves nothing: no device is active, or the active one refuses volume
+-    /// changes. An iPhone says so, as iOS will not let one app set system volume for another.
++    /// The device the slider moves, and the volume it last reported.
++    private var sliderDevice: (id: String, reportedPercent: Int?)? {
++        if let id = player.activeDeviceId {
++            return (id, player.activeDevice?.volumePercent)
++        }
++        let soloist = SoloistEngine.shared
++        return soloist.readyDeviceId.map { ($0, soloist.volume) }
++    }
++
++    /// Whether the slider moves nothing: no device is active and Soloist is not ready, or the
++    /// active one refuses volume changes. An iPhone says so, as iOS will not let one app set
++    /// system volume for another.
+     var sliderRefused: Bool {
+-        player.activeDevice?.disableVolume ?? true
++        guard player.activeDeviceId != nil else { return sliderDevice == nil }
++        return player.activeDevice?.disableVolume ?? true
+     }
+ 
+-    /// Moves the active device's volume, which is what the slider shows.
++    /// Moves the volume of the device the slider shows.
+     func setVolumeFromSlider(_ newVolume: Double) {
+-        guard let deviceId = player.activeDeviceId, !sliderRefused else { return }
+-        draggedVolume = DraggedVolume(
+-            deviceId: deviceId,
+-            volume: newVolume,
+-            reportedPercent: player.activeDevice?.volumePercent,
+-        )
++        guard let device = sliderDevice, !sliderRefused else { return }
++        draggedVolume = DraggedVolume(deviceId: device.id, volume: newVolume, reportedPercent: device.reportedPercent)
+         volumeSubject.send(newVolume)
+     }
+ 
+@@ -1360,12 +1367,18 @@ final class PlaybackViewModel {
+         volumeSubscription = volumeSubject
+             .debounce(for: .milliseconds(50), scheduler: DispatchQueue.main)
+             .sink { [weak self] newVolume in
++                guard let self, let to = draggedVolume?.deviceId, !to.isEmpty else { return }
++                let percent = Int((newVolume * 100).rounded())
++                // Soloist takes it over its own socket, active or not, which also remembers it
++                // for Soloist's next start.
++                if to == SoloistEngine.shared.readyDeviceId {
++                    SoloistEngine.shared.setVolume(percent: percent)
++                    return
++                }
+                 // To the active device only, never on to Soloist as a transport command goes: the
+                 // drag was of the active device's volume, and a device that has gone inactive since
+                 // has nothing to set.
+-                guard let self, isInitialized, let to = player.activeDeviceId, !to.isEmpty,
+-                      let from = commandSource else { return }
+-                let percent = Int((newVolume * 100).rounded())
++                guard isInitialized, to == player.activeDeviceId, let from = commandSource else { return }
+                 Task {
+                     try? await SpclientAPI().setVolume(
+                         percent: percent,
+-- 
+2.54.0 (Apple Git-157)
+

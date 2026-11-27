@@ -1,0 +1,5 @@
+"auth.window.title" = "Entrar no Slack";
+"auth.waiting.title" = "Continue no navegador";
+"auth.waiting.body" = "Entre no Slack na janela do navegador que abriu. Quando terminar, esta janela fecha sozinha.";
+"auth.waiting.retry" = "Abrir o navegador de novo";
+"auth.waiting.page" = "Entrar por esta janela";

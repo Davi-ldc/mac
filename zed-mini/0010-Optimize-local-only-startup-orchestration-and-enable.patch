@@ -1,0 +1,1232 @@
+From c44c7404d8e43163658cca9ecc00854b5b04bd4b Mon Sep 17 00:00:00 2001
+From: mini <mini@local>
+Date: Fri, 27 Nov 2026 03:37:38 -0300
+Subject: [PATCH 10/10] Optimize local-only startup orchestration and enable
+ panic=abort in release
+
+Overlaps AppDatabase, default settings, keymaps, built-in languages, and
+theme preloading with AppKit launch; defers Rayon pool, LazyHttpClient,
+disabled AI/telemetry/auth subsystems, and unused embedded fonts; keeps
+OutlinePanel parallel with ProjectPanel; installs menus immediately;
+defers startup keymap error toasts until a window exists; and enables
+panic = "abort" in [profile.release] to strip ~50 MB of unwind tables.
+---
+ Cargo.toml                      |   1 +
+ crates/workspace/src/welcome.rs |  13 +-
+ crates/zed/src/main.rs          | 450 +++++++++++++++++++++++---------
+ crates/zed/src/zed.rs           | 372 +++++++++++++++++++++-----
+ crates/zed/src/zed/app_menus.rs |   8 -
+ 5 files changed, 647 insertions(+), 197 deletions(-)
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 2a09416..a5bac64 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1158,6 +1158,7 @@ zed_actions = { codegen-units = 1 }
+ debug = "limited"
+ lto = "thin"
+ codegen-units = 1
++panic = "abort"
+ 
+ [profile.release.package]
+ zed = { codegen-units = 16 }
+diff --git a/crates/workspace/src/welcome.rs b/crates/workspace/src/welcome.rs
+index ea31eb4..3d069f9 100644
+--- a/crates/workspace/src/welcome.rs
++++ b/crates/workspace/src/welcome.rs
+@@ -19,7 +19,7 @@ use settings::{DefaultOpenBehavior, Settings};
+ use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Vector, VectorName, prelude::*};
+ use util::ResultExt;
+ use zed_actions::{
+-    Extensions, OpenKeymap, OpenOnboarding, OpenSettings, assistant::ToggleFocus, command_palette,
++    OpenKeymap, OpenOnboarding, OpenSettings, assistant::ToggleFocus, command_palette,
+ };
+ 
+ #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
+@@ -163,7 +163,7 @@ impl SectionEntry {
+     }
+ }
+ 
+-const CONTENT: (Section<4>, Section<3>) = (
++const CONTENT: (Section<4>, Section<2>) = (
+     Section {
+         title: "Get Started",
+         entries: [
+@@ -208,15 +208,6 @@ const CONTENT: (Section<4>, Section<3>) = (
+                 action: &OpenKeymap,
+                 visibility_guard: SectionVisibility::Always,
+             },
+-            SectionEntry {
+-                icon: IconName::Blocks,
+-                title: "Explore Extensions",
+-                action: &Extensions {
+-                    category_filter: None,
+-                    id: None,
+-                },
+-                visibility_guard: SectionVisibility::Always,
+-            },
+         ],
+     },
+ );
+diff --git a/crates/zed/src/main.rs b/crates/zed/src/main.rs
+index 4057dd7..28252e0 100644
+--- a/crates/zed/src/main.rs
++++ b/crates/zed/src/main.rs
+@@ -45,7 +45,6 @@ use reqwest_client::ReqwestClient;
+ 
+ use assets::Assets;
+ use node_runtime::{NodeBinaryOptions, NodeRuntime};
+-use parking_lot::Mutex;
+ use project::{project_settings::ProjectSettings, trusted_worktrees};
+ use recent_projects::{RemoteSettings, open_remote_project};
+ use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
+@@ -75,7 +74,8 @@ use workspace::{
+ use zed::{
+     OpenListener, OpenRequest, RawOpenRequest, app_menus, build_window_options,
+     derive_paths_with_position, edit_prediction_registry, handle_cli_connection,
+-    handle_keymap_file_changes, initialize_workspace, open_paths_with_positions,
++    handle_keymap_file_changes_with_preloaded, initialize_workspace, open_paths_with_positions,
++    preload_default_keymaps,
+ };
+ 
+ use crate::zed::{CrashHandler, OpenRequestKind, eager_load_active_theme_and_icon_theme};
+@@ -84,6 +84,63 @@ use crate::zed::{CrashHandler, OpenRequestKind, eager_load_active_theme_and_icon
+ #[global_allocator]
+ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+ 
++/// Defers `ReqwestClient` construction (including macOS Keychain root CA loading
++/// and TLS config initialization) until the first outbound HTTP request.
++struct LazyHttpClient {
++    proxy: Option<http_client::Url>,
++    user_agent: Option<http_client::http::HeaderValue>,
++    build: Box<dyn Fn() -> anyhow::Result<Arc<ReqwestClient>> + Send + Sync>,
++    inner: OnceLock<Arc<ReqwestClient>>,
++}
++
++impl LazyHttpClient {
++    fn new(
++        proxy: Option<http_client::Url>,
++        user_agent_str: String,
++        build: impl Fn() -> anyhow::Result<Arc<ReqwestClient>> + Send + Sync + 'static,
++    ) -> Self {
++        let user_agent = http_client::http::HeaderValue::from_str(&user_agent_str).ok();
++        Self {
++            proxy,
++            user_agent,
++            build: Box::new(build),
++            inner: OnceLock::new(),
++        }
++    }
++
++    fn get_or_init(&self) -> anyhow::Result<Arc<ReqwestClient>> {
++        if let Some(client) = self.inner.get() {
++            return Ok(client.clone());
++        }
++        let client = (self.build)()?;
++        let _ = self.inner.set(client.clone());
++        Ok(self.inner.get().cloned().unwrap_or(client))
++    }
++}
++
++impl http_client::HttpClient for LazyHttpClient {
++    fn user_agent(&self) -> Option<&http_client::http::HeaderValue> {
++        self.user_agent.as_ref()
++    }
++
++    fn proxy(&self) -> Option<&http_client::Url> {
++        self.proxy.as_ref()
++    }
++
++    fn send(
++        &self,
++        req: http_client::http::Request<http_client::AsyncBody>,
++    ) -> futures::future::BoxFuture<
++        'static,
++        anyhow::Result<http_client::Response<http_client::AsyncBody>>,
++    > {
++        match self.get_or_init() {
++            Ok(client) => client.send(req),
++            Err(err) => futures::future::ready(Err(err)).boxed(),
++        }
++    }
++}
++
+ fn build_application() -> Application {
+     let platform = gpui_platform::current_platform(false);
+     if std::env::var("ZED_EXPERIMENTAL_A11Y").as_deref() == Ok("1") {
+@@ -319,13 +376,6 @@ fn main() {
+         return;
+     }
+ 
+-    rayon::ThreadPoolBuilder::new()
+-        .num_threads(std::thread::available_parallelism().map_or(1, |n| n.get().div_ceil(2)))
+-        .stack_size(10 * 1024 * 1024)
+-        .thread_name(|ix| format!("RayonWorker{}", ix))
+-        .build_global()
+-        .unwrap();
+-
+     log::info!(
+         "========== starting zed version {}, sha {} ==========",
+         app_version,
+@@ -339,17 +389,6 @@ fn main() {
+     #[cfg(windows)]
+     check_for_conpty_dll();
+ 
+-    let app = build_application()
+-        .with_assets(Assets)
+-        .with_restart_arguments(restart_arguments);
+-
+-    let app_db = db::AppDatabase::new();
+-    let system_id = app.background_executor().spawn(system_id());
+-    let installation_id = app
+-        .background_executor()
+-        .spawn(installation_id(KeyValueStore::from_app_db(&app_db)));
+-    let background_executor = app.background_executor();
+-
+     let (open_listener, mut open_rx) = OpenListener::new();
+ 
+     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
+@@ -378,11 +417,39 @@ fn main() {
+         return;
+     }
+ 
++    let app = build_application()
++        .with_assets(Assets)
++        .with_restart_arguments(restart_arguments);
++
++    // Initialize Rayon's global thread pool synchronously before launching background
++    // tasks so no early caller can race and create an uncapped default-stack pool.
++    let _ = rayon::ThreadPoolBuilder::new()
++        .num_threads(
++            std::thread::available_parallelism().map_or(1, |n| n.get().div_ceil(2).min(4)),
++        )
++        .stack_size(10 * 1024 * 1024)
++        .thread_name(|ix| format!("RayonWorker{}", ix))
++        .build_global();
++
+     let session_id = Uuid::new_v4().to_string();
+-    let session = app.background_executor().spawn(Session::new(
+-        session_id.clone(),
+-        KeyValueStore::from_app_db(&app_db),
+-    ));
++    let app_db_and_session = app.background_executor().spawn({
++        let session_id = session_id.clone();
++        async move {
++            let app_db = db::AppDatabase::new();
++            let session = Session::new(session_id, KeyValueStore::from_app_db(&app_db)).await;
++            (app_db, session)
++        }
++    });
++    let preloaded_default_settings = app
++        .background_executor()
++        .spawn(async { settings::preload_default_settings() });
++    let preloaded_default_keymaps = app
++        .background_executor()
++        .spawn(async { preload_default_keymaps() });
++    let preloaded_language_configs = app
++        .background_executor()
++        .spawn(async { languages::preload_builtin_configs() });
++    let background_executor = app.background_executor();
+ 
+     let should_install_crash_handler =
+         client::telemetry::should_install_crash_handler(*release_channel::RELEASE_CHANNEL);
+@@ -435,11 +502,24 @@ fn main() {
+     }
+ 
+     let fs = RealFs::new(git_binary_path, app.background_executor());
++    let (user_settings_file_rx, user_settings_watcher) = watch_config_file(
++        &app.background_executor(),
++        fs.clone(),
++        paths::settings_file().clone(),
++    );
++    let (global_settings_file_rx, global_settings_watcher) = watch_config_file(
++        &app.background_executor(),
++        fs.clone(),
++        paths::global_settings_file().clone(),
++    );
+     let (user_keymap_file_rx, user_keymap_watcher) = watch_config_file(
+         &app.background_executor(),
+         fs.clone(),
+         paths::keymap_file().clone(),
+     );
++    let preloaded_bundled_themes = app
++        .background_executor()
++        .spawn(async { theme_settings::preload_bundled_themes(&Assets) });
+ 
+     let (shell_env_loaded_tx, shell_env_loaded_rx) = oneshot::channel();
+     if !stdout_is_a_pty() {
+@@ -451,6 +531,8 @@ fn main() {
+             })
+             .detach();
+     } else {
++        #[cfg(unix)]
++        util::mark_login_shell_environment_loaded();
+         drop(shell_env_loaded_tx)
+     }
+ 
+@@ -478,6 +560,7 @@ fn main() {
+     });
+ 
+     app.run(move |cx| {
++        let (app_db, session) = cx.foreground_executor().block_on(app_db_and_session);
+         cx.set_global(app_db);
+         let db_trusted_paths = match workspace::WorkspaceDb::global(cx).fetch_trusted_worktrees() {
+             Ok(trusted_paths) => trusted_paths,
+@@ -495,10 +578,27 @@ fn main() {
+         if let Some(app_commit_sha) = app_commit_sha {
+             AppCommitSha::set_global(app_commit_sha, cx);
+         }
+-        settings::init(cx);
++        let preloaded_default_settings = cx
++            .foreground_executor()
++            .block_on(preloaded_default_settings);
++        settings::init_with_preloaded(preloaded_default_settings, cx);
+         zlog_settings::init(cx);
+-        zed::watch_settings_files(fs.clone(), cx);
+-        handle_keymap_file_changes(user_keymap_file_rx, user_keymap_watcher, cx);
++        zed::watch_settings_files_with_receivers(
++            user_settings_file_rx,
++            user_settings_watcher,
++            global_settings_file_rx,
++            global_settings_watcher,
++            cx,
++        );
++        let preloaded_default_keymaps = cx
++            .foreground_executor()
++            .block_on(preloaded_default_keymaps);
++        handle_keymap_file_changes_with_preloaded(
++            user_keymap_file_rx,
++            user_keymap_watcher,
++            Some(preloaded_default_keymaps),
++            cx,
++        );
+ 
+         let user_agent = format!(
+             "Zed/{} ({}; {})",
+@@ -507,12 +607,14 @@ fn main() {
+             std::env::consts::ARCH
+         );
+         let proxy_url = ProxySettings::get_global(cx).proxy_url();
+-        let http = {
+-            let _guard = Tokio::handle(cx).enter();
+-
+-            ReqwestClient::proxy_and_user_agent(proxy_url, &user_agent)
+-                .expect("could not start HTTP client")
+-        };
++        let tokio_handle = Tokio::handle(cx);
++        let http = LazyHttpClient::new(proxy_url.clone(), user_agent.clone(), move || {
++            let _guard = tokio_handle.enter();
++            Ok(Arc::new(ReqwestClient::proxy_and_user_agent(
++                proxy_url.clone(),
++                &user_agent,
++            )?))
++        });
+         cx.set_http_client(Arc::new(http));
+ 
+         <dyn Fs>::set_global(fs.clone(), cx);
+@@ -560,7 +662,16 @@ fn main() {
+         let node_runtime = NodeRuntime::new(client.http_client(), Some(shell_env_loaded_rx), rx);
+ 
+         debug_adapter_extension::init(extension_host_proxy.clone(), cx);
+-        languages::init(languages.clone(), fs.clone(), node_runtime.clone(), cx);
++        let preloaded_language_configs = cx
++            .foreground_executor()
++            .block_on(preloaded_language_configs);
++        languages::init_with_preloaded(
++            languages.clone(),
++            fs.clone(),
++            node_runtime.clone(),
++            Some(preloaded_language_configs),
++            cx,
++        );
+         let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
+         let workspace_store = cx.new(|cx| WorkspaceStore::new(client.clone(), cx));
+ 
+@@ -594,11 +705,20 @@ fn main() {
+         client::init(&client, cx);
+         feature_flags::FeatureFlagStore::init(cx);
+ 
+-        let system_id = cx.foreground_executor().block_on(system_id).ok();
+-        let installation_id = cx.foreground_executor().block_on(installation_id).ok();
+-        let session = cx.foreground_executor().block_on(session);
+-
+         let telemetry = client.telemetry();
++        let telemetry_enabled = telemetry.diagnostics_enabled() || telemetry.metrics_enabled();
++        let (system_id, installation_id) = if telemetry_enabled {
++            let kvp = KeyValueStore::global(cx);
++            let system_id = cx.background_executor().spawn(system_id());
++            let installation_id = cx.background_executor().spawn(installation_id(kvp));
++            (
++                cx.foreground_executor().block_on(system_id).ok(),
++                cx.foreground_executor().block_on(installation_id).ok(),
++            )
++        } else {
++            (None, None)
++        };
++
+         telemetry.start(
+             system_id.as_ref().map(|id| id.to_string()),
+             installation_id.as_ref().map(|id| id.to_string()),
+@@ -660,15 +780,16 @@ fn main() {
+         dap_adapters::init(cx);
+         auto_update_ui::init(cx);
+         reliability::init(client.clone(), app_state.workspace_store.clone(), cx);
+-        extension_host::init(
+-            extension_host_proxy.clone(),
+-            app_state.fs.clone(),
+-            app_state.client.clone(),
+-            app_state.node_runtime.clone(),
++        // Themes, icon themes and languages this build needs are bundled, so the
++        // extension host (and its wasm runtime) is never started.
++        let preloaded_bundled_themes = cx
++            .foreground_executor()
++            .block_on(preloaded_bundled_themes);
++        theme_settings::init_with_preloaded(
++            theme::LoadThemes::All(Box::new(Assets)),
++            Some(preloaded_bundled_themes),
+             cx,
+         );
+-
+-        theme_settings::init(theme::LoadThemes::All(Box::new(Assets)), cx);
+         eager_load_active_theme_and_icon_theme(fs.clone(), cx);
+         theme_extension::init(
+             extension_host_proxy,
+@@ -676,50 +797,80 @@ fn main() {
+             cx.background_executor().clone(),
+         );
+         command_palette::init(cx);
+-        let copilot_chat_configuration = copilot_chat::CopilotChatConfiguration {
+-            enterprise_uri: settings::CopilotSettings::get_global(cx)
+-                .enterprise_uri
+-                .clone(),
+-        };
+-        let credentials_provider = zed_credentials_provider::global(cx);
+-        copilot_chat::init(
+-            app_state.client.http_client(),
+-            credentials_provider,
+-            copilot_chat_configuration,
+-            cx,
+-        );
+-
+-        copilot_ui::init(&app_state, cx);
+         language_model::init(cx);
+-        RefreshLlmTokenListener::register(
+-            app_state.client.clone(),
+-            app_state.user_store.clone(),
+-            cx,
+-        );
+-        language_models::init(app_state.user_store.clone(), app_state.client.clone(), cx);
+-        acp_tools::init(cx);
+-        zed::telemetry_log::init(cx);
+-        zed::remote_debug::init(cx);
+         edit_prediction_ui::init(cx);
+-        web_search::init(cx);
+-        web_search_providers::init(app_state.client.clone(), app_state.user_store.clone(), cx);
+         snippet_provider::init(cx);
+-        edit_prediction_registry::init(app_state.client.clone(), app_state.user_store.clone(), cx);
+-        let prompt_builder = PromptBuilder::load(app_state.fs.clone(), stdout_is_a_pty(), cx);
+-        project::AgentRegistryStore::init_global(
+-            cx,
+-            app_state.fs.clone(),
+-            app_state.client.http_client(),
+-        );
+-        agent_ui::init(
+-            app_state.fs.clone(),
+-            prompt_builder,
+-            app_state.languages.clone(),
+-            is_new_install,
+-            false,
+-            cx,
+-        );
+-        zed::watch_user_agents_md(app_state.fs.clone(), cx);
++        zed::telemetry_log::init(cx);
++        zed::remote_debug::init(cx);
++
++        let init_ai_subsystems = {
++            let app_state = app_state.clone();
++            let initialized = Rc::new(std::cell::Cell::new(false));
++            move |cx: &mut App| {
++                if initialized.get() {
++                    return;
++                }
++                initialized.set(true);
++                let copilot_chat_configuration = copilot_chat::CopilotChatConfiguration {
++                    enterprise_uri: settings::CopilotSettings::get_global(cx)
++                        .enterprise_uri
++                        .clone(),
++                };
++                let credentials_provider = zed_credentials_provider::global(cx);
++                copilot_chat::init(
++                    app_state.client.http_client(),
++                    credentials_provider,
++                    copilot_chat_configuration,
++                    cx,
++                );
++                copilot_ui::init(&app_state, cx);
++                RefreshLlmTokenListener::register(
++                    app_state.client.clone(),
++                    app_state.user_store.clone(),
++                    cx,
++                );
++                language_models::init(app_state.user_store.clone(), app_state.client.clone(), cx);
++                acp_tools::init(cx);
++                web_search::init(cx);
++                web_search_providers::init(
++                    app_state.client.clone(),
++                    app_state.user_store.clone(),
++                    cx,
++                );
++                edit_prediction_registry::init(
++                    app_state.client.clone(),
++                    app_state.user_store.clone(),
++                    cx,
++                );
++                let prompt_builder =
++                    PromptBuilder::load(app_state.fs.clone(), stdout_is_a_pty(), cx);
++                project::AgentRegistryStore::init_global(
++                    cx,
++                    app_state.fs.clone(),
++                    app_state.client.http_client(),
++                );
++                agent_ui::init(
++                    app_state.fs.clone(),
++                    prompt_builder,
++                    app_state.languages.clone(),
++                    is_new_install,
++                    false,
++                    cx,
++                );
++                zed::watch_user_agents_md(app_state.fs.clone(), cx);
++            }
++        };
++
++        if !project::DisableAiSettings::get_global(cx).disable_ai {
++            init_ai_subsystems(cx);
++        } else {
++            cx.observe_global::<SettingsStore>(move |cx| {
++                if !project::DisableAiSettings::get_global(cx).disable_ai {
++                    init_ai_subsystems(cx);
++                }
++            })
++            .detach();
++        }
+ 
+         repl::init(app_state.fs.clone(), cx);
+         recent_projects::init(cx);
+@@ -746,7 +897,7 @@ fn main() {
+         project_bookmarks::init(cx);
+         project_symbols::init(cx);
+         project_panel::init(cx);
+-        outline_panel::init(cx);
++        timeline::init(cx);
+         tasks_ui::init(cx);
+         snippets_ui::init(cx);
+         channel::init(&app_state.client.clone(), app_state.user_store.clone(), cx);
+@@ -776,14 +927,12 @@ fn main() {
+         notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
+         collab_ui::init(&app_state, cx);
+         git_ui::init(cx);
+-        feedback::init(cx);
+         markdown_preview::init(cx);
+         tabular_data_preview::init(cx);
+         svg_preview::init(cx);
+         onboarding::init(cx);
+         settings_ui::init(cx);
+         keymap_editor::init(cx);
+-        extensions_ui::init(cx);
+         edit_prediction::init(cx);
+         inspector_ui::init(app_state.clone(), cx);
+         json_schema_store::init(cx);
+@@ -853,9 +1002,6 @@ fn main() {
+         #[cfg(debug_assertions)]
+         watch_languages(fs.clone(), app_state.languages.clone(), cx);
+ 
+-        let menus = app_menus(cx);
+-        cx.set_menus(menus);
+-
+         if let Some(mut crash_handler) = crash_handler {
+             let crash_handler2 = block_on(poll_once(&mut crash_handler));
+             match crash_handler2 {
+@@ -876,13 +1022,17 @@ fn main() {
+ 
+         initialize_workspace(app_state.clone(), cx);
+ 
+-        cx.activate(true);
++        // Install the native menu bar and Dock menu immediately so they are never
++        // missing during slow or remote workspace restoration.
++        let menus = app_menus(cx);
++        cx.set_menus(menus);
++        #[cfg(not(target_os = "windows"))]
++        cx.set_dock_menu(vec![gpui::MenuItem::action(
++            "New Window",
++            workspace::NewWindow,
++        )]);
+ 
+-        cx.spawn({
+-            let client = app_state.client.clone();
+-            async move |cx| authenticate(client, cx).await
+-        })
+-        .detach_and_log_err(cx);
++        cx.activate(true);
+ 
+         let urls: Vec<_> = args
+             .paths_or_urls
+@@ -962,6 +1112,17 @@ fn main() {
+         });
+ 
+         let restore_finished = cx.background_spawn(restore_task).shared();
++        let first_window_placed = first_window_rx.shared();
++
++        cx.spawn({
++            let client = app_state.client.clone();
++            let restore_finished = restore_finished.clone();
++            async move |cx| {
++                restore_finished.await;
++                authenticate(client, cx).await
++            }
++        })
++        .detach_and_log_err(cx);
+ 
+         cx.spawn({
+             let db = workspace::WorkspaceDb::global(cx);
+@@ -985,7 +1146,6 @@ fn main() {
+ 
+         cx.spawn(async move |cx| {
+             let _first_window_subscription = _first_window_subscription;
+-            let first_window_placed = first_window_rx.shared();
+             while let Some(urls) = open_rx.next().await {
+                 // On a macOS cold launch, `zed <path>` arrives here after startup already
+                 // began restoring the session, so wait for a restored window to exist before
+@@ -1829,28 +1989,82 @@ fn parse_url_arg(arg: &str, cx: &App) -> String {
+     }
+ }
+ 
+-fn load_embedded_fonts(cx: &App) {
+-    let asset_source = cx.asset_source();
+-    let font_paths = asset_source.list("fonts").unwrap();
+-    let embedded_fonts = Mutex::new(Vec::new());
+-    let executor = cx.background_executor();
++fn is_embedded_font_family(family: &str) -> bool {
++    matches!(
++        family,
++        ".ZedSans" | ".ZedMono" | "IBM Plex Sans" | "Lilex" | "Zed Plex Sans" | "Zed Plex Mono"
++    )
++}
+ 
+-    cx.foreground_executor().block_on(executor.scoped(|scope| {
+-        for font_path in &font_paths {
+-            if !font_path.ends_with(".ttf") {
+-                continue;
+-            }
++fn uses_embedded_font(font: &gpui::Font) -> bool {
++    is_embedded_font_family(font.family.as_ref())
++        || font
++            .fallbacks
++            .as_ref()
++            .is_some_and(|fallbacks| fallbacks.fallback_list().iter().any(|f| is_embedded_font_family(f)))
++}
+ 
+-            scope.spawn(async {
+-                let font_bytes = asset_source.load(font_path).unwrap().unwrap();
+-                embedded_fonts.lock().push(font_bytes);
+-            });
+-        }
+-    }));
++fn any_setting_uses_embedded_font(cx: &App) -> bool {
++    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
++    if uses_embedded_font(&theme_settings.ui_font)
++        || uses_embedded_font(&theme_settings.buffer_font)
++        || is_embedded_font_family(theme_settings.agent_ui_font_family().as_ref())
++        || is_embedded_font_family(theme_settings.agent_buffer_font_family().as_ref())
++        || is_embedded_font_family(theme_settings.markdown_preview_font_family().as_ref())
++        || is_embedded_font_family(theme_settings.markdown_preview_code_font_family().as_ref())
++        || is_embedded_font_family(theme_settings.mermaid_font_family().as_ref())
++    {
++        return true;
++    }
++    cx.global::<SettingsStore>()
++        .terminal_font_family()
++        .is_some_and(is_embedded_font_family)
++}
++
++fn load_embedded_fonts(cx: &mut App) {
++    let load_sync = |cx: &App| {
++        let asset_source = cx.asset_source();
++        let font_paths = asset_source.list("fonts").unwrap();
++        let fonts: Vec<_> = font_paths
++            .into_iter()
++            .filter(|path| path.ends_with(".ttf"))
++            .filter_map(|path| asset_source.load(&path).ok().flatten())
++            .collect();
++        cx.text_system().add_fonts(fonts).log_err();
++    };
++
++    if any_setting_uses_embedded_font(cx) {
++        load_sync(cx);
++        return;
++    }
+ 
+-    cx.text_system()
+-        .add_fonts(embedded_fonts.into_inner())
+-        .unwrap();
++    // Do not pin the 2.12 MB of unused embedded TTF fonts in memory when all
++    // configured UI, buffer, terminal, markdown, mermaid, and agent fonts are
++    // system fonts. Load them on demand if settings later switch to one.
++    let loaded = Rc::new(std::cell::Cell::new(false));
++    cx.observe_global::<SettingsStore>(move |cx| {
++        if loaded.get() || !any_setting_uses_embedded_font(cx) {
++            return;
++        }
++        loaded.set(true);
++        let asset_source = cx.asset_source().clone();
++        let text_system = cx.text_system().clone();
++        cx.spawn(async move |cx| {
++            cx.background_spawn(async move {
++                let font_paths = asset_source.list("fonts").unwrap();
++                let fonts: Vec<_> = font_paths
++                    .into_iter()
++                    .filter(|path| path.ends_with(".ttf"))
++                    .filter_map(|path| asset_source.load(&path).ok().flatten())
++                    .collect();
++                text_system.add_fonts(fonts).log_err();
++            })
++            .await;
++            cx.update(|cx| cx.refresh_windows());
++        })
++        .detach();
++    })
++    .detach();
+ }
+ 
+ #[cfg(target_os = "linux")]
+diff --git a/crates/zed/src/zed.rs b/crates/zed/src/zed.rs
+index 739202e..8744e3f 100644
+--- a/crates/zed/src/zed.rs
++++ b/crates/zed/src/zed.rs
+@@ -84,6 +84,7 @@ use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
+ use std::{
+     borrow::Cow,
+     path::{Path, PathBuf},
++    rc::Rc,
+     sync::Arc,
+     sync::atomic::{self, AtomicBool},
+ };
+@@ -535,17 +536,42 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
+         )
+         .detach();
+ 
+-        cx.defer(move |cx| {
+-            window_handle
+-                .update(cx, |_, window, cx| {
+-                    let sidebar =
+-                        cx.new(|cx| Sidebar::new(multi_workspace_handle.clone(), window, cx));
+-                    multi_workspace_handle.update(cx, |multi_workspace, cx| {
+-                        multi_workspace.register_sidebar(sidebar, cx);
+-                    });
+-                })
+-                .ok();
+-        });
++        let register_sidebar = {
++            let multi_workspace_handle = multi_workspace_handle.clone();
++            let registered = Rc::new(std::cell::Cell::new(false));
++            move |cx: &mut App| {
++                if registered.get()
++                    || DisableAiSettings::get_global(cx).disable_ai
++                    || agent_ui::thread_metadata_store::ThreadMetadataStore::try_global(cx)
++                        .is_none()
++                {
++                    return;
++                }
++                registered.set(true);
++                let multi_workspace_handle = multi_workspace_handle.clone();
++                window_handle
++                    .update(cx, |_, window, cx| {
++                        let sidebar =
++                            cx.new(|cx| Sidebar::new(multi_workspace_handle.clone(), window, cx));
++                        multi_workspace_handle.update(cx, |multi_workspace, cx| {
++                            multi_workspace.register_sidebar(sidebar, cx);
++                        });
++                    })
++                    .ok();
++            }
++        };
++
++        if !DisableAiSettings::get_global(cx).disable_ai {
++            cx.defer(move |cx| register_sidebar(cx));
++        } else {
++            cx.observe_global::<SettingsStore>(move |_, cx| {
++                if !DisableAiSettings::get_global(cx).disable_ai {
++                    let register_sidebar = register_sidebar.clone();
++                    cx.defer(move |cx| register_sidebar(cx));
++                }
++            })
++            .detach();
++        }
+     })
+     .detach();
+ 
+@@ -778,11 +804,39 @@ fn show_software_emulation_warning_if_needed(
+ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<anyhow::Result<()>> {
+     cx.spawn_in(window, async move |workspace_handle, cx| {
+         let project_panel = ProjectPanel::load(workspace_handle.clone(), cx.clone());
++        // The outline is a section of the project panel, as in VS Code's Explorer, not a panel.
+         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
++        let explorer = {
++            let workspace_handle = workspace_handle.clone();
++            let mut cx = cx.clone();
++            async move {
++                let (project_panel, outline_panel) =
++                    futures::join!(project_panel, outline_panel);
++                let Some(project_panel) =
++                    project_panel.context("failed to load panel").log_err()
++                else {
++                    return;
++                };
++                let outline_panel = outline_panel.context("failed to load panel").log_err();
++                workspace_handle
++                    .update_in(&mut cx, |workspace, window, cx| {
++                        workspace.add_panel(project_panel.clone(), window, cx);
++                        if let Some(outline_panel) = outline_panel {
++                            add_outline_section(
++                                workspace,
++                                &project_panel,
++                                outline_panel,
++                                window,
++                                cx,
++                            );
++                        }
++                        timeline::add_to_explorer(workspace, &project_panel, window, cx);
++                    })
++                    .log_err();
++            }
++        };
+         let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());
+         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
+-        let channels_panel =
+-            collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
+         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
+ 
+         async fn add_panel_when_ready(
+@@ -801,11 +855,9 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
+         }
+ 
+         futures::join!(
+-            add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
+-            add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
++            explorer,
+             add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
+             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
+-            add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
+             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
+             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
+         );
+@@ -818,6 +870,56 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
+     })
+ }
+ 
++fn add_outline_section(
++    workspace: &mut Workspace,
++    project_panel: &Entity<ProjectPanel>,
++    outline_panel: Entity<OutlinePanel>,
++    window: &mut Window,
++    cx: &mut Context<Workspace>,
++) {
++    const TITLE: &str = "Outline";
++    let focus_handle = outline_panel.read(cx).activation_focus_handle(cx);
++    let set_visible = {
++        let outline_panel = outline_panel.downgrade();
++        move |visible: bool, window: &mut Window, cx: &mut App| {
++            outline_panel
++                .update(cx, |outline_panel, cx| {
++                    outline_panel.set_active(visible, window, cx)
++                })
++                .log_err();
++        }
++    };
++    let outline_for_symbols = outline_panel.downgrade();
++    project_panel.update(cx, |project_panel, cx| {
++        project_panel.add_section(
++            project_panel::ExplorerSection {
++                title: TITLE.into(),
++                view: outline_panel.into(),
++                focus_handle,
++                set_visible: Rc::new(set_visible),
++                expanded: false,
++            },
++            window,
++            cx,
++        )
++    });
++    workspace.register_action(|workspace, _: &outline_panel::ToggleFocus, window, cx| {
++        project_panel::toggle_section_focus(workspace, TITLE, window, cx);
++    });
++    workspace.register_action(|workspace, _: &outline_panel::Toggle, window, cx| {
++        project_panel::toggle_section_visibility(workspace, TITLE, window, cx);
++    });
++    workspace.register_action(move |_, _: &outline_panel::ToggleSymbols, window, cx| {
++        if let Some(outline_panel) = outline_for_symbols.upgrade() {
++            window.defer(cx, move |window, cx| {
++                outline_panel.update(cx, |outline_panel, cx| {
++                    outline_panel.toggle_symbols(&outline_panel::ToggleSymbols, window, cx);
++                });
++            });
++        }
++    });
++}
++
+ fn setup_or_teardown_ai_panel<P: Panel>(
+     workspace: &mut Workspace,
+     window: &mut Window,
+@@ -1321,22 +1423,6 @@ fn register_actions(
+                 workspace.toggle_panel_focus::<ProjectPanel>(window, cx);
+             },
+         )
+-        .register_action(
+-            |workspace: &mut Workspace,
+-             _: &outline_panel::ToggleFocus,
+-             window: &mut Window,
+-             cx: &mut Context<Workspace>| {
+-                workspace.toggle_panel_focus::<OutlinePanel>(window, cx);
+-            },
+-        )
+-        .register_action(
+-            |workspace: &mut Workspace,
+-             _: &collab_ui::collab_panel::ToggleFocus,
+-             window: &mut Window,
+-             cx: &mut Context<Workspace>| {
+-                workspace.toggle_panel_focus::<collab_ui::collab_panel::CollabPanel>(window, cx);
+-            },
+-        )
+         .register_action(
+             |workspace: &mut Workspace,
+              _: &terminal_panel::ToggleFocus,
+@@ -2121,30 +2207,78 @@ pub fn watch_user_agents_md(fs: Arc<dyn fs::Fs>, cx: &mut App) {
+     });
+ }
+ 
+-pub fn watch_settings_files(fs: Arc<dyn fs::Fs>, cx: &mut App) {
++pub fn watch_settings_files_with_receivers(
++    user_settings_file_rx: mpsc::UnboundedReceiver<String>,
++    user_settings_watcher: gpui::Task<()>,
++    global_settings_file_rx: mpsc::UnboundedReceiver<String>,
++    global_settings_watcher: gpui::Task<()>,
++    cx: &mut App,
++) {
+     MigrationNotification::set_global(cx.new(|_| MigrationNotification), cx);
+ 
+     SettingsStore::update_global(cx, move |store, cx| {
+-        store.watch_settings_files(fs, cx, |settings_file, result, cx| {
+-            let is_user = matches!(settings_file, SettingsFile::User);
+-            let migrating_in_memory =
+-                matches!(&result.migration_status, MigrationStatus::Succeeded);
+-            notify_settings_errors(result, is_user, cx);
+-            if let Some(notifier) = MigrationNotification::try_global(cx) {
+-                notifier.update(cx, |_, cx| {
+-                    cx.emit(MigrationEvent::ContentChanged {
+-                        migration_type: MigrationType::Settings,
+-                        migrating_in_memory,
++        store.watch_settings_files_with_receivers(
++            user_settings_file_rx,
++            user_settings_watcher,
++            global_settings_file_rx,
++            global_settings_watcher,
++            cx,
++            |settings_file, result, cx| {
++                let is_user = matches!(settings_file, SettingsFile::User);
++                let migrating_in_memory =
++                    matches!(&result.migration_status, MigrationStatus::Succeeded);
++                notify_settings_errors(result, is_user, cx);
++                if let Some(notifier) = MigrationNotification::try_global(cx) {
++                    notifier.update(cx, |_, cx| {
++                        cx.emit(MigrationEvent::ContentChanged {
++                            migration_type: MigrationType::Settings,
++                            migrating_in_memory,
++                        });
+                     });
+-                });
+-            }
+-        });
++                }
++            },
++        );
+     });
+ }
+ 
++pub struct PreloadedKeymaps {
++    default_keymap: Option<KeymapFile>,
++    vscode_keymap: Option<KeymapFile>,
++    overrides_keymap: Option<KeymapFile>,
++}
++
++/// Pre-parses built-in keymap JSONC assets off the main thread so startup
++/// overlaps keymap parsing with AppKit launch.
++pub fn preload_default_keymaps() -> PreloadedKeymaps {
++    let parse_asset = |path: &str| {
++        let content = util::asset_str::<settings::SettingsAssets>(path);
++        KeymapFile::parse(content.as_ref()).log_err()
++    };
++    PreloadedKeymaps {
++        default_keymap: parse_asset(DEFAULT_KEYMAP_PATH),
++        vscode_keymap: BaseKeymap::VSCode.asset_path().and_then(parse_asset),
++        overrides_keymap: parse_asset(SPECIFIC_OVERRIDES_KEYMAP_PATH),
++    }
++}
++
++#[cfg_attr(not(test), allow(dead_code))]
+ pub fn handle_keymap_file_changes(
++    user_keymap_file_rx: mpsc::UnboundedReceiver<String>,
++    user_keymap_watcher: gpui::Task<()>,
++    cx: &mut App,
++) {
++    handle_keymap_file_changes_with_preloaded(
++        user_keymap_file_rx,
++        user_keymap_watcher,
++        None,
++        cx,
++    );
++}
++
++pub fn handle_keymap_file_changes_with_preloaded(
+     mut user_keymap_file_rx: mpsc::UnboundedReceiver<String>,
+     user_keymap_watcher: gpui::Task<()>,
++    preloaded_keymaps: Option<PreloadedKeymaps>,
+     cx: &mut App,
+ ) {
+     let (base_keymap_tx, mut base_keymap_rx) = mpsc::unbounded();
+@@ -2205,15 +2339,96 @@ pub fn handle_keymap_file_changes(
+         .detach();
+     }
+ 
+-    load_default_keymap(cx);
++    load_default_keymap_with_preloaded(preloaded_keymaps, cx);
+ 
+     struct KeymapParseErrorNotification;
+     let notification_id = NotificationId::unique::<KeymapParseErrorNotification>();
+ 
++    // Consume the initial keymap file read (started before app.run()) and bind user
++    // keybindings once, avoiding a redundant full clear+reload+menu-rebuild on the first tick.
++    let mut initial_user_keymap_content = String::new();
++    let mut initial_migrating_in_memory = false;
++    let mut initial_error: Option<InitialKeymapError> = None;
++    if let Some(content) = cx
++        .foreground_executor()
++        .block_on(user_keymap_file_rx.next())
++    {
++        if let Ok(Some(migrated_content)) = migrate_keymap(&content) {
++            initial_user_keymap_content = migrated_content;
++            initial_migrating_in_memory = true;
++        } else {
++            initial_user_keymap_content = content;
++        }
++        match KeymapFile::load(&initial_user_keymap_content, cx) {
++            KeymapFileLoadResult::Success { mut key_bindings } => {
++                for key_binding in &mut key_bindings {
++                    key_binding.set_meta(KeybindSource::User.meta());
++                }
++                cx.bind_keys(filter_disabled_ai_bindings(key_bindings, cx));
++            }
++            KeymapFileLoadResult::SomeFailedToLoad {
++                mut key_bindings,
++                error_message,
++            } => {
++                if !key_bindings.is_empty() {
++                    for key_binding in &mut key_bindings {
++                        key_binding.set_meta(KeybindSource::User.meta());
++                    }
++                    cx.bind_keys(filter_disabled_ai_bindings(key_bindings, cx));
++                }
++                initial_error = Some(InitialKeymapError::SomeFailed(error_message));
++            }
++            KeymapFileLoadResult::JsonParseFailure { error } => {
++                initial_error = Some(InitialKeymapError::JsonParse(error));
++            }
++        }
++    }
++
++    enum InitialKeymapError {
++        SomeFailed(MarkdownString),
++        JsonParse(anyhow::Error),
++    }
++
+     cx.spawn(async move |cx| {
+         let _user_keymap_watcher = user_keymap_watcher;
+-        let mut user_keymap_content = String::new();
+-        let mut migrating_in_memory = false;
++        let mut user_keymap_content = initial_user_keymap_content;
++        let mut migrating_in_memory = initial_migrating_in_memory;
++        if migrating_in_memory || initial_error.is_some() {
++            let needs_window = cx.update(|cx| cx.windows().is_empty());
++            if needs_window {
++                let (window_tx, window_rx) = futures::channel::oneshot::channel::<()>();
++                let window_tx = Rc::new(std::cell::RefCell::new(Some(window_tx)));
++                let _window_sub = cx.update(|cx| {
++                    cx.observe_new::<Workspace>(move |_, _, _| {
++                        if let Some(tx) = window_tx.borrow_mut().take() {
++                            tx.send(()).ok();
++                        }
++                    })
++                });
++                let _ = window_rx.await;
++            }
++            cx.update(|cx| {
++                if migrating_in_memory
++                    && let Some(notifier) = MigrationNotification::try_global(cx)
++                {
++                    notifier.update(cx, |_, cx| {
++                        cx.emit(MigrationEvent::ContentChanged {
++                            migration_type: MigrationType::Keymap,
++                            migrating_in_memory: true,
++                        });
++                    });
++                }
++                match initial_error {
++                    Some(InitialKeymapError::SomeFailed(error_message)) => {
++                        show_keymap_file_load_error(notification_id.clone(), error_message, cx);
++                    }
++                    Some(InitialKeymapError::JsonParse(error)) => {
++                        show_keymap_file_json_error(notification_id.clone(), &error, cx);
++                    }
++                    None => {}
++                }
++            });
++        }
+         loop {
+             select_biased! {
+                 _ = base_keymap_rx.next() => {},
+@@ -2359,19 +2574,56 @@ fn reload_keymaps(cx: &mut App, mut user_key_bindings: Vec<KeyBinding>) {
+ }
+ 
+ pub fn load_default_keymap(cx: &mut App) {
++    load_default_keymap_with_preloaded(None, cx);
++}
++
++fn load_preloaded_or_asset(
++    preloaded: Option<KeymapFile>,
++    asset_path: &str,
++    source: Option<KeybindSource>,
++    cx: &App,
++) -> Vec<KeyBinding> {
++    if let Some(keymap_file) = preloaded
++        && let KeymapFileLoadResult::Success { mut key_bindings } = keymap_file.load_keymap(cx)
++    {
++        if let Some(source) = source {
++            for key_binding in &mut key_bindings {
++                key_binding.set_meta(source.meta());
++            }
++        }
++        return key_bindings;
++    }
++    KeymapFile::load_asset(asset_path, source, cx).unwrap()
++}
++
++fn load_default_keymap_with_preloaded(preloaded: Option<PreloadedKeymaps>, cx: &mut App) {
+     let base_keymap = *BaseKeymap::get_global(cx);
+     if base_keymap == BaseKeymap::None {
+         return;
+     }
++    let (default_keymap, vscode_keymap, overrides_keymap) = match preloaded {
++        Some(p) => (p.default_keymap, p.vscode_keymap, p.overrides_keymap),
++        None => (None, None, None),
++    };
+ 
+     cx.bind_keys(filter_disabled_ai_bindings(
+-        KeymapFile::load_asset(DEFAULT_KEYMAP_PATH, Some(KeybindSource::Default), cx).unwrap(),
++        load_preloaded_or_asset(
++            default_keymap,
++            DEFAULT_KEYMAP_PATH,
++            Some(KeybindSource::Default),
++            cx,
++        ),
+         cx,
+     ));
+ 
+     if let Some(asset_path) = base_keymap.asset_path() {
++        let base_preloaded = if base_keymap == BaseKeymap::VSCode {
++            vscode_keymap
++        } else {
++            None
++        };
+         cx.bind_keys(filter_disabled_ai_bindings(
+-            KeymapFile::load_asset(asset_path, Some(KeybindSource::Base), cx).unwrap(),
++            load_preloaded_or_asset(base_preloaded, asset_path, Some(KeybindSource::Base), cx),
+             cx,
+         ));
+     }
+@@ -2383,14 +2635,12 @@ pub fn load_default_keymap(cx: &mut App) {
+         ));
+     }
+ 
+-    cx.bind_keys(
+-        KeymapFile::load_asset(
+-            SPECIFIC_OVERRIDES_KEYMAP_PATH,
+-            Some(KeybindSource::Default),
+-            cx,
+-        )
+-        .unwrap(),
+-    );
++    cx.bind_keys(load_preloaded_or_asset(
++        overrides_keymap,
++        SPECIFIC_OVERRIDES_KEYMAP_PATH,
++        Some(KeybindSource::Default),
++        cx,
++    ));
+ }
+ 
+ /// Namespaces of actions that are part of an AI feature. When the user opts out
+@@ -2789,7 +3039,9 @@ fn open_settings_file(
+ /// This fast path exists to load these themes as soon as possible so the user
+ /// doesn't see the default themes while waiting on extensions to load.
+ pub(crate) fn eager_load_active_theme_and_icon_theme(fs: Arc<dyn Fs>, cx: &mut App) {
+-    let extension_store = ExtensionStore::global(cx);
++    let Some(extension_store) = ExtensionStore::try_global(cx) else {
++        return;
++    };
+     let theme_registry = ThemeRegistry::global(cx);
+     let theme_settings = ThemeSettings::get_global(cx);
+     let appearance = SystemAppearance::global(cx).0;
+diff --git a/crates/zed/src/zed/app_menus.rs b/crates/zed/src/zed/app_menus.rs
+index aff790d..cf13c5e 100644
+--- a/crates/zed/src/zed/app_menus.rs
++++ b/crates/zed/src/zed/app_menus.rs
+@@ -1,4 +1,3 @@
+-use collab_ui::collab_panel;
+ use gpui::{App, Menu, MenuItem, OsAction};
+ use project::DisableAiSettings;
+ use release_channel::ReleaseChannel;
+@@ -42,7 +41,6 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
+         MenuItem::separator(),
+         MenuItem::action("Project Panel", project_panel::ToggleFocus),
+         MenuItem::action("Outline Panel", outline_panel::ToggleFocus),
+-        MenuItem::action("Collab Panel", collab_panel::ToggleFocus),
+         MenuItem::action("Terminal Panel", terminal_panel::Toggle),
+         MenuItem::action("Debugger Panel", debug_panel::ToggleFocus),
+     ];
+@@ -98,7 +96,6 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
+                 #[cfg(target_os = "macos")]
+                 MenuItem::os_submenu("Services", gpui::SystemMenuType::Services),
+                 MenuItem::separator(),
+-                MenuItem::action("Extensions", zed_actions::Extensions::default()),
+                 #[cfg(not(target_os = "windows"))]
+                 MenuItem::action("Install CLI", install_cli::InstallCliBinary),
+                 MenuItem::separator(),
+@@ -312,17 +309,12 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
+                 MenuItem::action("View Dependency Licenses", zed_actions::OpenLicenses),
+                 MenuItem::action("Show Welcome", onboarding::ShowWelcome),
+                 MenuItem::separator(),
+-                MenuItem::action("File Bug Report...", zed_actions::feedback::FileBugReport),
+-                MenuItem::action("Request Feature...", zed_actions::feedback::RequestFeature),
+-                MenuItem::action("Email Us...", zed_actions::feedback::EmailZed),
+-                MenuItem::separator(),
+                 MenuItem::action(
+                     "Documentation",
+                     super::OpenBrowser {
+                         url: "https://zed.dev/docs".into(),
+                     },
+                 ),
+-                MenuItem::action("Zed Repository", feedback::OpenZedRepo),
+                 MenuItem::action(
+                     "Zed Twitter",
+                     super::OpenBrowser {
+-- 
+2.54.0 (Apple Git-157)
+

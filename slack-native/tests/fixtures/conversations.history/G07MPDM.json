@@ -1,0 +1,31 @@
+{
+  "ok": true,
+  "messages": [
+    {
+      "user": "U02SAM",
+      "type": "message",
+      "ts": "1795111200.000111",
+      "client_msg_id": "ed5f265b-0000-4000-8000-02b3aec0ee74",
+      "text": "lunch on Friday?",
+      "team": "T0NORTHWND",
+      "blocks": [
+        {
+          "type": "rich_text",
+          "block_id": "b7797",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                {
+                  "type": "text",
+                  "text": "lunch on Friday?"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "has_more": false
+}

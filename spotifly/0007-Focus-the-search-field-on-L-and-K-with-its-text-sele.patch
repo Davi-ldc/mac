@@ -1,0 +1,167 @@
+From fd8e75b9e5e7c7d7e74218076ed1eb35bf7aefe7 Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Mon, 23 Nov 2026 14:32:03 -0300
+Subject: [PATCH 07/10] =?UTF-8?q?Focus=20the=20search=20field=20on=20?=
+ =?UTF-8?q?=E2=8C=98L=20and=20=E2=8C=98K,=20with=20its=20text=20selected?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ Spotifly/AppShortcut.swift                |  3 +-
+ Spotifly/SpotiflyApp.swift                | 27 +++++++++++++---
+ SpotiflyTests/AppShortcutTests.swift      | 11 +++++++
+ SpotiflyTests/SearchFieldFocusTests.swift | 38 ++++++++++++++++++-----
+ 4 files changed, 67 insertions(+), 12 deletions(-)
+
+diff --git a/Spotifly/AppShortcut.swift b/Spotifly/AppShortcut.swift
+index cfea3fe..8ac50de 100644
+--- a/Spotifly/AppShortcut.swift
++++ b/Spotifly/AppShortcut.swift
+@@ -61,7 +61,8 @@ enum AppShortcut: CaseIterable {
+         case .previousTrack: KeyboardShortcut(.leftArrow, modifiers: .command)
+         case .volumeUp: KeyboardShortcut(.upArrow, modifiers: .command)
+         case .volumeDown: KeyboardShortcut(.downArrow, modifiers: .command)
+-        case .likeTrack: KeyboardShortcut("l", modifiers: .command)
++        // Spotify's own: ⌘L focuses the search there, and here (`focusSearchOnShortcut`).
++        case .likeTrack: KeyboardShortcut("b", modifiers: [.option, .shift])
+         case .search: KeyboardShortcut("f", modifiers: .command)
+         case .sidebar: KeyboardShortcut("s", modifiers: [.control, .command])
+         case .inspector: KeyboardShortcut("i", modifiers: [.option, .command])
+diff --git a/Spotifly/SpotiflyApp.swift b/Spotifly/SpotiflyApp.swift
+index 4089154..507e809 100644
+--- a/Spotifly/SpotiflyApp.swift
++++ b/Spotifly/SpotiflyApp.swift
+@@ -42,7 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+             return event
+         }
+         _ = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+-            playPauseOnSpace(event) ? nil : event
++            playPauseOnSpace(event) || focusSearchOnShortcut(event) ? nil : event
+         }
+     }
+ 
+@@ -342,14 +342,33 @@ private struct NavigationHistoryMenuItems: View {
+ func focusToolbarSearchField() {
+     let windows = NSApp.windows.sorted { $0.isKeyWindow && !$1.isKeyWindow }
+     for window in windows where window.isVisible {
+-        // The toolbar lives in the window frame view, above contentView.
+-        if let field = firstSearchField(in: window.contentView?.superview ?? window.contentView) {
+-            window.makeFirstResponder(field)
++        if focusSearchField(in: window) {
+             return
+         }
+     }
+ }
+ 
++/// Focuses `window`'s toolbar search field with all of its text selected, so typing replaces the
++/// last search. Returns false for a window without one: Settings, or the mini player.
++@discardableResult
++func focusSearchField(in window: NSWindow) -> Bool {
++    // The toolbar lives in the window frame view, above contentView.
++    guard let field = firstSearchField(in: window.contentView?.superview ?? window.contentView) else { return false }
++    field.selectText(nil)
++    return true
++}
++
++/// Focuses the search field on ⌘L or ⌘K, as Spotify's own app does (⌘L, and ⌘K for its quick
++/// search), beside the menu's ⌘F, from anywhere in a window that has the field. Returns whether
++/// the key was taken; in a sheet or alert it is left to them.
++func focusSearchOnShortcut(_ event: NSEvent) -> Bool {
++    let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .function])
++    guard modifiers == .command, let key = event.charactersIgnoringModifiers?.lowercased(), ["l", "k"].contains(key),
++          let window = event.window, window.attachedSheet == nil, window.sheetParent == nil
++    else { return false }
++    return focusSearchField(in: window)
++}
++
+ /// Ends the search field's editing on a click anywhere else in its window.
+ ///
+ /// SwiftUI's lists and grids take no focus when clicked, so once the toolbar's field had it, from
+diff --git a/SpotiflyTests/AppShortcutTests.swift b/SpotiflyTests/AppShortcutTests.swift
+index 7eac9e4..a7bd23f 100644
+--- a/SpotiflyTests/AppShortcutTests.swift
++++ b/SpotiflyTests/AppShortcutTests.swift
+@@ -6,6 +6,7 @@
+ //
+ 
+ @testable import Spotifly
++import SwiftUI
+ import Testing
+ 
+ /// The settings window lists the shortcuts the menus bind, spelled as a menu spells them:
+@@ -17,5 +18,15 @@ struct AppShortcutTests {
+         #expect(AppShortcut.sidebar.glyphs == "⌃⌘S")
+         #expect(AppShortcut.nextTrack.glyphs == "⌘→")
+         #expect(AppShortcut.back.glyphs == "⌘[")
++        #expect(AppShortcut.likeTrack.glyphs == "⌥⇧B")
++    }
++
++    /// ⌘L and ⌘K focus the search field (`focusSearchOnShortcut`), ahead of the menus, so a menu
++    /// item showing either would never run.
++    @Test func `no menu item claims ⌘L or ⌘K`() {
++        let claimed = AppShortcut.allCases.filter {
++            $0.shortcut.modifiers == .command && ["l", "k"].contains($0.shortcut.key.character)
++        }
++        #expect(claimed.isEmpty)
+     }
+ }
+diff --git a/SpotiflyTests/SearchFieldFocusTests.swift b/SpotiflyTests/SearchFieldFocusTests.swift
+index e24eebe..1dbfa1e 100644
+--- a/SpotiflyTests/SearchFieldFocusTests.swift
++++ b/SpotiflyTests/SearchFieldFocusTests.swift
+@@ -60,20 +60,44 @@ struct SearchFieldFocusTests {
+     /// still types one.
+     @Test func `a space typed in the search field is the field's, not Play/Pause`() throws {
+         edit(NSSearchField())
+-        let space = try #require(NSEvent.keyEvent(
++
++        #expect(try !playPauseOnSpace(key(" ", code: 49)))
++    }
++
++    /// From anywhere in the window, here with nothing focused: the field takes the focus, and its
++    /// last search is selected, so typing replaces it.
++    @Test(arguments: [("l", UInt16(37)), ("k", 40)])
++    func `⌘L and ⌘K focus the search field with its text selected`(character: String, code: UInt16) throws {
++        let field = NSSearchField()
++        field.stringValue = "garden"
++        edit(field)
++        window.makeFirstResponder(nil)
++
++        #expect(try focusSearchOnShortcut(key(character, code: code, modifiers: .command)))
++        let editor = try #require(window.firstResponder as? NSTextView)
++        #expect(editor.delegate === field)
++        #expect(editor.selectedRange() == NSRange(location: 0, length: 6))
++    }
++
++    @Test func `L alone, and ⌘L in a window without the field, are left alone`() throws {
++        #expect(try !focusSearchOnShortcut(key("l", code: 37, modifiers: .command)))
++        edit(NSSearchField())
++        #expect(try !focusSearchOnShortcut(key("l", code: 37)))
++    }
++
++    private func key(_ characters: String, code: UInt16, modifiers: NSEvent.ModifierFlags = []) throws -> NSEvent {
++        try #require(NSEvent.keyEvent(
+             with: .keyDown,
+             location: .zero,
+-            modifierFlags: [],
++            modifierFlags: modifiers,
+             timestamp: 0,
+             windowNumber: window.windowNumber,
+             context: nil,
+-            characters: " ",
+-            charactersIgnoringModifiers: " ",
++            characters: characters,
++            charactersIgnoringModifiers: characters,
+             isARepeat: false,
+-            keyCode: 49,
++            keyCode: code,
+         ))
+-
+-        #expect(!playPauseOnSpace(space))
+     }
+ 
+     /// A playlist's name in its sheet, say: only the search field holds on to Space.
+-- 
+2.54.0 (Apple Git-157)
+

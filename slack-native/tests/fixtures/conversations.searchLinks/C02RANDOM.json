@@ -1,0 +1,27 @@
+{
+ "ok": true,
+ "items": [
+  {
+   "url": "https://notes.example.com/p/2f1c9a7e44d0b6a1c3e8f5d27b90a614",
+   "title": null,
+   "icon_url": null,
+   "timestamp": "1795294000.000000",
+   "ts": "1795294000.000100",
+   "user": "U02SAM"
+  },
+  {
+   "url": "https://github.com/northwind/signup-flow",
+   "title": "GitHub - northwind/signup-flow: Fluxo de cadastro",
+   "icon_url": "https://github.com/favicon.ico",
+   "timestamp": "1795290500.000000",
+   "ts": "1795290500.000100",
+   "user": "U01ALEX"
+  }
+ ],
+ "pagination": {
+  "total_count": 2,
+  "page": 1,
+  "per_page": 20,
+  "page_count": 1
+ }
+}

@@ -1,0 +1,320 @@
+From c71c1acbc142d9f575f7f228bd71f601c4d52af5 Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Mon, 23 Nov 2026 11:15:12 -0300
+Subject: [PATCH 5/6] Search as the field is typed in, once typing pauses
+
+---
+ Spotifly/Store/AppStore.swift                 |  1 -
+ Spotifly/Store/Services/SearchService.swift   | 39 +++++++---
+ .../ViewModels/NavigationCoordinator.swift    | 14 ++++
+ Spotifly/Views/LoggedInView.swift             | 42 +++++++++--
+ .../NavigationCoordinatorTests.swift          | 32 ++++++++
+ SpotiflyTests/SearchServiceTests.swift        | 74 +++++++++++++++++++
+ 6 files changed, 186 insertions(+), 16 deletions(-)
+ create mode 100644 SpotiflyTests/SearchServiceTests.swift
+
+diff --git a/Spotifly/Store/AppStore.swift b/Spotifly/Store/AppStore.swift
+index 60245e9..0b0764d 100644
+--- a/Spotifly/Store/AppStore.swift
++++ b/Spotifly/Store/AppStore.swift
+@@ -68,7 +68,6 @@ final class AppStore {
+     /// Oldest to newest, used to enforce the bounded query cache.
+     private(set) var searchResultQueries: [String] = []
+     private(set) var searchCacheEvictionRevision: UInt64 = 0
+-    var searchIsLoading = false
+     /// The last submitted search that failed, which its results page shows in their place,
+     /// with Try again. Replaced by the next answer, and gone when the field is emptied.
+     private(set) var failedSearch: FailedSearch?
+diff --git a/Spotifly/Store/Services/SearchService.swift b/Spotifly/Store/Services/SearchService.swift
+index 7cc7d9d..88a84b8 100644
+--- a/Spotifly/Store/Services/SearchService.swift
++++ b/Spotifly/Store/Services/SearchService.swift
+@@ -37,22 +37,43 @@ final class SearchService {
+ 
+     // MARK: - Search
+ 
++    /// The query of the newest search while it runs, which typing does not ask for again.
++    private(set) var searchingQuery: String?
++    /// Counts the searches asked for, so one can tell whether a newer one came after it.
++    private var searchRun = 0
++
++    /// Searches `query` and keeps its results, or why it failed, and with `remembering` the query
++    /// among the recent searches. Returns whether it kept them: not when a newer search was asked
++    /// for while it ran, nor when its caller was cancelled, as typing on cancels the last pause's,
++    /// so an older search never replaces a newer one.
++    ///
+     /// Takes no access token: the partner API authorizes itself from the keymaster grant, which
+     /// is the point of the migration. The Web API token this used to need was minted with the
+     /// user's dashboard client id, and `api-partner` rejects it.
+-    func search(query: String) async {
+-        guard !query.isEmpty, !store.searchIsLoading else { return }
+-
+-        store.searchIsLoading = true
++    @discardableResult
++    func search(query: String, remembering: Bool = true) async -> Bool {
++        guard !query.isEmpty else { return false }
++        searchRun &+= 1
++        let run = searchRun
++        searchingQuery = query
++        defer {
++            if run == searchRun {
++                searchingQuery = nil
++            }
++        }
+ 
+         do {
+-            try await store.setSearchResults(partnerSearch(query: query), for: query)
+-            remember(query)
++            let results = try await partnerSearch(query: query)
++            guard run == searchRun, !Task.isCancelled else { return false }
++            store.setSearchResults(results, for: query)
++            if remembering {
++                remember(query)
++            }
+         } catch {
++            guard run == searchRun, !Task.isCancelled else { return false }
+             store.setSearchFailure(error, for: query)
+         }
+-
+-        store.searchIsLoading = false
++        return true
+     }
+ 
+     // MARK: - More results
+@@ -103,7 +124,7 @@ final class SearchService {
+     // MARK: - Recent searches
+ 
+     /// Puts `query` first among the recent searches, once.
+-    private func remember(_ query: String) {
++    func remember(_ query: String) {
+         recentSearches.removeAll { $0 == query }
+         recentSearches.insert(query, at: 0)
+         recentSearches = Array(recentSearches.prefix(Self.recentSearchesLimit))
+diff --git a/Spotifly/ViewModels/NavigationCoordinator.swift b/Spotifly/ViewModels/NavigationCoordinator.swift
+index e39315b..288ef24 100644
+--- a/Spotifly/ViewModels/NavigationCoordinator.swift
++++ b/Spotifly/ViewModels/NavigationCoordinator.swift
+@@ -131,6 +131,20 @@ final class NavigationCoordinator {
+         navigate(to: Route(section: .searchResults, query: query))
+     }
+ 
++    /// Shows `query`'s results as it is typed: in place of the search shown, in the scope it is
++    /// shown in, so the history keeps one step for what was typed, as for a search with Return.
++    /// From anywhere else, the search home among it, a step of its own.
++    func showTypedSearch(query: String) {
++        guard store?.canShowSearch(for: query) == true else { return }
++        guard displayedSearchQuery != nil else {
++            navigate(to: Route(section: .searchResults, query: query))
++            return
++        }
++        var route = current
++        route.query = query
++        replace(with: route)
++    }
++
+     func selectAlbum(_ albumId: String?, recordsHistory: Bool = true) {
+         setSelection(albumId.map { .album(id: $0) }, for: .albums, recordsHistory: recordsHistory)
+     }
+diff --git a/Spotifly/Views/LoggedInView.swift b/Spotifly/Views/LoggedInView.swift
+index ebecca5..44aba86 100644
+--- a/Spotifly/Views/LoggedInView.swift
++++ b/Spotifly/Views/LoggedInView.swift
+@@ -69,7 +69,7 @@ struct LoggedInView: View {
+                 // itself — attaching it to an inner view inside the detail column
+                 // does not surface the field in the window toolbar. Centered in the
+                 // toolbar, as in Spotify's own app.
+-                // On Favorites the field filters the list, and Return searches nothing.
++                // On Favorites the field filters the list, and neither typing nor Return searches.
+                 .searchable(
+                     text: $searchText,
+                     placement: .toolbarPrincipal,
+@@ -90,6 +90,8 @@ struct LoggedInView: View {
+                     }
+                 }
+                 .onChange(of: searchText) { _, newValue in handleSearchTextChange(newValue) }
++                // Each keystroke restarts it, which cancels the last one's wait or search.
++                .task(id: searchText) { await searchAsTyped() }
+                 // The field shows the search on screen, as Back and a recent search change it, and
+                 // nothing on the search page before a search.
+                 .onChange(of: navigationCoordinator.displayedSearchQuery) { _, query in
+@@ -210,21 +212,49 @@ struct LoggedInView: View {
+         navigationCoordinator.selectedNavigationItem == .favorites
+     }
+ 
++    /// Return: searches what the field says at once, and keeps it among the recent searches.
++    /// Results the typing already shows are kept, not asked for again.
+     private func performSearch() {
+         let query = searchText
++        if query == navigationCoordinator.displayedSearchQuery, session.store.searchResults(for: query) != nil {
++            session.searchService.remember(query)
++            return
++        }
+         Task {
+             debugLog("Search", "Starting search for: \(query)")
+-            await session.searchService.search(query: query)
++            let kept = await session.searchService.search(query: query)
+             debugLog("Search", "After search - results: \(session.store.searchResults(for: query) != nil), error: \(session.store.failedSearch?.failure.message ?? "nil")")
+-            // The page opens for a failure too, to say so. The field can be cleared while the
+-            // request is in flight, which already left the results view; do not navigate back
+-            // into it behind the user.
+-            if !searchText.isEmpty {
++            // The page opens for a failure too, to say so. Not for a search a newer one replaced,
++            // nor once the field says something else: typed on, or emptied, which already left
++            // the results view; do not navigate back into it behind the user.
++            if kept, searchText == query {
+                 navigationCoordinator.navigateToSearchResults(query: query)
+             }
+         }
+     }
+ 
++    /// Shows the results for what the field says once typing pauses for 250 ms, as Spotify's own
++    /// app searches as you type. The pause keeps a word typed at speed to one search of four
++    /// requests, against Spotify's rate limit. Nothing is asked for a query with results kept,
++    /// one already being searched, or the one on screen, which Back and a recent search put in
++    /// the field too. Typed queries are not recent searches: a pause mid-word would add one.
++    private func searchAsTyped() async {
++        let query = searchText
++        guard !isFilteringFavorites, !query.trimmingCharacters(in: .whitespaces).isEmpty,
++              query != navigationCoordinator.displayedSearchQuery
++        else { return }
++        do {
++            try await Task.sleep(for: .milliseconds(250))
++        } catch {
++            return
++        }
++        let search = session.searchService
++        if session.store.searchResults(for: query) == nil, search.searchingQuery != query {
++            guard await search.search(query: query, remembering: false) else { return }
++        }
++        navigationCoordinator.showTypedSearch(query: query)
++    }
++
+     private func handleSearchTextChange(_ newValue: String) {
+         guard newValue.isEmpty else { return }
+         session.searchService.clearFailure()
+diff --git a/SpotiflyTests/NavigationCoordinatorTests.swift b/SpotiflyTests/NavigationCoordinatorTests.swift
+index e6f2e84..b5a0964 100644
+--- a/SpotiflyTests/NavigationCoordinatorTests.swift
++++ b/SpotiflyTests/NavigationCoordinatorTests.swift
+@@ -462,6 +462,38 @@ struct NavigationCoordinatorTests {
+         #expect(coordinator.current == Route(section: .playlists, selection: .playlist(id: "playlist-a")))
+     }
+ 
++    /// What was typed is one step, so Back leads to where the search started, here the search
++    /// home, rather than through every pause in the typing.
++    @Test func `a typed search replaces the search shown`() {
++        let store = AppStore()
++        for query in ["g", "ga"] {
++            store.setSearchResults(emptySearchResults, for: query)
++        }
++        let coordinator = NavigationCoordinator(store: store)
++        coordinator.selectNavigationItem(.searchResults)
++
++        coordinator.showTypedSearch(query: "g")
++        coordinator.showTypedSearch(query: "ga")
++
++        #expect(coordinator.current == Route(section: .searchResults, query: "ga"))
++        coordinator.navigateBackward()
++        #expect(coordinator.current == Route(section: .searchResults))
++    }
++
++    @Test func `a typed search keeps the scope shown`() {
++        let store = AppStore()
++        for query in ["g", "ga"] {
++            store.setSearchResults(emptySearchResults, for: query)
++        }
++        let coordinator = NavigationCoordinator(store: store)
++        coordinator.navigateToSearchResults(query: "g")
++        coordinator.showSearchScope(.tracks)
++
++        coordinator.showTypedSearch(query: "ga")
++
++        #expect(coordinator.current == Route(section: .searchResults, query: "ga", searchScope: .tracks))
++    }
++
+     @Test func `queue deep link applies its route directly`() {
+         let coordinator = NavigationCoordinator(store: AppStore())
+         coordinator.navigateToQueue()
+diff --git a/SpotiflyTests/SearchServiceTests.swift b/SpotiflyTests/SearchServiceTests.swift
+new file mode 100644
+index 0000000..3847614
+--- /dev/null
++++ b/SpotiflyTests/SearchServiceTests.swift
+@@ -0,0 +1,74 @@
++//
++//  SearchServiceTests.swift
++//  SpotiflyTests
++//
++//  Searching as the field is typed in: the newest search is the one whose results are kept, and
++//  typing does not fill the recent searches.
++//
++
++import Foundation
++@testable import Spotifly
++import Testing
++
++@MainActor
++struct SearchServiceTests {
++    private let store = AppStore()
++
++    /// A service whose searches Spotify answers at once with no results, except those for
++    /// `held`, which wait for `gate` and then, as `URLSession` does, throw if cancelled.
++    private func service(holding held: String? = nil, until gate: AsyncGate? = nil) -> SearchService {
++        let transport: PartnerAPI.Transport = { request in
++            let body = String(decoding: request.httpBody ?? Data(), as: UTF8.self)
++            if let held, let gate, body.contains(#""searchTerm":"\#(held)""#) {
++                await gate.entered()
++                await gate.wait()
++                try Task.checkCancellation()
++            }
++            return (Data(#"{"data":{}}"#.utf8), httpResponse(200))
++        }
++        let defaults = UserDefaults(suiteName: "SearchServiceTests.\(UUID().uuidString)")!
++        return SearchService(store: store, partner: partnerAPI(transport: transport), defaults: defaults)
++    }
++
++    @Test func `an older search answering after a newer one keeps nothing`() async {
++        let gate = AsyncGate()
++        let search = service(holding: "gar", until: gate)
++        let older = Task { await search.search(query: "gar") }
++        await gate.waitUntilEntered()
++
++        #expect(await search.search(query: "garden"))
++        await gate.open()
++
++        #expect(await older.value == false)
++        #expect(store.searchResults(for: "gar") == nil)
++        #expect(store.searchResults(for: "garden") != nil)
++        #expect(search.recentSearches == ["garden"])
++        #expect(search.searchingQuery == nil)
++    }
++
++    /// Typing on cancels the search the last pause started.
++    @Test func `a cancelled search keeps no results and no failure`() async {
++        let gate = AsyncGate()
++        let search = service(holding: "gar", until: gate)
++        let typed = Task { await search.search(query: "gar", remembering: false) }
++        await gate.waitUntilEntered()
++        #expect(search.searchingQuery == "gar")
++
++        typed.cancel()
++        await gate.open()
++
++        #expect(await typed.value == false)
++        #expect(store.searchResults(for: "gar") == nil)
++        #expect(store.searchFailure(for: "gar") == nil)
++    }
++
++    /// A pause mid-word would otherwise add a part of a word.
++    @Test func `a typed search is not a recent search, one with Return is`() async {
++        let search = service()
++
++        #expect(await search.search(query: "gar", remembering: false))
++        #expect(search.recentSearches.isEmpty)
++        #expect(await search.search(query: "garden"))
++        #expect(search.recentSearches == ["garden"])
++    }
++}
+-- 
+2.54.0 (Apple Git-157)
+

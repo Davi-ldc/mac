@@ -1,0 +1,4 @@
+/build/
+/bench/bin/
+/bench/media/
+.DS_Store

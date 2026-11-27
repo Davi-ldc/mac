@@ -1,0 +1,112 @@
+From 1134ab211905ab14d4b551ba605970b5fe5ff2a5 Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Thu, 26 Nov 2026 15:22:48 -0300
+Subject: [PATCH 13/19] Delete the old logins from the keychain once, not at
+ every launch
+
+---
+ Spotifly/KeychainManager.swift | 48 +++++++++++++---------------------
+ Spotifly/SpotiflyApp.swift     | 12 +++------
+ 2 files changed, 22 insertions(+), 38 deletions(-)
+
+diff --git a/Spotifly/KeychainManager.swift b/Spotifly/KeychainManager.swift
+index 3f7ef98..65161d9 100644
+--- a/Spotifly/KeychainManager.swift
++++ b/Spotifly/KeychainManager.swift
+@@ -14,22 +14,6 @@ nonisolated enum KeychainManager {
+     /// Format: TeamID.groupName (must match keychain-access-groups in entitlements)
+     private static let accessGroup = "89S4HZY343.com.spotifly.keychain"
+ 
+-    // MARK: - The dashboard grant, which no longer exists
+-
+-    /// Deletes what the dashboard app left behind: the Web API access and refresh tokens, and
+-    /// the client id the user typed in to obtain them.
+-    ///
+-    /// Housekeeping on someone else's machine, run once per launch because there is nowhere
+-    /// cheaper to run it. The refresh token is a live credential for an app Spotifly no longer
+-    /// speaks to, and leaving it in the user's keychain forever is not ours to do. Delete this
+-    /// once enough releases have passed that no installed copy still holds one.
+-    static func purgeDashboardGrant() {
+-        for key in ["spotify_access_token", "spotify_refresh_token", "spotify_expires_at"] {
+-            delete(key: key, service: "com.spotifly.oauth")
+-        }
+-        delete(key: "spotify_custom_client_id", service: "com.spotifly.config")
+-    }
+-
+     // MARK: - Keymaster grant
+ 
+     private static let keymasterService = "com.spotifly.keymaster"
+@@ -58,22 +42,26 @@ nonisolated enum KeychainManager {
+         delete(key: keymasterTokensKey, service: keymasterService)
+     }
+ 
+-    // MARK: - Stored accesspoint login, which no longer exists
++    // MARK: - Logins that no longer exist
+ 
+-    private static let storedLoginService = "com.spotifly.librespot"
+-    private static let storedLoginKey = "stored_login"
++    /// Set once the old logins have been deleted, so the launches after do not ask the keychain
++    /// again. Named after the stored login, the first of them: a Mac that set it then had been
++    /// deleting the dashboard grant at every launch, and has none left.
++    static let oldLoginsClearedKey = "clearedStoredLogin"
+ 
+-    /// Set once the stored login has been deleted, so the launch after does not ask again.
+-    static let storedLoginClearedKey = "clearedStoredLogin"
+-
+-    /// Deletes the reusable accesspoint login the built-in player kept, which nothing reads
+-    /// since Soloist became the only player, and which is a live credential for the account.
+-    /// Once, at launch (`SpotiflyApp.init`), beside `ContainerMigration`, which deletes the file
+-    /// an older version kept it in: nothing writes it any more, so once is enough.
+-    static func clearStoredLoginOnce(defaults: UserDefaults = .standard) {
+-        guard !defaults.bool(forKey: storedLoginClearedKey) else { return }
+-        delete(key: storedLoginKey, service: storedLoginService)
+-        defaults.set(true, forKey: storedLoginClearedKey)
++    /// Deletes the logins of earlier versions, which nothing reads and which are live
++    /// credentials: the dashboard app's Web API tokens and the client id the user typed in to
++    /// obtain them, and the reusable accesspoint login of the built-in player, which Soloist
++    /// replaced. Once, at launch (`SpotiflyApp.init`), beside `ContainerMigration`, which deletes
++    /// the file an older version kept the stored login in: nothing writes them any more.
++    static func clearOldLoginsOnce(defaults: UserDefaults = .standard) {
++        guard !defaults.bool(forKey: oldLoginsClearedKey) else { return }
++        for key in ["spotify_access_token", "spotify_refresh_token", "spotify_expires_at"] {
++            delete(key: key, service: "com.spotifly.oauth")
++        }
++        delete(key: "spotify_custom_client_id", service: "com.spotifly.config")
++        delete(key: "stored_login", service: "com.spotifly.librespot")
++        defaults.set(true, forKey: oldLoginsClearedKey)
+     }
+ 
+     // MARK: - Soloist key
+diff --git a/Spotifly/SpotiflyApp.swift b/Spotifly/SpotiflyApp.swift
+index 507e809..5411491 100644
+--- a/Spotifly/SpotiflyApp.swift
++++ b/Spotifly/SpotiflyApp.swift
+@@ -85,21 +85,17 @@ struct SpotiflyApp: App {
+ 
+     init() {
+         // Before anything reads what the first launch outside the App Sandbox finds in the old
+-        // container. `auth` is built after it for that reason. The keychain copy of the
+-        // built-in player's stored login goes with it, once. Not when hosting the tests,
+-        // which must not move or delete the developer's data.
++        // container. `auth` is built after it for that reason. The old logins in the keychain
++        // go with it, once. Not when hosting the tests, which must not move or delete the
++        // developer's data.
+         if !Self.hostsUnitTests {
+             ContainerMigration.runOnce()
+-            KeychainManager.clearStoredLoginOnce()
++            KeychainManager.clearOldLoginsOnce()
+         }
+         _auth = State(initialValue: Self.hostsUnitTests ? nil : AuthViewModel())
+ 
+         // Set activation policy to regular to support media keys
+         NSApplication.shared.setActivationPolicy(.regular)
+-
+-        // Nothing reads the dashboard grant any more; this is where the last copy of it on an
+-        // upgraded machine gets thrown away.
+-        KeychainManager.purgeDashboardGrant()
+     }
+ 
+     /// Hosting the unit tests (`TEST_HOST`), the app finds the developer's grant and Connect
+-- 
+2.54.0 (Apple Git-157)
+

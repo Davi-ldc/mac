@@ -1,0 +1,92 @@
+From 5ad17b7e65030df5f0486dddb60409fbc3b09cb6 Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Tue, 24 Nov 2026 18:21:33 -0300
+Subject: [PATCH 08/10] Pause the playing track's waveform while its window is
+ out of sight
+
+---
+ Spotifly/Views/Components/TrackTable.swift | 48 +++++++++++++++++++++-
+ 1 file changed, 47 insertions(+), 1 deletion(-)
+
+diff --git a/Spotifly/Views/Components/TrackTable.swift b/Spotifly/Views/Components/TrackTable.swift
+index 80325fb..a2150ea 100644
+--- a/Spotifly/Views/Components/TrackTable.swift
++++ b/Spotifly/Views/Components/TrackTable.swift
+@@ -5,6 +5,7 @@
+ //  The tracks of a list as a sortable table
+ //
+ 
++import AppKit
+ import SwiftUI
+ import UniformTypeIdentifiers
+ 
+@@ -263,13 +264,17 @@ private struct NumberCell: View {
+     let currentRowId: String?
+ 
+     @Environment(PlaybackViewModel.self) private var playbackViewModel
++    @State private var windowIsVisible = true
+ 
+     var body: some View {
+         Group {
+             if row.isPlaying(currentRowId: currentRowId, playingUri: playbackViewModel.currentTrackUri) {
++                // Still while none of the window shows, as behind others: macOS keeps the
++                // animation's display cycle going there, at over 10% CPU.
+                 Image(systemName: "waveform")
+                     .foregroundStyle(.tint)
+-                    .symbolEffect(.variableColor.iterative, isActive: playbackViewModel.isPlaying)
++                    .symbolEffect(.variableColor.iterative, isActive: playbackViewModel.isPlaying && windowIsVisible)
++                    .background(WindowVisibility(isVisible: $windowIsVisible))
+             } else {
+                 Text(row.number, format: .number)
+                     .foregroundStyle(.secondary)
+@@ -280,6 +285,47 @@ private struct NumberCell: View {
+     }
+ }
+ 
++/// Whether any of the window this view is in shows on screen, as AppKit's occlusion state has
++/// it: not while the window is behind others, minimised, hidden or on another Space.
++private struct WindowVisibility: NSViewRepresentable {
++    @Binding var isVisible: Bool
++
++    func makeNSView(context _: Context) -> ObserverView {
++        ObserverView()
++    }
++
++    func updateNSView(_ view: ObserverView, context _: Context) {
++        view.onChange = { isVisible = $0 }
++    }
++
++    final class ObserverView: NSView {
++        var onChange: ((Bool) -> Void)?
++
++        override func viewDidMoveToWindow() {
++            super.viewDidMoveToWindow()
++            NotificationCenter.default.removeObserver(self)
++            guard let window else { return }
++            NotificationCenter.default.addObserver(
++                self, selector: #selector(occlusionDidChange),
++                name: NSWindow.didChangeOcclusionStateNotification, object: window,
++            )
++            // Not during the update that put this view in the window, which SwiftUI's state
++            // may not change in.
++            DispatchQueue.main.async { [weak self] in self?.occlusionDidChange() }
++        }
++
++        @objc private func occlusionDidChange() {
++            guard let window else { return }
++            onChange?(window.occlusionState.contains(.visible))
++        }
++
++        /// Clicks go to the row, never to this view behind the waveform.
++        override func hitTest(_: NSPoint) -> NSView? {
++            nil
++        }
++    }
++}
++
+ /// A 32 pt cover beside the title over the artist; the accent while the track plays, and dimmed
+ /// once played, or, with the reason as tooltip, where Spotify will not play it.
+ private struct TitleCell: View {
+-- 
+2.54.0 (Apple Git-157)
+

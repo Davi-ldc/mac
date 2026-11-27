@@ -1,0 +1,238 @@
+From c20c3da93255f1bc7ad4f6f2669319e1d2f627f7 Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Thu, 26 Nov 2026 15:24:44 -0300
+Subject: [PATCH 18/19] Redraw only the row whose heart changes, and build the
+ favorites list once per redraw
+
+---
+ Spotifly/Store/AppStore.swift              | 45 ++++++++++++++++------
+ Spotifly/Views/Components/TrackTable.swift |  5 ++-
+ Spotifly/Views/FavoritesListView.swift     | 21 +++++-----
+ SpotiflyTests/SpotiflyTests.swift          | 20 ++++++++++
+ 4 files changed, 67 insertions(+), 24 deletions(-)
+
+diff --git a/Spotifly/Store/AppStore.swift b/Spotifly/Store/AppStore.swift
+index 0b0764d..52ed221 100644
+--- a/Spotifly/Store/AppStore.swift
++++ b/Spotifly/Store/AppStore.swift
+@@ -44,8 +44,15 @@ final class AppStore {
+     /// User's followed artist IDs in display order
+     private(set) var userArtistIds: [String] = []
+ 
+-    /// User's favorite track IDs (Set for O(1) lookup)
+-    private(set) var favoriteTrackIds: Set<String> = []
++    /// Whether each track is a favorite, one observable per track: a row reads its own, so a
++    /// heart toggled redraws that row rather than every row that read a shared set. Made on its
++    /// first read, so that a track not yet a favorite is observed for when it becomes one.
++    @ObservationIgnored private var favorites: [String: Favorite] = [:]
++
++    @Observable
++    fileprivate final class Favorite {
++        var isFavorite = false
++    }
+ 
+     /// Track IDs whose favorite status has been resolved from the Web API
+     private(set) var resolvedFavoriteTrackIds: Set<String> = []
+@@ -145,7 +152,25 @@ final class AppStore {
+ 
+     /// Check if a track is favorited
+     func isFavorite(_ trackId: String) -> Bool {
+-        favoriteTrackIds.contains(trackId)
++        favorite(trackId).isFavorite
++    }
++
++    private func favorite(_ trackId: String) -> Favorite {
++        if let favorite = favorites[trackId] {
++            return favorite
++        }
++        let favorite = Favorite()
++        favorites[trackId] = favorite
++        return favorite
++    }
++
++    /// Only a change is written: a page of favorites marks again tracks already marked, and an
++    /// observable is told of every write, equal or not.
++    private func setFavorite(_ trackId: String, _ isFavorite: Bool) {
++        let favorite = favorite(trackId)
++        if favorite.isFavorite != isFavorite {
++            favorite.isFavorite = isFavorite
++        }
+     }
+ 
+     /// Check if a track's favorite status has already been resolved
+@@ -401,7 +426,7 @@ final class AppStore {
+ 
+     /// Add track to favorites (optimistic update)
+     func addTrackToFavorites(_ trackId: String) {
+-        favoriteTrackIds.insert(trackId)
++        setFavorite(trackId, true)
+         resolvedFavoriteTrackIds.insert(trackId)
+         if !savedTrackIds.contains(trackId) {
+             savedTrackIds.insert(trackId, at: 0)
+@@ -412,7 +437,7 @@ final class AppStore {
+ 
+     /// Remove track from favorites (optimistic update)
+     func removeTrackFromFavorites(_ trackId: String) {
+-        favoriteTrackIds.remove(trackId)
++        setFavorite(trackId, false)
+         resolvedFavoriteTrackIds.insert(trackId)
+         savedTrackIds.removeAll { $0 == trackId }
+         favoriteAddedAt[trackId] = nil
+@@ -422,11 +447,7 @@ final class AppStore {
+     func updateFavoriteStatuses(_ statuses: [String: Bool]) {
+         for (trackId, isFavorite) in statuses {
+             resolvedFavoriteTrackIds.insert(trackId)
+-            if isFavorite {
+-                favoriteTrackIds.insert(trackId)
+-            } else {
+-                favoriteTrackIds.remove(trackId)
+-            }
++            setFavorite(trackId, isFavorite)
+         }
+     }
+ 
+@@ -434,7 +455,7 @@ final class AppStore {
+     func markTracksAsFavorite(_ trackIds: [String]) {
+         for trackId in trackIds {
+             resolvedFavoriteTrackIds.insert(trackId)
+-            favoriteTrackIds.insert(trackId)
++            setFavorite(trackId, true)
+         }
+     }
+ 
+@@ -652,7 +673,7 @@ final class AppStore {
+                 userPlaylistIds: userPlaylistIds,
+                 userAlbumIds: userAlbumIds,
+                 userArtistIds: userArtistIds,
+-                favoriteTrackIds: Array(favoriteTrackIds),
++                favoriteTrackIds: favorites.filter(\.value.isFavorite).map(\.key),
+                 savedTrackIds: savedTrackIds,
+                 playlistsPagination: playlistsPagination,
+                 albumsPagination: albumsPagination,
+diff --git a/Spotifly/Views/Components/TrackTable.swift b/Spotifly/Views/Components/TrackTable.swift
+index a2150ea..6f6cddb 100644
+--- a/Spotifly/Views/Components/TrackTable.swift
++++ b/Spotifly/Views/Components/TrackTable.swift
+@@ -188,8 +188,9 @@ struct TrackTable: View {
+         }
+         .playerBarClearance()
+         // One check for every row's heart, rather than one per row as it scrolls in; again when
+-        // the rows change, which a queue does at the same count.
+-        .task(id: rows.map(\.track.id)) {
++        // the rows change, which a queue does at the same count. Keyed by a hash of the ids
++        // rather than by an array of them, which every redraw would allocate and compare.
++        .task(id: rows.reduce(into: Hasher()) { $0.combine($1.track.id) }.finalize()) {
+             await trackService.ensureFavoriteStatuses(trackIds: rows.map(\.track.id))
+         }
+         .newPlaylistPrompt(
+diff --git a/Spotifly/Views/FavoritesListView.swift b/Spotifly/Views/FavoritesListView.swift
+index 8f24486..e8ea0a4 100644
+--- a/Spotifly/Views/FavoritesListView.swift
++++ b/Spotifly/Views/FavoritesListView.swift
+@@ -16,12 +16,14 @@ struct FavoritesListView: View {
+     @Environment(PlaybackViewModel.self) private var playbackViewModel
+ 
+     var body: some View {
++        // Built once per redraw: each read of `favoriteTracks` looks every favorite up again.
++        let tracks = store.favoriteTracks
+         // A ZStack, not a Group: a Group hands its `.task` to each branch, so switching
+         // between loading and the error started the load again, forever.
+         ZStack {
+-            if store.favoritesPagination.isLoading, store.favoriteTracks.isEmpty {
++            if store.favoritesPagination.isLoading, tracks.isEmpty {
+                 ProgressView("loading.favorites")
+-            } else if let failure = store.favoritesPagination.failure, store.favoriteTracks.isEmpty {
++            } else if let failure = store.favoritesPagination.failure, tracks.isEmpty {
+                 ContentUnavailableView {
+                     Label("error.load_favorites", systemImage: "exclamationmark.triangle")
+                 } description: {
+@@ -36,7 +38,7 @@ struct FavoritesListView: View {
+                         await loadFavorites(forceRefresh: true)
+                     }
+                 }
+-            } else if store.favoriteTracks.isEmpty {
++            } else if tracks.isEmpty {
+                 ContentUnavailableView(
+                     "empty.no_favorites",
+                     systemImage: "heart",
+@@ -44,7 +46,7 @@ struct FavoritesListView: View {
+                 )
+             } else {
+                 VStack(spacing: 0) {
+-                    header
++                    header(tracks)
+                     // A later page that failed leaves the list short, which sorting and the filter
+                     // would hide; it says so, with a retry, over the rows there are.
+                     if let failure = store.favoritesPagination.failure {
+@@ -54,7 +56,7 @@ struct FavoritesListView: View {
+                         .padding(.bottom, 8)
+                     }
+                     TrackTable(
+-                        rows: rows,
++                        rows: rows(of: tracks),
+                         columns: [.number, .album, .added],
+                         currentSection: .favorites,
+                     ) { row in
+@@ -83,8 +85,8 @@ struct FavoritesListView: View {
+     }
+ 
+     /// Every favorite, numbered as Liked Songs lists them, then narrowed by the filter.
+-    private var rows: [TrackTableRow] {
+-        let all = store.favoriteTracks.enumerated().map { index, track in
++    private func rows(of tracks: [Track]) -> [TrackTableRow] {
++        let all = tracks.enumerated().map { index, track in
+             TrackTableRow(id: track.id, number: index + 1, track: track, addedAt: store.favoriteAddedAt[track.id])
+         }
+         let query = filter.trimmingCharacters(in: .whitespaces)
+@@ -96,9 +98,8 @@ struct FavoritesListView: View {
+         }
+     }
+ 
+-    private var header: some View {
+-        let tracks = store.favoriteTracks
+-        return DetailHeader(kind: String(localized: "detail.kind.playlist"), title: String(localized: "nav.favorites")) {
++    private func header(_ tracks: [Track]) -> some View {
++        DetailHeader(kind: String(localized: "detail.kind.playlist"), title: String(localized: "nav.favorites")) {
+             RoundedRectangle(cornerRadius: 10)
+                 .fill(LinearGradient(
+                     colors: [Color(red: 1, green: 0.56, blue: 0.64), Color(red: 0.88, green: 0.14, blue: 0.37)],
+diff --git a/SpotiflyTests/SpotiflyTests.swift b/SpotiflyTests/SpotiflyTests.swift
+index 1421299..84670ef 100644
+--- a/SpotiflyTests/SpotiflyTests.swift
++++ b/SpotiflyTests/SpotiflyTests.swift
+@@ -5,7 +5,9 @@
+ //  Created by Ralph von der Heyden on 30.12.25.
+ //
+ 
++import Observation
+ @testable import Spotifly
++import Synchronization
+ import Testing
+ 
+ @MainActor
+@@ -73,4 +75,22 @@ struct SpotiflyTests {
+ 
+         #expect(store.savedTrackIds == ["a", "b", "c"])
+     }
++
++    /// A row observes its own track's heart: toggling another redraws only that one, and a page
++    /// marking again a favorite already marked redraws none.
++    @Test func `a favorite toggled tells only the row of its track`() {
++        let store = AppStore()
++        store.markTracksAsFavorite(["a"])
++        let told = Mutex(false)
++        withObservationTracking { _ = store.isFavorite("a") } onChange: { told.withLock { $0 = true } }
++
++        store.addTrackToFavorites("b")
++        store.removeTrackFromFavorites("b")
++        store.markTracksAsFavorite(["a"])
++        #expect(!told.withLock { $0 })
++
++        store.removeTrackFromFavorites("a")
++        #expect(told.withLock { $0 })
++        #expect(!store.isFavorite("a"))
++    }
+ }
+-- 
+2.54.0 (Apple Git-157)
+

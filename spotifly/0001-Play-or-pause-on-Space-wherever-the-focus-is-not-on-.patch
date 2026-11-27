@@ -1,0 +1,90 @@
+From bf5786c0136c46f19b2b66c808062881fe0147a5 Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Sun, 22 Nov 2026 12:37:19 -0300
+Subject: [PATCH 1/6] Play or pause on Space wherever the focus is not on text
+
+---
+ Spotifly/SpotiflyApp.swift                | 28 +++++++++++++++++++++++
+ SpotiflyTests/SearchFieldFocusTests.swift | 20 ++++++++++++++++
+ 2 files changed, 48 insertions(+)
+
+diff --git a/Spotifly/SpotiflyApp.swift b/Spotifly/SpotiflyApp.swift
+index 7475622..4089154 100644
+--- a/Spotifly/SpotiflyApp.swift
++++ b/Spotifly/SpotiflyApp.swift
+@@ -41,6 +41,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
+             endSearchEditing(onClickOf: event)
+             return event
+         }
++        _ = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
++            playPauseOnSpace(event) ? nil : event
++        }
+     }
+ 
+     /// Holds the quit until the session has shut down, whose disconnect takes its device off
+@@ -360,6 +363,31 @@ func endSearchEditing(onClickOf event: NSEvent) {
+     window.makeFirstResponder(nil)
+ }
+ 
++/// Plays or pauses on a plain Space wherever the focus is not on editable text, as Spotify's own
++/// app does. The Playback menu's Space alone does not: a focused list keeps the key from it, and
++/// the sidebar has the focus from launch.
++///
++/// Returns whether the Space was taken. Held down, it is taken without repeating the toggle; in a
++/// sheet or alert it is left to the buttons there.
++func playPauseOnSpace(_ event: NSEvent) -> Bool {
++    let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .function])
++    guard event.keyCode == 49, modifiers.isEmpty,
++          let window = event.window, window.attachedSheet == nil, window.sheetParent == nil
++    else { return false }
++    if let text = window.firstResponder as? NSText, text.isEditable {
++        return false
++    }
++    if !event.isARepeat {
++        let playback = PlaybackViewModel.shared
++        if playback.isPlaying {
++            playback.pause()
++        } else {
++            playback.resume()
++        }
++    }
++    return true
++}
++
+ private func firstSearchField(in view: NSView?) -> NSSearchField? {
+     guard let view else { return nil }
+     if let field = view as? NSSearchField {
+diff --git a/SpotiflyTests/SearchFieldFocusTests.swift b/SpotiflyTests/SearchFieldFocusTests.swift
+index ee0d561..e24eebe 100644
+--- a/SpotiflyTests/SearchFieldFocusTests.swift
++++ b/SpotiflyTests/SearchFieldFocusTests.swift
+@@ -56,6 +56,26 @@ struct SearchFieldFocusTests {
+         #expect((window.firstResponder as? NSText)?.delegate === field)
+     }
+ 
++    /// Space plays or pauses wherever the focus is not on text, so a search with a space in it
++    /// still types one.
++    @Test func `a space typed in the search field is the field's, not Play/Pause`() throws {
++        edit(NSSearchField())
++        let space = try #require(NSEvent.keyEvent(
++            with: .keyDown,
++            location: .zero,
++            modifierFlags: [],
++            timestamp: 0,
++            windowNumber: window.windowNumber,
++            context: nil,
++            characters: " ",
++            charactersIgnoringModifiers: " ",
++            isARepeat: false,
++            keyCode: 49,
++        ))
++
++        #expect(!playPauseOnSpace(space))
++    }
++
+     /// A playlist's name in its sheet, say: only the search field holds on to Space.
+     @Test func `another text field keeps its editing`() {
+         let field = NSTextField()
+-- 
+2.54.0 (Apple Git-157)
+

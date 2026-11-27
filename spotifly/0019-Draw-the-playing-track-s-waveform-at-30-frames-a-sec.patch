@@ -1,0 +1,242 @@
+From 5f53fc3bfdf3fe298b83f64b4b3023a614ddd751 Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Thu, 26 Nov 2026 22:27:01 -0300
+Subject: [PATCH 19/19] Draw the playing track'\''s waveform at 30 frames a
+ second
+
+---
+ Spotifly/Views/Components/TrackTable.swift | 204 ++++++++++++++++++++-
+ 1 file changed, 201 insertions(+), 3 deletions(-)
+
+diff --git a/Spotifly/Views/Components/TrackTable.swift b/Spotifly/Views/Components/TrackTable.swift
+index 6f6cddb..b58d24d 100644
+--- a/Spotifly/Views/Components/TrackTable.swift
++++ b/Spotifly/Views/Components/TrackTable.swift
+@@ -6,6 +6,7 @@
+ //
+ 
+ import AppKit
++import QuartzCore
+ import SwiftUI
+ import UniformTypeIdentifiers
+ 
+@@ -272,9 +273,8 @@ private struct NumberCell: View {
+             if row.isPlaying(currentRowId: currentRowId, playingUri: playbackViewModel.currentTrackUri) {
+                 // Still while none of the window shows, as behind others: macOS keeps the
+                 // animation's display cycle going there, at over 10% CPU.
+-                Image(systemName: "waveform")
+-                    .foregroundStyle(.tint)
+-                    .symbolEffect(.variableColor.iterative, isActive: playbackViewModel.isPlaying && windowIsVisible)
++                PlayingWaveform(isAnimating: playbackViewModel.isPlaying && windowIsVisible)
++                    .fixedSize()
+                     .background(WindowVisibility(isVisible: $windowIsVisible))
+             } else {
+                 Text(row.number, format: .number)
+@@ -286,6 +286,204 @@ private struct NumberCell: View {
+     }
+ }
+ 
++/// `.symbolEffect(.variableColor.iterative)` on the waveform, as measured on macOS 27, drawn at
++/// 30 frames a second by Core Animation rather than by SwiftUI.
++///
++/// Driving it from SwiftUI (`TimelineView`) or `.symbolEffect` keeps AppKit's display cycle
++/// laying out the window on every tick (over 20% CPU with Liquid Glass on the player bar).
++/// Animating six `CALayer` slices of the symbol with `CAKeyframeAnimation` capped to 30 fps
++/// renders in the window server with negligible app CPU, and stops completely while paused or
++/// occluded.
++private struct PlayingWaveform: NSViewRepresentable {
++    let isAnimating: Bool
++
++    func makeNSView(context _: Context) -> WaveformView {
++        WaveformView()
++    }
++
++    func updateNSView(_ view: WaveformView, context _: Context) {
++        view.setAnimating(isAnimating)
++    }
++
++    final class WaveformView: NSView {
++        /// Horizontal boundaries partitioning the 6 bars of the `waveform` SF Symbol through the
++        /// empty pixel columns between them.
++        private static let sliceEdges: [CGFloat] = [0, 0.217, 0.350, 0.483, 0.633, 0.783, 1]
++        private static let period: TimeInterval = 1.66
++        private static let stagger: TimeInterval = 0.125
++        private static let animationKey = "waveformPulse"
++        /// Keyframe opacity curve sampled at 30 Hz over one cycle: rises in 0.1 s, holds 0.035 s,
++        /// falls smoothly in 0.555 s.
++        private static let keyframes: [Float] = {
++            let frames = 50
++            return (0 ... frames).map { index in
++                Float(PlayingWaveform.brightness(at: Double(index) / Double(frames) * period))
++            }
++        }()
++
++        private let baseLayer = CALayer()
++        private let barLayers = (0 ..< 6).map { _ in CALayer() }
++        private var isAnimating = false
++        private var symbolSize = NSSize(width: 15, height: 16)
++        private var lastScale: CGFloat = 0
++
++        override var intrinsicContentSize: NSSize {
++            symbolSize
++        }
++
++        override init(frame frameRect: NSRect) {
++            super.init(frame: frameRect)
++            let root = CALayer()
++            layer = root
++            wantsLayer = true
++            baseLayer.contentsGravity = .resize
++            root.addSublayer(baseLayer)
++            for (index, barLayer) in barLayers.enumerated() {
++                let left = Self.sliceEdges[index]
++                let right = Self.sliceEdges[index + 1]
++                barLayer.contentsGravity = .resize
++                barLayer.contentsRect = CGRect(x: left, y: 0, width: right - left, height: 1)
++                root.addSublayer(barLayer)
++            }
++            renderSymbols()
++        }
++
++        @available(*, unavailable)
++        required init?(coder _: NSCoder) {
++            nil
++        }
++
++        override func layout() {
++            super.layout()
++            CATransaction.begin()
++            CATransaction.setDisableActions(true)
++            baseLayer.frame = bounds
++            for (index, barLayer) in barLayers.enumerated() {
++                let left = Self.sliceEdges[index] * bounds.width
++                let right = Self.sliceEdges[index + 1] * bounds.width
++                barLayer.frame = CGRect(x: left, y: 0, width: right - left, height: bounds.height)
++            }
++            CATransaction.commit()
++        }
++
++        override func viewDidChangeEffectiveAppearance() {
++            super.viewDidChangeEffectiveAppearance()
++            renderSymbols()
++        }
++
++        override func viewDidChangeBackingProperties() {
++            super.viewDidChangeBackingProperties()
++            let scale = window?.backingScaleFactor ?? 2
++            if scale != lastScale {
++                renderSymbols()
++            }
++        }
++
++        override func viewDidMoveToWindow() {
++            super.viewDidMoveToWindow()
++            if let scale = window?.backingScaleFactor, scale != lastScale {
++                renderSymbols()
++            }
++            applyAnimation()
++        }
++
++        func setAnimating(_ animating: Bool) {
++            guard isAnimating != animating else { return }
++            isAnimating = animating
++            applyAnimation()
++        }
++
++        private func applyAnimation() {
++            let shouldAnimate = isAnimating && window != nil
++            CATransaction.begin()
++            CATransaction.setDisableActions(true)
++            if shouldAnimate {
++                let now = CACurrentMediaTime()
++                for (index, barLayer) in barLayers.enumerated() {
++                    guard barLayer.animation(forKey: Self.animationKey) == nil else { continue }
++                    let animation = CAKeyframeAnimation(keyPath: "opacity")
++                    animation.values = Self.keyframes
++                    animation.duration = Self.period
++                    animation.repeatCount = .infinity
++                    animation.calculationMode = .linear
++                    animation.beginTime = now
++                    animation.timeOffset = index == 0 ? 0 : Self.period - Double(index) * Self.stagger
++                    animation.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 30, preferred: 30)
++                    barLayer.opacity = 0
++                    barLayer.add(animation, forKey: Self.animationKey)
++                }
++            } else {
++                for barLayer in barLayers {
++                    barLayer.removeAnimation(forKey: Self.animationKey)
++                    barLayer.opacity = 1
++                }
++            }
++            CATransaction.commit()
++        }
++
++        private func renderSymbols() {
++            let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
++            lastScale = scale
++            effectiveAppearance.performAsCurrentDrawingAppearance {
++                let tint = NSColor(named: "AccentColor") ?? .controlAccentColor
++                let config = NSImage.SymbolConfiguration(pointSize: NSFont.systemFontSize, weight: .regular)
++                    .applying(.init(paletteColors: [tint]))
++                guard let dimmed = NSImage(systemSymbolName: "waveform", variableValue: 0, accessibilityDescription: nil)?
++                    .withSymbolConfiguration(config),
++                    let lit = NSImage(systemSymbolName: "waveform", variableValue: 1, accessibilityDescription: nil)?
++                    .withSymbolConfiguration(config)
++                else { return }
++                let size = lit.size
++                if size != symbolSize {
++                    symbolSize = size
++                    invalidateIntrinsicContentSize()
++                }
++                let dimmedCG = Self.rasterize(dimmed, size: size, scale: scale)
++                let litCG = Self.rasterize(lit, size: size, scale: scale)
++                CATransaction.begin()
++                CATransaction.setDisableActions(true)
++                baseLayer.contents = dimmedCG
++                baseLayer.contentsScale = scale
++                for barLayer in barLayers {
++                    barLayer.contents = litCG
++                    barLayer.contentsScale = scale
++                }
++                CATransaction.commit()
++            }
++        }
++
++        private static func rasterize(_ image: NSImage, size: NSSize, scale: CGFloat) -> CGImage? {
++            let width = max(1, Int((size.width * scale).rounded(.up)))
++            let height = max(1, Int((size.height * scale).rounded(.up)))
++            guard let context = CGContext(
++                data: nil,
++                width: width,
++                height: height,
++                bitsPerComponent: 8,
++                bytesPerRow: width * 4,
++                space: CGColorSpaceCreateDeviceRGB(),
++                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue,
++            ) else { return nil }
++            context.scaleBy(x: scale, y: scale)
++            NSGraphicsContext.saveGraphicsState()
++            NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
++            image.draw(in: NSRect(origin: .zero, size: size))
++            NSGraphicsContext.restoreGraphicsState()
++            return context.makeImage()
++        }
++    }
++
++    /// How lit a bar is, from 0 (dimmed) to 1 (full), at `phase` seconds into the 1.66 s cycle:
++    /// rises in 0.1 s, holds 0.035 s, falls in 0.555 s.
++    static func brightness(at phase: TimeInterval) -> Double {
++        if phase < 0.1 {
++            return phase / 0.1
++        }
++        let fraction = min(1, max(0, (phase - 0.135) / 0.555))
++        return (1 + cos(.pi * fraction)) / 2
++    }
++}
++
+ /// Whether any of the window this view is in shows on screen, as AppKit's occlusion state has
+ /// it: not while the window is behind others, minimised, hidden or on another Space.
+ private struct WindowVisibility: NSViewRepresentable {
+-- 
+2.54.0 (Apple Git-157)
+

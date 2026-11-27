@@ -1,0 +1,124 @@
+From d24023e44cfd6dfb361d4fb9eaccac37cdcf4c48 Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Thu, 26 Nov 2026 10:40:24 -0300
+Subject: [PATCH 09/10] Start Soloist again when the network returns or the Mac
+ wakes while it is logged out
+
+---
+ Spotifly/Soloist/SoloistEngine.swift | 48 +++++++++++++++++++++++++++-
+ SpotiflyTests/SoloistTests.swift     | 13 ++++++++
+ 2 files changed, 60 insertions(+), 1 deletion(-)
+
+diff --git a/Spotifly/Soloist/SoloistEngine.swift b/Spotifly/Soloist/SoloistEngine.swift
+index 3806451..cba8028 100644
+--- a/Spotifly/Soloist/SoloistEngine.swift
++++ b/Spotifly/Soloist/SoloistEngine.swift
+@@ -5,6 +5,7 @@
+ //  Runs Spotify's Soloist as this Mac's player, and says whether it is ready
+ //
+ 
++import AppKit
+ import Darwin
+ import Foundation
+ 
+@@ -76,7 +77,23 @@ final class SoloistEngine {
+     private var isStarting = false
+     private var restartsInARow = 0
+ 
+-    private init() {}
++    /// Whether the network has come back since Soloist was launched; see `startAgainIfLoggedOut`.
++    private var networkReturnedSinceLaunch = false
++
++    private init() {
++        guard !SpotiflyApp.hostsUnitTests else { return }
++        let network = NetworkMonitor.shared
++        Task {
++            for await _ in Observations({ network.returns }).dropFirst() {
++                await networkReturned()
++            }
++        }
++        // A sleep takes the network away and the wake gives it back, whether or not the path
++        // monitor saw it go.
++        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
++            Task { await self?.networkReturned() }
++        }
++    }
+ 
+     // MARK: - Files
+ 
+@@ -199,6 +216,7 @@ final class SoloistEngine {
+ 
+         try process.run()
+         self.process = process
++        networkReturnedSinceLaunch = false
+         debugLog("Soloist", "Started pid \(process.processIdentifier)")
+     }
+ 
+@@ -342,12 +360,40 @@ final class SoloistEngine {
+         status = loggedIn ? .ready : .waitingForPairing
+         if loggedIn {
+             restartsInARow = 0
++        } else {
++            Task { await startAgainIfLoggedOut() }
+         }
+         if becomesReady, let remembered = UserDefaults.standard.object(forKey: Self.volumeKey) as? Int {
+             send(volume: remembered)
+         }
+     }
+ 
++    // MARK: - The network
++
++    /// Soloist restores its stored login only as it starts. Started with no network, as when the
++    /// app reopens at login before Wi-Fi is up, it stays logged out and waits for a pairing, and
++    /// its discovery stays silent as well: no phone lists this Mac, neither among the account's
++    /// devices nor on the local network. On 2026-11-26 it stayed so for the 55 minutes the network
++    /// was back, until the app was reopened. So a Soloist found logged out with the network back
++    /// since its launch, or the Mac woken, is started again, when the network returns or when it
++    /// says it is logged out, whichever comes last. One never paired waits for its pairing again.
++    private func networkReturned() async {
++        networkReturnedSinceLaunch = true
++        await startAgainIfLoggedOut()
++    }
++
++    private func startAgainIfLoggedOut() async {
++        guard Self.startsAgain(status: status, isRunning: process != nil && !isStarting, networkReturned: networkReturnedSinceLaunch)
++        else { return }
++        debugLog("Soloist", "Logged out, and the network is back since its start: starting it again")
++        await stop()
++        await start()
++    }
++
++    static func startsAgain(status: Status, isRunning: Bool, networkReturned: Bool) -> Bool {
++        status == .waitingForPairing && isRunning && networkReturned
++    }
++
+     // MARK: - Volume
+ 
+     /// Sets the volume the user chose, and remembers it for Soloist's next start. Over the
+diff --git a/SpotiflyTests/SoloistTests.swift b/SpotiflyTests/SoloistTests.swift
+index d5fc09a..81a1946 100644
+--- a/SpotiflyTests/SoloistTests.swift
++++ b/SpotiflyTests/SoloistTests.swift
+@@ -73,6 +73,19 @@ struct SoloistEventTests {
+         engine.apply(SoloistEvent(loggedIn: true))
+         #expect(engine.status == .ready)
+     }
++
++    /// Soloist restores its login only as it starts, so one launched before the network came is
++    /// started again; one logged in, or launched with the network there, is left as it is.
++    @MainActor
++    @Test func `a Soloist logged out with the network back since its launch starts again`() {
++        #expect(SoloistEngine.startsAgain(status: .waitingForPairing, isRunning: true, networkReturned: true))
++
++        #expect(!SoloistEngine.startsAgain(status: .waitingForPairing, isRunning: true, networkReturned: false))
++        #expect(!SoloistEngine.startsAgain(status: .ready, isRunning: true, networkReturned: true))
++        #expect(!SoloistEngine.startsAgain(status: .starting, isRunning: true, networkReturned: true))
++        #expect(!SoloistEngine.startsAgain(status: .waitingForPairing, isRunning: false, networkReturned: true))
++        #expect(!SoloistEngine.startsAgain(status: .failed("key"), isRunning: true, networkReturned: true))
++    }
+ }
+ 
+ @MainActor
+-- 
+2.54.0 (Apple Git-157)
+

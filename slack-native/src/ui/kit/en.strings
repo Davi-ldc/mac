@@ -1,0 +1,8 @@
+/* The dialogs' form controls, in the English web client's words (sk_calendar, date pickers). */
+"forms.date.today" = "Today";
+"forms.date.tomorrow" = "Tomorrow";
+"forms.calendar.previousYear" = "Previous year";
+"forms.calendar.previousMonth" = "Previous month";
+"forms.calendar.nextMonth" = "Next month";
+"forms.calendar.nextYear" = "Next year";
+"forms.calendar.weekdays" = "Su,Mo,Tu,We,Th,Fr,Sa";

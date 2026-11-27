@@ -1,0 +1,3455 @@
+From 3501dcf647e00c21012593f13048c14bfd3087f0 Mon Sep 17 00:00:00 2001
+From: mini <mini@local>
+Date: Fri, 27 Nov 2026 03:37:37 -0300
+Subject: [PATCH 03/10] Optimize GPUI Metal rendering, image/SVG memory, and
+ idle power on macOS
+
+- Bounds path textures to the area paths cover and double-buffers the layer.
+- Wires shared CVDisplayLink to GPUI's frame waker (DisplayLinkFrames) so
+  idle windows unsubscribe with zero vsync wakeups.
+- Marks occluded CAMetalLayer drawables MTLPurgeableState::Volatile and
+  forces presentation on restore if macOS purged a surface.
+- Prewarms Metal shaders in an autoreleasepool with parallel pipeline
+  compilation and a persistent on-disk MTLBinaryArchive cache.
+- Decodes still bounded images via TransientBuffer mmap/munmap (clamping
+  both width and height to 4096) with malloc_zone_pressure_relief, shares one
+  lazy usvg::fontdb, clamps SVG height+width to 4096, shrinks arenas and
+  instance buffers after spikes, evicts excess monochrome glyph atlases,
+  defers ForegroundJournal's 4 MB ring until a collector attaches, and
+  builds CGFonts off-lock in AppleTextSystem::add_fonts.
+---
+ crates/gpui/Cargo.toml                  |    1 +
+ crates/gpui/src/app.rs                  |   33 +
+ crates/gpui/src/arena.rs                |   32 +
+ crates/gpui/src/assets.rs               |  100 ++-
+ crates/gpui/src/elements/image_cache.rs |   11 +
+ crates/gpui/src/elements/img.rs         |  680 +++++++++++++--
+ crates/gpui/src/platform.rs             |   13 +
+ crates/gpui/src/profiler/journal.rs     |   40 +-
+ crates/gpui/src/svg_renderer.rs         |  142 +++-
+ crates/gpui_apple/Cargo.toml            |    3 +-
+ crates/gpui_apple/src/metal_atlas.rs    |   18 +
+ crates/gpui_apple/src/metal_renderer.rs | 1023 ++++++++++++++++++-----
+ crates/gpui_apple/src/shaders.metal     |    6 +-
+ crates/gpui_apple/src/text_system.rs    |   38 +-
+ crates/gpui_macos/src/display_link.rs   |   92 ++
+ crates/gpui_macos/src/platform.rs       |   38 +-
+ crates/gpui_macos/src/window.rs         |  121 ++-
+ 17 files changed, 2001 insertions(+), 390 deletions(-)
+
+diff --git a/crates/gpui/Cargo.toml b/crates/gpui/Cargo.toml
+index f215c00..da8dc1c 100644
+--- a/crates/gpui/Cargo.toml
++++ b/crates/gpui/Cargo.toml
+@@ -153,6 +153,7 @@ objc2-core-foundation.workspace = true
+ objc2-core-video = { workspace = true, features = ["CVPixelBuffer"] }
+ 
+ [target.'cfg(target_os = "macos")'.dependencies]
++libc.workspace = true
+ log.workspace = true
+ objc2 = { workspace = true, optional = true }
+ objc2-metal = { version = "0.3", optional = true }
+diff --git a/crates/gpui/src/app.rs b/crates/gpui/src/app.rs
+index 75da2eb..eeb0805 100644
+--- a/crates/gpui/src/app.rs
++++ b/crates/gpui/src/app.rs
+@@ -2396,6 +2396,39 @@ impl App {
+         &self.foreground_executor
+     }
+ 
++    /// Reclaims transient rendering and allocator memory after heavy views
++    /// (such as Markdown previews) close.
++    pub fn reclaim_memory(&mut self) {
++        let mut evicted_atlas = false;
++        for (_, window) in &self.windows {
++            if let Some(window) = window.as_ref()
++                && window
++                    .platform_window
++                    .sprite_atlas()
++                    .evict_monochrome_tiles_if_excess(2)
++            {
++                evicted_atlas = true;
++            }
++        }
++        if evicted_atlas {
++            self.refresh_windows();
++        }
++        if let Ok(mut arena) = self.element_arena.try_borrow_mut() {
++            arena.shrink_to_minimum();
++        }
++        self.event_arena.shrink_to_minimum();
++        #[cfg(target_os = "macos")]
++        {
++            unsafe extern "C" {
++                fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
++            }
++            // SAFETY: NULL asks macOS libmalloc to purge empty magazines across all zones.
++            unsafe {
++                malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
++            }
++        }
++    }
++
+     /// Returns the foreground work journal for this app's foreground thread.
+     /// Apps constructed on the same thread share the stream.
+     #[cfg(feature = "profiler")]
+diff --git a/crates/gpui/src/arena.rs b/crates/gpui/src/arena.rs
+index ea5968f..b2f41e2 100644
+--- a/crates/gpui/src/arena.rs
++++ b/crates/gpui/src/arena.rs
+@@ -85,6 +85,7 @@ pub struct Arena {
+     current_chunk_index: usize,
+     chunk_size: NonZeroUsize,
+     scope_depth: usize,
++    low_usage_clears: u8,
+ }
+ 
+ impl Drop for Arena {
+@@ -103,6 +104,7 @@ impl Arena {
+             current_chunk_index: 0,
+             chunk_size,
+             scope_depth: 0,
++            low_usage_clears: 0,
+         }
+     }
+ 
+@@ -110,6 +112,16 @@ impl Arena {
+         self.chunks.len() * self.chunk_size.get()
+     }
+ 
++    pub fn shrink_to_minimum(&mut self) {
++        if self.scope_depth == 0 && self.elements.is_empty() {
++            self.chunks.truncate(1);
++            if self.elements.capacity() > 8192 {
++                self.elements.shrink_to(8192);
++            }
++            self.low_usage_clears = 0;
++        }
++    }
++
+     /// Marks the start of a scope (e.g. a window draw) whose allocations must stay
+     /// live until the scope ends, even if `clear` is called by a nested scope in
+     /// the meantime.
+@@ -148,13 +160,33 @@ impl Arena {
+     }
+ 
+     fn force_clear(&mut self) {
++        const MAX_RETAINED_ELEMENT_CAPACITY: usize = 8192;
+         self.valid.set(false);
+         self.valid = Rc::new(Cell::new(true));
++        let used_elements = self.elements.len();
+         self.elements.clear();
++        let used_chunks = self.current_chunk_index + 1;
+         for chunk_index in 0..=self.current_chunk_index {
+             self.chunks[chunk_index].reset();
+         }
+         self.current_chunk_index = 0;
++
++        if used_chunks < self.chunks.len()
++            || (self.elements.capacity() > MAX_RETAINED_ELEMENT_CAPACITY
++                && used_elements * 4 < self.elements.capacity())
++        {
++            self.low_usage_clears = self.low_usage_clears.saturating_add(1);
++            if self.low_usage_clears >= 2 {
++                self.chunks.truncate(used_chunks.max(1));
++                if self.elements.capacity() > MAX_RETAINED_ELEMENT_CAPACITY {
++                    self.elements
++                        .shrink_to(used_elements.max(MAX_RETAINED_ELEMENT_CAPACITY));
++                }
++                self.low_usage_clears = 0;
++            }
++        } else {
++            self.low_usage_clears = 0;
++        }
+     }
+ 
+     #[inline(always)]
+diff --git a/crates/gpui/src/assets.rs b/crates/gpui/src/assets.rs
+index cb8b47e..5bffefc 100644
+--- a/crates/gpui/src/assets.rs
++++ b/crates/gpui/src/assets.rs
+@@ -1,4 +1,5 @@
+ use crate::{DevicePixels, Pixels, Result, SharedString, Size, size};
++use crate::elements::TransientBuffer;
+ use smallvec::SmallVec;
+ 
+ use image::{Delay, Frame};
+@@ -39,13 +40,25 @@ pub struct RenderImageParams {
+     pub frame_index: usize,
+ }
+ 
++enum RenderImageData {
++    Frames(SmallVec<[Frame; 1]>),
++    /// Single still BGRA frame stored in an anonymous `mmap` (`TransientBuffer`) on macOS so
++    /// closing a preview `munmap`s the pixels immediately instead of retaining freed slabs in
++    /// macOS `xzone_malloc`'s `Malloc Large` cache.
++    Mapped {
++        width: u32,
++        height: u32,
++        pixels: TransientBuffer,
++    },
++}
++
+ /// A cached and processed image, in BGRA format
+ pub struct RenderImage {
+     /// The ID associated with this image
+     pub id: ImageId,
+     /// The scale factor of this image on render.
+     pub(crate) scale_factor: f32,
+-    data: SmallVec<[Frame; 1]>,
++    data: RenderImageData,
+ }
+ 
+ impl PartialEq for RenderImage {
+@@ -56,34 +69,59 @@ impl PartialEq for RenderImage {
+ 
+ impl Eq for RenderImage {}
+ 
++static NEXT_IMAGE_ID: AtomicUsize = AtomicUsize::new(0);
++
+ impl RenderImage {
+     /// Create a new image from the given data.
+     pub fn new(data: impl Into<SmallVec<[Frame; 1]>>) -> Self {
+-        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
++        Self {
++            id: ImageId(NEXT_IMAGE_ID.fetch_add(1, SeqCst)),
++            scale_factor: 1.0,
++            data: RenderImageData::Frames(data.into()),
++        }
++    }
+ 
++    /// Create a single-frame BGRA image backed by a [`TransientBuffer`].
++    pub(crate) fn from_mapped(width: u32, height: u32, pixels: TransientBuffer) -> Self {
+         Self {
+-            id: ImageId(NEXT_ID.fetch_add(1, SeqCst)),
++            id: ImageId(NEXT_IMAGE_ID.fetch_add(1, SeqCst)),
+             scale_factor: 1.0,
+-            data: data.into(),
++            data: RenderImageData::Mapped {
++                width,
++                height,
++                pixels,
++            },
+         }
+     }
+ 
+     /// Convert this image into a byte slice.
+     pub fn as_bytes(&self, frame_index: usize) -> Option<&[u8]> {
+-        self.data
+-            .get(frame_index)
+-            .map(|frame| frame.buffer().as_raw().as_slice())
++        match &self.data {
++            RenderImageData::Frames(frames) => frames
++                .get(frame_index)
++                .map(|frame| frame.buffer().as_raw().as_slice()),
++            RenderImageData::Mapped { pixels, .. } => (frame_index == 0).then_some(&**pixels),
++        }
+     }
+ 
+     /// Get the size of this image, in pixels.
+     pub fn size(&self, frame_index: usize) -> Size<DevicePixels> {
+-        self.data
+-            .get(frame_index)
+-            .map(|frame| {
+-                let (width, height) = frame.buffer().dimensions();
+-                size(width.into(), height.into())
+-            })
+-            .unwrap_or_default()
++        match &self.data {
++            RenderImageData::Frames(frames) => frames
++                .get(frame_index)
++                .map(|frame| {
++                    let (width, height) = frame.buffer().dimensions();
++                    size(width.into(), height.into())
++                })
++                .unwrap_or_default(),
++            RenderImageData::Mapped { width, height, .. } => {
++                if frame_index == 0 {
++                    size((*width).into(), (*height).into())
++                } else {
++                    Size::default()
++                }
++            }
++        }
+     }
+ 
+     /// Get the size of this image, in pixels for display, adjusted for the scale factor.
+@@ -94,23 +132,33 @@ impl RenderImage {
+ 
+     /// Get the delay of this frame from the previous
+     pub fn delay(&self, frame_index: usize) -> Delay {
+-        self.data
+-            .get(frame_index)
+-            .map(|frame| frame.delay())
+-            .unwrap_or(Delay::from_numer_denom_ms(100, 1))
++        match &self.data {
++            RenderImageData::Frames(frames) => frames
++                .get(frame_index)
++                .map(|frame| frame.delay())
++                .unwrap_or(Delay::from_numer_denom_ms(100, 1)),
++            RenderImageData::Mapped { .. } => Delay::from_numer_denom_ms(100, 1),
++        }
+     }
+ 
+     /// Get the number of frames for this image.
+     pub fn frame_count(&self) -> usize {
+-        self.data.len()
++        match &self.data {
++            RenderImageData::Frames(frames) => frames.len(),
++            RenderImageData::Mapped { .. } => 1,
++        }
+     }
+ }
+ 
+ impl fmt::Debug for RenderImage {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        let size = match &self.data {
++            RenderImageData::Frames(frames) => frames.first().map(|f| f.buffer().dimensions()),
++            RenderImageData::Mapped { width, height, .. } => Some((*width, *height)),
++        };
+         f.debug_struct("ImageData")
+             .field("id", &self.id)
+-            .field("size", &self.data.first().map(|f| f.buffer().dimensions()))
++            .field("size", &size)
+             .finish()
+     }
+ }
+@@ -130,4 +178,16 @@ mod tests {
+         assert_eq!(image.delay(0), Delay::from_numer_denom_ms(100, 1));
+         let _ = format!("{image:?}");
+     }
++
++    #[test]
++    fn new_and_from_mapped_allocate_distinct_image_ids() {
++        let a = RenderImage::new(SmallVec::new());
++        let b = RenderImage::from_mapped(1, 1, TransientBuffer::zeroed(4).unwrap());
++        let c = RenderImage::new(SmallVec::new());
++        let d = RenderImage::from_mapped(1, 1, TransientBuffer::zeroed(4).unwrap());
++        assert_ne!(a.id, b.id);
++        assert_ne!(b.id, c.id);
++        assert_ne!(c.id, d.id);
++        assert_ne!(a, b);
++    }
+ }
+diff --git a/crates/gpui/src/elements/image_cache.rs b/crates/gpui/src/elements/image_cache.rs
+index 3d9d4ce..c923cae 100644
+--- a/crates/gpui/src/elements/image_cache.rs
++++ b/crates/gpui/src/elements/image_cache.rs
+@@ -5,6 +5,8 @@ use crate::{
+ };
+ 
+ use crate::asset_cache::CachedLoad;
++use crate::elements::img::load_image;
++use futures::TryFutureExt as _;
+ use refineable::Refineable;
+ use smallvec::SmallVec;
+ use std::{collections::HashMap, fmt, sync::Arc};
+@@ -173,6 +175,15 @@ impl ImageCacheItem {
+         Self(CachedLoad::new(future, cx))
+     }
+ 
++    /// Starts loading an image into a new cache entry, decoded (or, for an SVG, rasterized) at
++    /// most `max_width` device pixels wide. The image keeps its logical size, so it lays out the
++    /// same, but one drawn narrower than its full width holds only the pixels it is drawn with.
++    pub fn new_at_most_wide(source: &Resource, max_width: u32, cx: &mut App) -> Self {
++        let future = load_image(source.clone(), None, Some(max_width), cx)
++            .inspect_err(|error| log::error!("Failed to load image: {error:?}"));
++        Self(CachedLoad::new(future, cx))
++    }
++
+     /// Returns the cached result without subscribing to completion notifications.
+     pub fn get(&self) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+         self.0.get()
+diff --git a/crates/gpui/src/elements/img.rs b/crates/gpui/src/elements/img.rs
+index 6cc5db8..ac2d235 100644
+--- a/crates/gpui/src/elements/img.rs
++++ b/crates/gpui/src/elements/img.rs
+@@ -9,8 +9,12 @@ use anyhow::Result;
+ 
+ use futures::Future;
+ use gpui_util::ResultExt;
+-use image::{ImageError, ImageFormat};
++use image::{
++    ColorType, Frame, ImageDecoder as _, ImageError, ImageFormat, RgbaImage, imageops,
++    metadata::Orientation,
++};
+ use scheduler::Instant;
++use smallvec::SmallVec;
+ use std::{
+     fs,
+     io::{self},
+@@ -33,6 +37,13 @@ pub const LOADING_DELAY: Duration = Duration::from_millis(200);
+ /// Custom loaders, or external images will not use this asset loader
+ pub type ImgResourceLoader = AssetLogger<ImageAssetLoader>;
+ 
++/// The resource loader for images drawn as icons, such as an icon theme's.
++pub type IconResourceLoader = AssetLogger<IconAssetLoader>;
++
++/// The longest side an icon's SVG is rasterized at, in device pixels: an icon drawn at 16 px on a
++/// 2x display, with headroom. SVGs whose 2x raster fits (viewBoxes up to 32) are unaffected.
++pub const ICON_MAX_RASTER_SIZE: f32 = 64.;
++
+ /// A source of image content.
+ #[derive(Clone)]
+ pub enum ImageSource {
+@@ -612,65 +623,537 @@ impl Asset for ImageAssetLoader {
+         source: Self::Source,
+         cx: &mut App,
+     ) -> impl Future<Output = Self::Output> + Send + 'static {
+-        let client = cx.http_client();
+-        // TODO: Can we make SVGs always rescale?
+-        // let scale_factor = cx.scale_factor();
+-        let svg_renderer = cx.svg_renderer();
+-        let asset_source = cx.asset_source().clone();
+-        async move {
+-            let bytes = match source.clone() {
+-                Resource::Path(uri) => fs::read(uri.as_ref())?,
+-                Resource::Uri(uri) => {
+-                    use anyhow::Context as _;
+-                    use futures::AsyncReadExt as _;
+-
+-                    let mut response = client
+-                        .get(uri.as_ref(), ().into(), true)
+-                        .await
+-                        .with_context(|| format!("loading image asset from {uri:?}"))?;
+-                    let mut body = Vec::new();
+-                    response.body_mut().read_to_end(&mut body).await?;
+-                    if !response.status().is_success() {
+-                        let mut body = String::from_utf8_lossy(&body).into_owned();
+-                        let first_line = body.lines().next().unwrap_or("").trim_end();
+-                        body.truncate(first_line.len());
+-                        return Err(ImageCacheError::BadStatus {
+-                            uri,
+-                            status: response.status(),
+-                            body,
+-                        });
++        load_image(source, None, None, cx)
++    }
++}
++
++/// Loads images as [`ImageAssetLoader`] does, but rasterizes an SVG no larger than
++/// [`ICON_MAX_RASTER_SIZE`]. [`ImageAssetLoader`] rasterizes an SVG at twice its viewBox, whatever
++/// size it is drawn at, and some icon themes draw on canvases thousands of units wide, which
++/// would make an icon a raster of hundreds of megabytes that stays cached for the session.
++#[derive(Clone)]
++pub enum IconAssetLoader {}
++
++impl Asset for IconAssetLoader {
++    type Source = Resource;
++    type Output = Result<Arc<RenderImage>, ImageCacheError>;
++
++    fn load(
++        source: Self::Source,
++        cx: &mut App,
++    ) -> impl Future<Output = Self::Output> + Send + 'static {
++        load_image(source, Some(ICON_MAX_RASTER_SIZE), None, cx)
++    }
++}
++
++/// Loads an image from `source`. `max_width`, in device pixels, limits how wide it is decoded or
++/// rasterized; it keeps its logical size, so it lays out the same.
++pub(crate) fn load_image(
++    source: Resource,
++    max_svg_raster_size: Option<f32>,
++    max_width: Option<u32>,
++    cx: &mut App,
++) -> impl Future<Output = Result<Arc<RenderImage>, ImageCacheError>> + Send + 'static {
++    let client = cx.http_client();
++    // TODO: Can we make SVGs always rescale?
++    // let scale_factor = cx.scale_factor();
++    let svg_renderer = cx.svg_renderer();
++    let asset_source = cx.asset_source().clone();
++    async move {
++        let bytes: Box<dyn Deref<Target = [u8]> + Send> = match source.clone() {
++            Resource::Path(uri) if max_width.is_some() => {
++                Box::new(TransientBuffer::read_file(uri.as_ref())?)
++            }
++            Resource::Path(uri) => Box::new(fs::read(uri.as_ref())?),
++            Resource::Uri(uri) => {
++                use anyhow::Context as _;
++                use futures::AsyncReadExt as _;
++
++                let mut response = client
++                    .get(uri.as_ref(), ().into(), true)
++                    .await
++                    .with_context(|| format!("loading image asset from {uri:?}"))?;
++                let mut body = Vec::new();
++                response.body_mut().read_to_end(&mut body).await?;
++                if !response.status().is_success() {
++                    let mut body = String::from_utf8_lossy(&body).into_owned();
++                    let first_line = body.lines().next().unwrap_or("").trim_end();
++                    body.truncate(first_line.len());
++                    return Err(ImageCacheError::BadStatus {
++                        uri,
++                        status: response.status(),
++                        body,
++                    });
++                }
++                Box::new(body)
++            }
++            Resource::Embedded(path) => {
++                let data = asset_source.load(&path).ok().flatten();
++                if let Some(data) = data {
++                    Box::new(data.to_vec())
++                } else {
++                    return Err(ImageCacheError::Asset(
++                        format!("Embedded resource not found: {}", path).into(),
++                    ));
++                }
++            }
++        };
++
++        let bytes: &[u8] = &bytes;
++        let result = if let Ok(format) = image::guess_format(bytes) {
++            let still_image = match (format, max_width) {
++                (ImageFormat::Gif | ImageFormat::WebP, _) | (_, None) => None,
++                (_, Some(max_width)) => decode_still_image_at_most_wide(bytes, format, max_width)?,
++            };
++            let image = match still_image {
++                Some(image) => image,
++                None => {
++                    let mut data = match format {
++                        ImageFormat::Gif => decode_gif_image(bytes)?,
++                        ImageFormat::WebP => decode_webp_image(bytes)?,
++                        _ => decode_static_image(bytes, format)?,
++                    };
++                    let shrink =
++                        max_width.map_or(1., |max_width| shrink_to_width(&mut data, max_width));
++                    let mut image = RenderImage::new(data);
++                    image.scale_factor = shrink;
++                    image
++                }
++            };
++
++            Ok(Arc::new(image))
++        } else {
++            match (max_width, max_svg_raster_size) {
++                (Some(max_width), _) => {
++                    svg_renderer.render_single_frame_at_most_wide(bytes, max_width as f32)
++                }
++                (None, Some(max_size)) => svg_renderer.render_single_frame_at_most(bytes, max_size),
++                (None, None) => svg_renderer.render_single_frame(bytes, 1.0),
++            }
++            .map_err(Into::into)
++        };
++        #[cfg(target_os = "macos")]
++        release_malloc_pressure();
++        result
++    }
++}
++
++#[cfg(target_os = "macos")]
++fn release_malloc_pressure() {
++    unsafe extern "C" {
++        fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
++    }
++    // SAFETY: Passing NULL asks macOS libmalloc to purge empty magazines across all zones.
++    unsafe {
++        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
++    }
++}
++
++/// Decodes a still image no wider than `max_width` (and no taller than 4096 px) directly into a
++/// BGRA [`TransientBuffer`] (`mmap`/`munmap` on macOS). Neither the full-size decode scratch nor
++/// the downsampled `RenderImage` buffer touches macOS `xzone_malloc`'s sticky `Malloc Large`
++/// cache, so closing a preview returns 100% of its pixel memory to the OS immediately.
++/// Returns `None` for formats or pixel types the caller should decode as usual.
++fn decode_still_image_at_most_wide(
++    bytes: &[u8],
++    format: ImageFormat,
++    max_width: u32,
++) -> Result<Option<RenderImage>, ImageCacheError> {
++    const MAX_RASTER_SIDE: u32 = 4096;
++    if max_width == 0 {
++        return Ok(None);
++    }
++    let mut decoder =
++        image::ImageReader::with_format(io::Cursor::new(bytes), format).into_decoder()?;
++    let color_type = decoder.color_type();
++    if !matches!(
++        color_type,
++        ColorType::L8 | ColorType::La8 | ColorType::Rgb8 | ColorType::Rgba8
++    ) {
++        return Ok(None);
++    }
++    let orientation = decoder.orientation()?;
++    let (width, height) = decoder.dimensions();
++    if width == 0 || height == 0 {
++        return Ok(None);
++    }
++    let mut pixels =
++        TransientBuffer::zeroed(usize::try_from(decoder.total_bytes()).map_err(io::Error::other)?)?;
++    decoder.read_image(&mut pixels)?;
++
++    let swaps_axes = matches!(
++        orientation,
++        Orientation::Rotate90
++            | Orientation::Rotate270
++            | Orientation::Rotate90FlipH
++            | Orientation::Rotate270FlipH
++    );
++    let (drawn_width, drawn_height) = if swaps_axes {
++        (height, width)
++    } else {
++        (width, height)
++    };
++    let clamped_width = max_width.min(MAX_RASTER_SIDE);
++    let shrink = (clamped_width as f32 / drawn_width as f32)
++        .min(MAX_RASTER_SIDE as f32 / drawn_height as f32)
++        .min(1.);
++    let scale = |length: u32| ((length as f32 * shrink).round() as u32).max(1);
++    let scaled_w = scale(width);
++    let scaled_h = scale(height);
++    let (out_w, out_h) = if swaps_axes {
++        (scaled_h, scaled_w)
++    } else {
++        (scaled_w, scaled_h)
++    };
++
++    let dest = downsample_to_bgra_mapped(
++        &pixels,
++        width,
++        height,
++        color_type,
++        orientation,
++        scaled_w,
++        scaled_h,
++        out_w,
++        out_h,
++    )?;
++    drop(pixels);
++
++    let mut image = RenderImage::from_mapped(out_w, out_h, dest);
++    image.scale_factor = shrink;
++    Ok(Some(image))
++}
++
++/// Box-filter downsamples 8-bit pixels (`L8`/`La8`/`Rgb8`/`Rgba8`) directly into an oriented BGRA
++/// [`TransientBuffer`] with premultiplied-alpha weighting and zero `DefaultMallocZone` scratch.
++#[allow(clippy::too_many_arguments)]
++fn downsample_to_bgra_mapped(
++    src: &[u8],
++    src_w: u32,
++    src_h: u32,
++    color_type: ColorType,
++    orientation: Orientation,
++    scaled_w: u32,
++    scaled_h: u32,
++    out_w: u32,
++    out_h: u32,
++) -> Result<TransientBuffer, ImageCacheError> {
++    let channels: usize = match color_type {
++        ColorType::L8 => 1,
++        ColorType::La8 => 2,
++        ColorType::Rgb8 => 3,
++        ColorType::Rgba8 => 4,
++        _ => return Err(anyhow::anyhow!("unsupported color type {color_type:?}").into()),
++    };
++    let src_w_usize = src_w as usize;
++    let src_h_usize = src_h as usize;
++    let expected_src_len = src_w_usize
++        .checked_mul(src_h_usize)
++        .and_then(|px| px.checked_mul(channels))
++        .ok_or_else(|| anyhow::anyhow!("source image dimensions overflow"))?;
++    if src.len() < expected_src_len {
++        return Err(anyhow::anyhow!("decoded image does not match its dimensions").into());
++    }
++
++    let out_w_usize = out_w as usize;
++    let out_h_usize = out_h as usize;
++    let dest_len = out_w_usize
++        .checked_mul(out_h_usize)
++        .and_then(|px| px.checked_mul(4))
++        .ok_or_else(|| anyhow::anyhow!("output image dimensions overflow"))?;
++    let mut dest = TransientBuffer::zeroed(dest_len).map_err(io::Error::other)?;
++
++    let scaled_w_usize = scaled_w as usize;
++    let scaled_h_usize = scaled_h as usize;
++    let src_row_stride = src_w_usize * channels;
++
++    for dy in 0..scaled_h_usize {
++        let sy0 = (dy as u64 * src_h as u64 / scaled_h as u64) as usize;
++        let sy1 = (((dy as u64 + 1) * src_h as u64 / scaled_h as u64) as usize)
++            .max(sy0 + 1)
++            .min(src_h_usize);
++
++        for dx in 0..scaled_w_usize {
++            let sx0 = (dx as u64 * src_w as u64 / scaled_w as u64) as usize;
++            let sx1 = (((dx as u64 + 1) * src_w as u64 / scaled_w as u64) as usize)
++                .max(sx0 + 1)
++                .min(src_w_usize);
++
++            let count = ((sx1 - sx0) * (sy1 - sy0)) as u64;
++            let bgra = match color_type {
++                ColorType::L8 => {
++                    let mut sum = 0u64;
++                    for sy in sy0..sy1 {
++                        let row_start = sy * src_row_stride;
++                        for &v in &src[row_start + sx0..row_start + sx1] {
++                            sum += u64::from(v);
++                        }
+                     }
+-                    body
++                    let v = ((sum + count / 2) / count) as u8;
++                    [v, v, v, 255]
+                 }
+-                Resource::Embedded(path) => {
+-                    let data = asset_source.load(&path).ok().flatten();
+-                    if let Some(data) = data {
+-                        data.to_vec()
++                ColorType::La8 => {
++                    let mut sum_v = 0u64;
++                    let mut sum_a = 0u64;
++                    for sy in sy0..sy1 {
++                        let row_start = sy * src_row_stride;
++                        for px in src[row_start + sx0 * 2..row_start + sx1 * 2].chunks_exact(2) {
++                            let v = u64::from(px[0]);
++                            let a = u64::from(px[1]);
++                            sum_v += v * a;
++                            sum_a += a;
++                        }
++                    }
++                    let a = ((sum_a + count / 2) / count) as u8;
++                    let v = if sum_a > 0 {
++                        ((sum_v + sum_a / 2) / sum_a).min(255) as u8
++                    } else {
++                        0
++                    };
++                    [v, v, v, a]
++                }
++                ColorType::Rgb8 => {
++                    let mut sum_r = 0u64;
++                    let mut sum_g = 0u64;
++                    let mut sum_b = 0u64;
++                    for sy in sy0..sy1 {
++                        let row_start = sy * src_row_stride;
++                        for px in src[row_start + sx0 * 3..row_start + sx1 * 3].chunks_exact(3) {
++                            sum_r += u64::from(px[0]);
++                            sum_g += u64::from(px[1]);
++                            sum_b += u64::from(px[2]);
++                        }
++                    }
++                    let half = count / 2;
++                    [
++                        ((sum_b + half) / count) as u8,
++                        ((sum_g + half) / count) as u8,
++                        ((sum_r + half) / count) as u8,
++                        255,
++                    ]
++                }
++                ColorType::Rgba8 => {
++                    let mut sum_r = 0u64;
++                    let mut sum_g = 0u64;
++                    let mut sum_b = 0u64;
++                    let mut sum_a = 0u64;
++                    for sy in sy0..sy1 {
++                        let row_start = sy * src_row_stride;
++                        for px in src[row_start + sx0 * 4..row_start + sx1 * 4].chunks_exact(4) {
++                            let a = u64::from(px[3]);
++                            sum_r += u64::from(px[0]) * a;
++                            sum_g += u64::from(px[1]) * a;
++                            sum_b += u64::from(px[2]) * a;
++                            sum_a += a;
++                        }
++                    }
++                    let a = ((sum_a + count / 2) / count) as u8;
++                    if sum_a > 0 {
++                        let half = sum_a / 2;
++                        [
++                            ((sum_b + half) / sum_a).min(255) as u8,
++                            ((sum_g + half) / sum_a).min(255) as u8,
++                            ((sum_r + half) / sum_a).min(255) as u8,
++                            a,
++                        ]
+                     } else {
+-                        return Err(ImageCacheError::Asset(
+-                            format!("Embedded resource not found: {}", path).into(),
+-                        ));
++                        [0, 0, 0, a]
+                     }
+                 }
++                _ => unreachable!(),
+             };
+ 
+-            if let Ok(format) = image::guess_format(&bytes) {
+-                let data = match format {
+-                    ImageFormat::Gif => decode_gif_image(&bytes)?,
+-                    ImageFormat::WebP => decode_webp_image(&bytes)?,
+-                    _ => decode_static_image(&bytes, format)?,
+-                };
++            let (ox, oy) = match orientation {
++                Orientation::NoTransforms => (dx, dy),
++                Orientation::FlipHorizontal => (scaled_w_usize - 1 - dx, dy),
++                Orientation::Rotate180 => (scaled_w_usize - 1 - dx, scaled_h_usize - 1 - dy),
++                Orientation::FlipVertical => (dx, scaled_h_usize - 1 - dy),
++                Orientation::Rotate90 => (scaled_h_usize - 1 - dy, dx),
++                Orientation::Rotate270 => (dy, scaled_w_usize - 1 - dx),
++                Orientation::Rotate90FlipH => (dy, dx),
++                Orientation::Rotate270FlipH => (scaled_h_usize - 1 - dy, scaled_w_usize - 1 - dx),
++            };
++            let offset = (oy * out_w_usize + ox) * 4;
++            dest[offset..offset + 4].copy_from_slice(&bgra);
++        }
++    }
++
++    Ok(dest)
++}
+ 
+-                Ok(Arc::new(RenderImage::new(data)))
+-            } else {
+-                svg_renderer
+-                    .render_single_frame(&bytes, 1.0)
+-                    .map_err(Into::into)
++/// Downsamples BGRA frames wider than `max_width` to that width, keeping their aspect ratio, and
++/// returns the factor they shrank by.
++fn shrink_to_width(frames: &mut SmallVec<[Frame; 1]>, max_width: u32) -> f32 {
++    let Some(width) = frames.first().map(|frame| frame.buffer().width()) else {
++        return 1.;
++    };
++    if max_width == 0 || width <= max_width {
++        return 1.;
++    }
++    let shrink = max_width as f32 / width as f32;
++    let scale = |length: u32| ((length as f32 * shrink).round() as u32).max(1);
++    for frame in frames.iter_mut() {
++        let (left, top, delay) = (frame.left(), frame.top(), frame.delay());
++        let mut buffer = std::mem::replace(frame, Frame::new(RgbaImage::new(0, 0))).into_buffer();
++        let (new_width, new_height) = (scale(buffer.width()), scale(buffer.height()));
++        let has_alpha = buffer.pixels().any(|pixel| pixel[3] != u8::MAX);
++        if has_alpha {
++            premultiply(&mut buffer, 4);
++        }
++        let mut resized = imageops::thumbnail(&buffer, new_width, new_height);
++        drop(buffer);
++        if has_alpha {
++            unpremultiply(&mut resized, 4);
++        }
++        *frame = Frame::from_parts(resized, scale(left), scale(top), delay);
++    }
++    shrink
++}
++
++// Pixels are premultiplied while they are resized: filtering straight alpha would bleed the
++// colour of transparent pixels, often black, into the edges of what they surround.
++fn premultiply(pixels: &mut [u8], channels: usize) {
++    for pixel in pixels.chunks_exact_mut(channels) {
++        if let Some((alpha, colour)) = pixel.split_last_mut() {
++            let alpha = u32::from(*alpha);
++            for channel in colour {
++                *channel = ((u32::from(*channel) * alpha + 127) / 255) as u8;
+             }
+         }
+     }
+ }
+ 
++fn unpremultiply(pixels: &mut [u8], channels: usize) {
++    for pixel in pixels.chunks_exact_mut(channels) {
++        if let Some((alpha, colour)) = pixel.split_last_mut()
++            && *alpha > 0
++        {
++            let alpha = u32::from(*alpha);
++            for channel in colour {
++                *channel = ((u32::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
++            }
++        }
++    }
++}
++
++/// Memory for an image's full-size decode scratch or cached pixel buffer that goes back to the
++/// system immediately when dropped. macOS's `xzone_malloc` keeps freed `Malloc Large` blocks (>32
++/// KiB) resident for reuse and does not give them up under `malloc_zone_pressure_relief`, so
++/// routing allocations >= 32 KiB through anonymous `mmap`/`munmap` ensures zero retained footprint
++/// after an image or preview is closed, while tiny allocations avoid `mmap` / page-rounding cost.
++#[cfg(target_os = "macos")]
++pub(crate) enum TransientBuffer {
++    Mapped {
++        pointer: std::ptr::NonNull<u8>,
++        len: usize,
++    },
++    Heap(Vec<u8>),
++}
++
++#[cfg(not(target_os = "macos"))]
++pub(crate) struct TransientBuffer {
++    data: Vec<u8>,
++}
++
++// SAFETY: the buffer owns its mapping exclusively, as a Vec owns its allocation.
++#[cfg(target_os = "macos")]
++unsafe impl Send for TransientBuffer {}
++#[cfg(target_os = "macos")]
++unsafe impl Sync for TransientBuffer {}
++
++impl TransientBuffer {
++    /// Allocations at or above 32 KiB (2 ARM64 pages) bypass `xzone_malloc`'s sticky large cache.
++    #[cfg(target_os = "macos")]
++    const MMAP_THRESHOLD: usize = 32 * 1024;
++
++    #[cfg(target_os = "macos")]
++    pub(crate) fn zeroed(len: usize) -> io::Result<Self> {
++        if len < Self::MMAP_THRESHOLD {
++            return Ok(Self::Heap(vec![0; len]));
++        }
++        // SAFETY: a new private anonymous mapping aliases no other memory.
++        let pointer = unsafe {
++            libc::mmap(
++                std::ptr::null_mut(),
++                len,
++                libc::PROT_READ | libc::PROT_WRITE,
++                libc::MAP_PRIVATE | libc::MAP_ANON,
++                -1,
++                0,
++            )
++        };
++        if pointer == libc::MAP_FAILED {
++            return Err(io::Error::last_os_error());
++        }
++        let pointer = std::ptr::NonNull::new(pointer.cast::<u8>())
++            .ok_or_else(|| io::Error::other("mmap returned a null mapping"))?;
++        Ok(Self::Mapped { pointer, len })
++    }
++
++    #[cfg(not(target_os = "macos"))]
++    pub(crate) fn zeroed(len: usize) -> io::Result<Self> {
++        Ok(Self { data: vec![0; len] })
++    }
++
++    fn read_file(path: &Path) -> io::Result<Self> {
++        let mut file = fs::File::open(path)?;
++        let len = usize::try_from(file.metadata()?.len()).map_err(io::Error::other)?;
++        let mut buffer = Self::zeroed(len)?;
++        io::Read::read_exact(&mut file, &mut buffer)?;
++        Ok(buffer)
++    }
++}
++
++impl Deref for TransientBuffer {
++    type Target = [u8];
++
++    #[cfg(target_os = "macos")]
++    fn deref(&self) -> &[u8] {
++        match self {
++            // SAFETY: the mapping is `len` readable bytes for as long as `self` lives.
++            Self::Mapped { pointer, len } => unsafe {
++                std::slice::from_raw_parts(pointer.as_ptr(), *len)
++            },
++            Self::Heap(data) => data,
++        }
++    }
++
++    #[cfg(not(target_os = "macos"))]
++    fn deref(&self) -> &[u8] {
++        &self.data
++    }
++}
++
++impl DerefMut for TransientBuffer {
++    #[cfg(target_os = "macos")]
++    fn deref_mut(&mut self) -> &mut [u8] {
++        match self {
++            // SAFETY: as in `deref`, and `&mut self` makes this the only reference.
++            Self::Mapped { pointer, len } => unsafe {
++                std::slice::from_raw_parts_mut(pointer.as_ptr(), *len)
++            },
++            Self::Heap(data) => data,
++        }
++    }
++
++    #[cfg(not(target_os = "macos"))]
++    fn deref_mut(&mut self) -> &mut [u8] {
++        &mut self.data
++    }
++}
++
++#[cfg(target_os = "macos")]
++impl Drop for TransientBuffer {
++    fn drop(&mut self) {
++        if let Self::Mapped { pointer, len } = self
++            && *len > 0
++        {
++            // SAFETY: the mapping came from `mmap` with this length and is unmapped only here.
++            unsafe { libc::munmap(pointer.as_ptr().cast(), *len) };
++        }
++    }
++}
++
+ /// An error that can occur when interacting with the image cache.
+ #[derive(Debug, Error, Clone)]
+ pub enum ImageCacheError {
+@@ -729,7 +1212,7 @@ impl From<image::ImageError> for ImageCacheError {
+ mod tests {
+     use super::*;
+     use crate::{IntoElement, ParentElement as _, TestAppContext, canvas, div, point, px, size};
+-    use image::{Frame, ImageBuffer, Rgba};
++    use image::{DynamicImage, Frame, ImageBuffer, Rgba};
+     use smallvec::SmallVec;
+ 
+     const TEST_IMG_ID: &str = "test-img";
+@@ -746,6 +1229,107 @@ mod tests {
+         Arc::new(RenderImage::new(SmallVec::from_elem(frame, 1)))
+     }
+ 
++    #[test]
++    fn decode_still_image_at_most_wide_rejects_zero_max_width() {
++        let src = RgbaImage::from_pixel(4, 4, Rgba([10, 20, 30, 255]));
++        let mut png_bytes = Vec::new();
++        DynamicImage::ImageRgba8(src)
++            .write_to(&mut io::Cursor::new(&mut png_bytes), ImageFormat::Png)
++            .unwrap();
++        assert!(
++            decode_still_image_at_most_wide(&png_bytes, ImageFormat::Png, 0)
++                .unwrap()
++                .is_none()
++        );
++    }
++
++    #[test]
++    fn decode_still_image_at_most_wide_preserves_bgra_and_alpha() {
++        let mut src = RgbaImage::new(40, 20);
++        for y in 0..20 {
++            for x in 0..40 {
++                let pixel = if y < 10 {
++                    // Top half: semi-transparent red (RGBA = 200, 40, 20, 128)
++                    Rgba([200, 40, 20, 128])
++                } else {
++                    // Bottom half: opaque blue (RGBA = 10, 30, 220, 255)
++                    Rgba([10, 30, 220, 255])
++                };
++                src.put_pixel(x, y, pixel);
++            }
++        }
++        let mut png_bytes = Vec::new();
++        DynamicImage::ImageRgba8(src)
++            .write_to(&mut io::Cursor::new(&mut png_bytes), ImageFormat::Png)
++            .unwrap();
++
++        let image = decode_still_image_at_most_wide(&png_bytes, ImageFormat::Png, 20)
++            .unwrap()
++            .unwrap();
++        assert!((image.scale_factor - 0.5).abs() < 0.05, "unexpected shrink {}", image.scale_factor);
++        let dims = image.size(0);
++        assert_eq!((dims.width.0, dims.height.0), (20, 10));
++        let bytes = image.as_bytes(0).unwrap();
++        let pixel_at = |x: usize, y: usize| -> [u8; 4] {
++            let off = (y * 20 + x) * 4;
++            bytes[off..off + 4].try_into().unwrap()
++        };
++
++        // Top row should be BGRA ~ [20, 40, 200, 128]
++        let top = pixel_at(10, 1);
++        assert!(top[2] > 180 && top[0] < 40 && (top[3] as i32 - 128).abs() <= 4, "top={top:?}");
++        // Bottom row should be BGRA ~ [220, 30, 10, 255]
++        let bottom = pixel_at(10, 8);
++        assert!(bottom[0] > 200 && bottom[2] < 30 && bottom[3] == 255, "bottom={bottom:?}");
++    }
++
++    #[test]
++    fn downsample_to_bgra_mapped_matches_all_orientations() {
++        // 3x2 image with distinct RGB values per pixel so every orientation produces a unique grid.
++        let mut src = RgbaImage::new(3, 2);
++        for y in 0..2u32 {
++            for x in 0..3u32 {
++                src.put_pixel(x, y, Rgba([(x * 60 + 10) as u8, (y * 100 + 20) as u8, 77, 255]));
++            }
++        }
++        let orientations = [
++            Orientation::NoTransforms,
++            Orientation::FlipHorizontal,
++            Orientation::Rotate180,
++            Orientation::FlipVertical,
++            Orientation::Rotate90,
++            Orientation::Rotate270,
++            Orientation::Rotate90FlipH,
++            Orientation::Rotate270FlipH,
++        ];
++        for orientation in orientations {
++            let mut expected = DynamicImage::ImageRgba8(src.clone());
++            expected.apply_orientation(orientation);
++            let mut expected_bgra = expected.into_rgba8();
++            for px in expected_bgra.chunks_exact_mut(4) {
++                px.swap(0, 2);
++            }
++            let (out_w, out_h) = expected_bgra.dimensions();
++            let actual = downsample_to_bgra_mapped(
++                src.as_raw(),
++                3,
++                2,
++                ColorType::Rgba8,
++                orientation,
++                3,
++                2,
++                out_w,
++                out_h,
++            )
++            .unwrap();
++            assert_eq!(
++                &*actual,
++                expected_bgra.as_raw().as_slice(),
++                "mismatch for orientation {orientation:?}"
++            );
++        }
++    }
++
+     /// Overwrites the cached `frame_index` of the sibling `img` during paint.
+     fn seed_frame_index(frame_index: usize) -> impl IntoElement {
+         canvas(
+diff --git a/crates/gpui/src/platform.rs b/crates/gpui/src/platform.rs
+index 8f44cc0..39154ee 100644
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -1831,6 +1831,13 @@ pub trait PlatformAtlas {
+     ) -> Result<Option<AtlasTile>>;
+     fn remove(&self, key: &AtlasKey);
+ 
++    /// Drops cached monochrome glyph/SVG tiles when the atlas has grown beyond
++    /// `max_textures` pages, returning true if tiles were evicted and windows
++    /// should redraw to repopulate only active glyphs.
++    fn evict_monochrome_tiles_if_excess(&self, _max_textures: usize) -> bool {
++        false
++    }
++
+     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
+     fn contains(&self, _key: &AtlasKey) -> bool {
+         false
+@@ -1871,6 +1878,12 @@ impl<Backend> AtlasState<Backend> {
+         self.tiles_by_key.clear();
+         reset_backend(&mut self.backend);
+     }
++
++    pub fn clear_monochrome(&mut self, reset_monochrome: impl FnOnce(&mut Backend)) {
++        self.tiles_by_key
++            .retain(|key, _| key.texture_kind() != AtlasTextureKind::Monochrome);
++        reset_monochrome(&mut self.backend);
++    }
+ }
+ 
+ impl<Backend: Default> Default for AtlasState<Backend> {
+diff --git a/crates/gpui/src/profiler/journal.rs b/crates/gpui/src/profiler/journal.rs
+index 28c66b6..6115f68 100644
+--- a/crates/gpui/src/profiler/journal.rs
++++ b/crates/gpui/src/profiler/journal.rs
+@@ -1187,7 +1187,9 @@ impl Drop for JournalSlotReadGuard<'_> {
+ }
+ 
+ struct JournalRing {
+-    slots: Box<[JournalSlot]>,
++    capacity: usize,
++    slots: std::sync::OnceLock<Box<[JournalSlot]>>,
++    has_collector: std::sync::atomic::AtomicBool,
+     finalized: AtomicU64,
+     offered: AtomicU64,
+ }
+@@ -1196,24 +1198,40 @@ impl JournalRing {
+     fn new(capacity: usize) -> Self {
+         let capacity = capacity.max(1);
+         Self {
+-            slots: (0..capacity).map(|_| JournalSlot::new()).collect(),
++            capacity,
++            slots: std::sync::OnceLock::new(),
++            has_collector: std::sync::atomic::AtomicBool::new(false),
+             finalized: AtomicU64::new(0),
+             offered: AtomicU64::new(0),
+         }
+     }
+ 
++    fn is_active(&self) -> bool {
++        self.has_collector.load(Ordering::Acquire)
++    }
++
++    fn activate(&self) {
++        self.slots
++            .get_or_init(|| (0..self.capacity).map(|_| JournalSlot::new()).collect());
++        self.has_collector.store(true, Ordering::Release);
++    }
++
+     fn capacity(&self) -> usize {
+-        self.slots.len()
++        self.capacity
+     }
+ 
+     fn try_publish(&self, sequence: u64, entry: ForegroundJournalEntry) -> bool {
+-        let index = (sequence % self.slots.len() as u64) as usize;
+-        self.slots[index].try_publish(sequence, entry)
++        let Some(slots) = self.slots.get() else {
++            return true;
++        };
++        let index = (sequence % slots.len() as u64) as usize;
++        slots[index].try_publish(sequence, entry)
+     }
+ 
+     fn read(&self, sequence: u64) -> Option<ForegroundJournalEntry> {
+-        let index = (sequence % self.slots.len() as u64) as usize;
+-        self.slots[index].try_read(sequence)
++        let slots = self.slots.get()?;
++        let index = (sequence % slots.len() as u64) as usize;
++        slots[index].try_read(sequence)
+     }
+ }
+ 
+@@ -1250,6 +1268,9 @@ impl JournalPublisher {
+     }
+ 
+     fn publish_one(&mut self, entry: ForegroundJournalEntry) {
++        if !self.ring.is_active() {
++            return;
++        }
+         let sequence = self.next_sequence;
+         self.next_sequence += 1;
+         self.ring
+@@ -1320,6 +1341,7 @@ impl ForegroundJournal {
+     /// Creates an independent collector that observes entries offered after
+     /// this call.
+     pub fn collector(&self) -> ForegroundJournalCollector {
++        self.ring.activate();
+         ForegroundJournalCollector {
+             cursor: self.ring.offered.load(Ordering::Acquire),
+             ring: Arc::clone(&self.ring),
+@@ -3158,7 +3180,9 @@ mod tests {
+                     RingOperation::Pin(slot) => {
+                         let index = usize::from(slot) % capacity;
+                         if pins[index].is_none() {
+-                            pins[index] = JournalSlotReadGuard::try_new(&journal.ring.slots[index]);
++                            pins[index] = JournalSlotReadGuard::try_new(
++                                &journal.ring.slots.get().unwrap()[index],
++                            );
+                             prop_assert!(pins[index].is_some());
+                             model.pinned[index] = true;
+                         }
+diff --git a/crates/gpui/src/svg_renderer.rs b/crates/gpui/src/svg_renderer.rs
+index 49f77a1..4a7bb69 100644
+--- a/crates/gpui/src/svg_renderer.rs
++++ b/crates/gpui/src/svg_renderer.rs
+@@ -1,10 +1,8 @@
+ use crate::{
+     AssetSource, DevicePixels, IsZero, RenderImage, Result, SharedString, Size,
+-    swap_rgba_pa_to_bgra,
++    elements::TransientBuffer, swap_rgba_pa_to_bgra,
+ };
+-use image::Frame;
+-use resvg::tiny_skia::Pixmap;
+-use smallvec::SmallVec;
++use resvg::tiny_skia::{Pixmap, PixmapMut};
+ use std::{
+     hash::Hash,
+     sync::{Arc, LazyLock, OnceLock},
+@@ -122,25 +120,18 @@ impl From<f32> for SvgSize {
+ impl SvgRenderer {
+     /// Creates a new SVG renderer with the provided asset source.
+     pub fn new(asset_source: Arc<dyn AssetSource>) -> Self {
+-        static SYSTEM_FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
+-            let mut db = usvg::fontdb::Database::new();
+-            db.load_system_fonts();
+-            Arc::new(db)
+-        });
+-
+-        // Build the enriched font DB lazily on first SVG render rather than
+-        // eagerly at construction time. This avoids the expensive deep-clone
+-        // of the system font database for code paths that never render SVGs
+-        // (e.g. tests).
+-        let enriched_fontdb: Arc<OnceLock<Arc<usvg::fontdb::Database>>> = Arc::new(OnceLock::new());
++        // Share a single lazily initialized font database (system + bundled fonts)
++        // across all renderers so we never deep-clone the system font DB.
++        static ENRICHED_FONT_DB: OnceLock<Arc<usvg::fontdb::Database>> = OnceLock::new();
+ 
+         let default_font_resolver = usvg::FontResolver::default_font_selector();
+         let font_resolver = Box::new({
+             let asset_source = asset_source.clone();
+             move |font: &usvg::Font, db: &mut Arc<usvg::fontdb::Database>| {
+                 if db.is_empty() {
+-                    let fontdb = enriched_fontdb.get_or_init(|| {
+-                        let mut db = (**SYSTEM_FONT_DB).clone();
++                    let fontdb = ENRICHED_FONT_DB.get_or_init(|| {
++                        let mut db = usvg::fontdb::Database::new();
++                        db.load_system_fonts();
+                         load_bundled_fonts(&*asset_source, &mut db);
+                         fix_generic_font_families(&mut db);
+                         Arc::new(db)
+@@ -197,6 +188,14 @@ impl SvgRenderer {
+         svg: &ParsedSvg,
+         size: impl Into<SvgSize>,
+     ) -> Result<Arc<RenderImage>, usvg::Error> {
++        self.rasterize_image(svg, size).map(Arc::new)
++    }
++
++    fn rasterize_image(
++        &self,
++        svg: &ParsedSvg,
++        size: impl Into<SvgSize>,
++    ) -> Result<RenderImage, usvg::Error> {
+         let (size, image_scale_factor) = match size.into() {
+             SvgSize::Size(size) => (SvgSize::Size(size), 1.0),
+             SvgSize::ExactSize(size) => (SvgSize::ExactSize(size), 1.0),
+@@ -205,17 +204,15 @@ impl SvgRenderer {
+                 SMOOTH_SVG_SCALE_FACTOR,
+             ),
+         };
+-        let pixmap = rasterize_tree(&svg.0, size)?;
+-        let mut buffer =
+-            image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take()).unwrap();
++        let (width, height, mut pixels) = rasterize_tree_mapped(&svg.0, size)?;
+ 
+-        for pixel in buffer.chunks_exact_mut(4) {
++        for pixel in pixels.chunks_exact_mut(4) {
+             swap_rgba_pa_to_bgra(pixel);
+         }
+ 
+-        let mut image = RenderImage::new(SmallVec::from_const([Frame::new(buffer)]));
++        let mut image = RenderImage::from_mapped(width, height, pixels);
+         image.scale_factor = image_scale_factor;
+-        Ok(Arc::new(image))
++        Ok(image)
+     }
+ 
+     /// Renders the given bytes into an image buffer.
+@@ -228,6 +225,60 @@ impl SvgRenderer {
+         self.render_parsed(&svg, scale_factor)
+     }
+ 
++    /// Renders the given bytes as [`Self::render_single_frame`] does at a scale factor of 1, but
++    /// with the image's longer side at most `max_size` device pixels. The image keeps the SVG's
++    /// logical size, so it lays out the same.
++    pub fn render_single_frame_at_most(
++        &self,
++        bytes: &[u8],
++        max_size: f32,
++    ) -> Result<Arc<RenderImage>, usvg::Error> {
++        let svg = self.parse_svg(bytes)?;
++        let svg_size = svg.0.size();
++        let shrink = max_size / (svg_size.width().max(svg_size.height()) * SMOOTH_SVG_SCALE_FACTOR);
++        self.render_parsed_shrunk(&svg, shrink)
++    }
++
++    /// Renders the given bytes as [`Self::render_single_frame`] does at a scale factor of 1, but
++    /// at most `max_width` device pixels wide (and capped in both dimensions to a Metal-safe max
++    /// of 4096 device pixels), keeping the SVG's logical size.
++    pub fn render_single_frame_at_most_wide(
++        &self,
++        bytes: &[u8],
++        max_width: f32,
++    ) -> Result<Arc<RenderImage>, usvg::Error> {
++        const MAX_SVG_RASTER_SIDE: f32 = 4096.0;
++        if !max_width.is_finite() || max_width <= 0.0 {
++            return Err(usvg::Error::InvalidSize);
++        }
++        let svg = self.parse_svg(bytes)?;
++        let svg_size = svg.0.size();
++        if svg_size.width() <= 0.0 || svg_size.height() <= 0.0 {
++            return Err(usvg::Error::InvalidSize);
++        }
++        let clamped_width = max_width.min(MAX_SVG_RASTER_SIDE);
++        let width_shrink = clamped_width / (svg_size.width() * SMOOTH_SVG_SCALE_FACTOR);
++        let height_shrink = MAX_SVG_RASTER_SIDE / (svg_size.height() * SMOOTH_SVG_SCALE_FACTOR);
++        let shrink = width_shrink.min(height_shrink);
++        self.render_parsed_shrunk(&svg, shrink)
++    }
++
++    fn render_parsed_shrunk(
++        &self,
++        svg: &ParsedSvg,
++        shrink: f32,
++    ) -> Result<Arc<RenderImage>, usvg::Error> {
++        if !shrink.is_finite() || shrink <= 0.0 {
++            return Err(usvg::Error::InvalidSize);
++        }
++        if shrink >= 1. {
++            return self.render_parsed(svg, 1.0);
++        }
++        let mut image = self.rasterize_image(svg, shrink)?;
++        image.scale_factor *= shrink;
++        Ok(Arc::new(image))
++    }
++
+     pub(crate) fn render_alpha_mask(
+         &self,
+         params: &RenderSvgParams,
+@@ -267,7 +318,7 @@ impl SvgRenderer {
+     }
+ }
+ 
+-fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Error> {
++fn clamped_raster_dimensions(tree: &usvg::Tree, size: SvgSize) -> (f32, f32) {
+     // Cap the size of the rendered pixmap to avoid texture allocation panics
+     // Related issue: #56466
+     const MAX_SIZE: f32 = 8192.0;
+@@ -291,6 +342,12 @@ fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Erro
+     let scale = (MAX_SIZE / width).min(MAX_SIZE / height).min(1.0);
+     width *= scale;
+     height *= scale;
++    (width, height)
++}
++
++fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Error> {
++    let svg_size = tree.size();
++    let (width, height) = clamped_raster_dimensions(tree, size);
+ 
+     // Render the SVG to a pixmap with the specified width and height.
+     let mut pixmap = resvg::tiny_skia::Pixmap::new(width as u32, height as u32)
+@@ -306,6 +363,34 @@ fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Erro
+     Ok(pixmap)
+ }
+ 
++fn rasterize_tree_mapped(
++    tree: &usvg::Tree,
++    size: SvgSize,
++) -> Result<(u32, u32, TransientBuffer), usvg::Error> {
++    let svg_size = tree.size();
++    let (width, height) = clamped_raster_dimensions(tree, size);
++    let (pixel_w, pixel_h) = (width as u32, height as u32);
++    if pixel_w == 0 || pixel_h == 0 {
++        return Err(usvg::Error::InvalidSize);
++    }
++    let byte_len = (pixel_w as usize)
++        .checked_mul(pixel_h as usize)
++        .and_then(|px| px.checked_mul(4))
++        .ok_or(usvg::Error::InvalidSize)?;
++    let mut pixels = TransientBuffer::zeroed(byte_len).map_err(|_| usvg::Error::InvalidSize)?;
++    let mut pixmap =
++        PixmapMut::from_bytes(&mut pixels, pixel_w, pixel_h).ok_or(usvg::Error::InvalidSize)?;
++
++    let transform = resvg::tiny_skia::Transform::from_scale(
++        width / svg_size.width(),
++        height / svg_size.height(),
++    );
++
++    resvg::render(tree, transform, &mut pixmap);
++
++    Ok((pixel_w, pixel_h, pixels))
++}
++
+ fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Database) {
+     let font_paths = [
+         "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf",
+@@ -362,6 +447,15 @@ mod tests {
+         include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+     const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
+ 
++    #[test]
++    fn render_single_frame_at_most_wide_rejects_non_positive_width() {
++        let renderer = SvgRenderer::new(Arc::new(()));
++        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="12"></svg>"#;
++        assert!(renderer.render_single_frame_at_most_wide(svg, 0.0).is_err());
++        assert!(renderer.render_single_frame_at_most_wide(svg, -10.0).is_err());
++        assert!(renderer.render_single_frame_at_most_wide(svg, f32::NAN).is_err());
++    }
++
+     #[test]
+     fn renders_parsed_svg_at_requested_size() -> Result<()> {
+         let renderer = SvgRenderer::new(Arc::new(()));
+diff --git a/crates/gpui_apple/Cargo.toml b/crates/gpui_apple/Cargo.toml
+index 488d1dc..3b607ea 100644
+--- a/crates/gpui_apple/Cargo.toml
++++ b/crates/gpui_apple/Cargo.toml
+@@ -51,6 +51,7 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
+     "block2",
+     "dispatch2",
+     "MTLAllocation",
++    "MTLBinaryArchive",
+     "MTLBlitCommandEncoder",
+     "MTLBuffer",
+     "MTLCommandBuffer",
+@@ -67,7 +68,7 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
+     "MTLTexture",
+     "MTLTypes",
+ ] }
+-objc2-foundation = { workspace = true, features = ["NSThread", "NSNotification", "NSOperation", "NSProcessInfo", "block2"] }
++objc2-foundation = { workspace = true, features = ["NSArray", "NSThread", "NSNotification", "NSOperation", "NSProcessInfo", "NSURL", "block2"] }
+ objc2-quartz-core = { workspace = true, features = ["objc2-core-foundation", "objc2-core-graphics", "objc2-metal"] }
+ objc2-security.workspace = true
+ parking_lot.workspace = true
+diff --git a/crates/gpui_apple/src/metal_atlas.rs b/crates/gpui_apple/src/metal_atlas.rs
+index 8bb14d6..6fc6572 100644
+--- a/crates/gpui_apple/src/metal_atlas.rs
++++ b/crates/gpui_apple/src/metal_atlas.rs
+@@ -58,6 +58,24 @@ impl PlatformAtlas for MetalAtlas {
+     fn remove(&self, key: &AtlasKey) {
+         self.0.lock().remove(key);
+     }
++
++    fn evict_monochrome_tiles_if_excess(&self, max_textures: usize) -> bool {
++        let mut state = self.0.lock();
++        let live_pages = state
++            .backend
++            .monochrome_textures
++            .textures
++            .iter()
++            .filter(|t| t.is_some())
++            .count();
++        if live_pages <= max_textures {
++            return false;
++        }
++        state.clear_monochrome(|backend| {
++            backend.monochrome_textures = AtlasTextureList::default();
++        });
++        true
++    }
+ }
+ 
+ impl AtlasBackend for MetalAtlasTextures {
+diff --git a/crates/gpui_apple/src/metal_renderer.rs b/crates/gpui_apple/src/metal_renderer.rs
+index 9b98a23..3c9f479 100644
+--- a/crates/gpui_apple/src/metal_renderer.rs
++++ b/crates/gpui_apple/src/metal_renderer.rs
+@@ -7,7 +7,11 @@ use gpui::{
+ };
+ #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+ use image::RgbaImage;
+-use objc2::{Message, rc::Retained, runtime::ProtocolObject};
++use objc2::{
++    Message,
++    rc::{Retained, Weak},
++    runtime::ProtocolObject,
++};
+ use objc2_core_foundation::{CFRetained, CGSize};
+ use objc2_core_graphics::{CGColorSpace, kCGColorSpaceDisplayP3};
+ use objc2_core_video::{
+@@ -15,23 +19,31 @@ use objc2_core_video::{
+     CVPixelBufferGetHeightOfPlane, CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
+     CVPixelBufferGetWidthOfPlane, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVReturnSuccess,
+ };
+-use objc2_foundation::{NSRange, NSString};
++use objc2_foundation::{NSArray, NSProcessInfo, NSRange, NSString, NSURL};
+ #[cfg(target_os = "macos")]
+ use objc2_metal::MTLCopyAllDevices;
+ use objc2_metal::{
+-    MTLBlendFactor, MTLBlendOperation, MTLBuffer, MTLClearColor, MTLCommandBuffer,
+-    MTLCommandEncoder, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLDrawable,
+-    MTLGPUFamily, MTLLibrary, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
+-    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
+-    MTLRenderPipelineState, MTLResourceOptions, MTLStorageMode, MTLStoreAction, MTLTexture,
+-    MTLTextureDescriptor, MTLTextureType, MTLTextureUsage, MTLViewport,
++    MTLBinaryArchive, MTLBinaryArchiveDescriptor, MTLBlendFactor, MTLBlendOperation, MTLBuffer,
++    MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
++    MTLCreateSystemDefaultDevice, MTLDevice, MTLDrawable, MTLGPUFamily, MTLLibrary, MTLLoadAction,
++    MTLPixelFormat, MTLPrimitiveType, MTLPurgeableState, MTLRenderCommandEncoder,
++    MTLRenderPassDescriptor, MTLRenderPipelineDescriptor, MTLRenderPipelineState, MTLResource,
++    MTLResourceOptions, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
++    MTLTextureType, MTLTextureUsage, MTLViewport,
+ };
+ #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+ use objc2_metal::{MTLBlitCommandEncoder, MTLOrigin, MTLRegion, MTLSize};
+ use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
+ use parking_lot::Mutex;
+ 
+-use std::{cell::Cell, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
++use std::{
++    cell::Cell,
++    mem,
++    mem::MaybeUninit,
++    ops::Range,
++    ptr, slice,
++    sync::{Arc, Once, OnceLock},
++};
+ 
+ // Exported to metal
+ pub(crate) type PointF = gpui::Point<f32>;
+@@ -43,8 +55,12 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
+ // Use 4x MSAA, all devices support it.
+ // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
+ const PATH_SAMPLE_COUNT: u32 = 4;
++/// The path textures are as large as the area the frame's paths cover, rounded up to this
++/// many pixels so that a highlight growing by a few pixels does not reallocate them.
++const PATH_TEXTURE_GRANULARITY: i32 = 256;
+ /// Metal requires the offset a buffer is bound at to be 256-byte aligned.
+ const INSTANCE_BUFFER_ALIGNMENT: usize = 256;
++const INITIAL_INSTANCE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
+ const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+ 
+ pub type Context = Arc<Mutex<InstanceBufferPool>>;
+@@ -61,13 +77,15 @@ pub fn new_renderer(
+ pub struct InstanceBufferPool {
+     buffer_size: usize,
+     buffers: Vec<InstanceBuffer>,
++    low_usage_frames: u32,
+ }
+ 
+ impl Default for InstanceBufferPool {
+     fn default() -> Self {
+         Self {
+-            buffer_size: 2 * 1024 * 1024,
++            buffer_size: INITIAL_INSTANCE_BUFFER_SIZE,
+             buffers: Vec::new(),
++            low_usage_frames: 0,
+         }
+     }
+ }
+@@ -84,6 +102,7 @@ impl InstanceBufferPool {
+     pub(crate) fn reset(&mut self, buffer_size: usize) {
+         self.buffer_size = buffer_size;
+         self.buffers.clear();
++        self.low_usage_frames = 0;
+     }
+ 
+     fn acquire(
+@@ -111,9 +130,25 @@ impl InstanceBufferPool {
+         })
+     }
+ 
+-    fn release(&mut self, buffer: InstanceBuffer) {
++    fn release(&mut self, buffer: InstanceBuffer, used_bytes: usize) {
++        if self.buffer_size > INITIAL_INSTANCE_BUFFER_SIZE
++            && used_bytes <= self.buffer_size / 4
++        {
++            self.low_usage_frames += 1;
++            if self.low_usage_frames >= 8 {
++                let target_size = used_bytes
++                    .saturating_mul(2)
++                    .next_power_of_two()
++                    .max(INITIAL_INSTANCE_BUFFER_SIZE)
++                    .min(self.buffer_size / 2);
++                self.reset(target_size);
++                return;
++            }
++        } else {
++            self.low_usage_frames = 0;
++        }
+         if buffer.size == self.buffer_size {
+-            self.buffers.push(buffer)
++            self.buffers.push(buffer);
+         }
+     }
+ }
+@@ -150,12 +185,63 @@ pub struct MetalRenderer {
+     path_intermediate_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+     path_intermediate_msaa_texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+     path_sample_count: u32,
++    drawable_purge_state: Arc<Mutex<DrawablePurgeState>>,
+     /// Offscreen render target reused across `render_scene` calls when
+     /// rendering headlessly without reading pixels back.
+     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+     headless_render_target: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+ }
+ 
++struct DrawablePurgeState {
++    want_volatile: bool,
++    in_flight_command_buffers: usize,
++    textures: Vec<SendSync<Weak<ProtocolObject<dyn MTLTexture>>>>,
++}
++
++impl DrawablePurgeState {
++    fn new() -> Self {
++        Self {
++            want_volatile: false,
++            in_flight_command_buffers: 0,
++            textures: Vec::new(),
++        }
++    }
++
++    fn apply_purgeable(&mut self, state: MTLPurgeableState) -> bool {
++        let mut purged = false;
++        self.textures.retain(|weak| {
++            if let Some(texture) = weak.0.load() {
++                let prev = texture.setPurgeableState(state);
++                if state == MTLPurgeableState::NonVolatile && prev == MTLPurgeableState::Empty {
++                    purged = true;
++                }
++                true
++            } else {
++                false
++            }
++        });
++        purged
++    }
++
++    fn track(&mut self, texture: &ProtocolObject<dyn MTLTexture>) {
++        let target_ptr = ptr::from_ref(texture) as usize;
++        let mut seen = false;
++        self.textures.retain(|weak| {
++            if let Some(existing) = weak.0.load() {
++                if ptr::from_ref(&*existing) as usize == target_ptr {
++                    seen = true;
++                }
++                true
++            } else {
++                false
++            }
++        });
++        if !seen {
++            self.textures.push(SendSync(Weak::new(texture)));
++        }
++    }
++}
++
+ #[repr(C)]
+ pub struct PathRasterizationVertex {
+     pub xy_position: Point<ScaledPixels>,
+@@ -164,6 +250,377 @@ pub struct PathRasterizationVertex {
+     pub bounds: Bounds<ScaledPixels>,
+ }
+ 
++struct SharedMetalState {
++    device: Retained<ProtocolObject<dyn MTLDevice>>,
++    is_apple_gpu: bool,
++    is_unified_memory: bool,
++    unit_vertices: Retained<ProtocolObject<dyn MTLBuffer>>,
++    paths_rasterization_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
++    path_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
++    shadows_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
++    quads_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
++    underlines_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
++    monochrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
++    polychrome_sprites_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
++    surfaces_pipeline_state: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
++}
++
++// SAFETY: Metal devices, compiled render pipeline states, and immutable vertex buffers are
++// thread-safe and safe to retain and share across windows.
++unsafe impl Send for SharedMetalState {}
++unsafe impl Sync for SharedMetalState {}
++
++struct SendSync<T>(T);
++
++// SAFETY: Used exclusively for thread-safe Metal objects (`MTLDevice`, `MTLLibrary`,
++// `MTLBinaryArchive`) and uniquely owned `MTLRenderPipelineDescriptor`s during
++// parallel pipeline compilation and background archive serialization.
++unsafe impl<T> Send for SendSync<T> {}
++unsafe impl<T> Sync for SendSync<T> {}
++
++static SHARED_METAL_STATE: OnceLock<SharedMetalState> = OnceLock::new();
++static SHARED_METAL_INIT_LOCK: Mutex<()> = Mutex::new(());
++static CACHED_HOME: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
++
++/// Starts compiling Metal shaders and render pipeline states on a background thread so they
++/// are ready by the time the first window opens.
++pub fn prewarm() {
++    static START: Once = Once::new();
++    START.call_once(|| {
++        // Capture HOME on the main thread before spawning so metal-prewarm never calls
++        // getenv concurrently with login-shell environment loading.
++        let _ = CACHED_HOME.get_or_init(|| std::env::var_os("HOME"));
++        let _ = std::thread::Builder::new()
++            .name("metal-prewarm".into())
++            .spawn(|| {
++                let _ = shared_metal_state();
++            });
++    });
++}
++
++fn shared_metal_state() -> Result<&'static SharedMetalState> {
++    if let Some(state) = SHARED_METAL_STATE.get() {
++        return Ok(state);
++    }
++    let _guard = SHARED_METAL_INIT_LOCK.lock();
++    if let Some(state) = SHARED_METAL_STATE.get() {
++        return Ok(state);
++    }
++    let state = objc2::rc::autoreleasepool(|_| SharedMetalState::new())?;
++    let _ = SHARED_METAL_STATE.set(state);
++    Ok(SHARED_METAL_STATE.get().expect("SharedMetalState just initialized"))
++}
++
++fn metal_archive_cache_path(device: &ProtocolObject<dyn MTLDevice>) -> Option<std::path::PathBuf> {
++    let home = CACHED_HOME.get_or_init(|| std::env::var_os("HOME")).as_ref()?;
++    let mut hash: u64 = 0xcbf29ce484222325;
++    let mut feed = |bytes: &[u8]| {
++        for &byte in bytes {
++            hash ^= u64::from(byte);
++            hash = hash.wrapping_mul(0x100000001b3);
++        }
++    };
++    feed(b"gpui-metal-archive-v1:");
++    #[cfg(feature = "runtime_shaders")]
++    feed(SHADERS_SOURCE_FILE.as_bytes());
++    #[cfg(not(feature = "runtime_shaders"))]
++    feed(SHADERS_METALLIB);
++    feed(b":");
++    feed(device.name().to_string().as_bytes());
++    feed(b":");
++    feed(
++        NSProcessInfo::processInfo()
++            .operatingSystemVersionString()
++            .to_string()
++            .as_bytes(),
++    );
++
++    let mut dir = std::path::PathBuf::from(home);
++    dir.push("Library/Caches/Zed Mini");
++    let _ = std::fs::create_dir_all(&dir);
++    dir.push(format!("metal-pipelines-{hash:016x}.metallib"));
++    Some(dir)
++}
++
++fn open_or_create_binary_archive(
++    device: &ProtocolObject<dyn MTLDevice>,
++    cache_path: Option<&std::path::Path>,
++) -> Option<(Retained<ProtocolObject<dyn MTLBinaryArchive>>, bool)> {
++    if let Some(path) = cache_path
++        && path.is_file()
++    {
++        let desc = MTLBinaryArchiveDescriptor::new();
++        let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
++        desc.setUrl(Some(&url));
++        if let Ok(archive) = device.newBinaryArchiveWithDescriptor_error(&desc) {
++            return Some((archive, true));
++        }
++    }
++    let desc = MTLBinaryArchiveDescriptor::new();
++    device
++        .newBinaryArchiveWithDescriptor_error(&desc)
++        .ok()
++        .map(|archive| (archive, false))
++}
++
++impl SharedMetalState {
++    fn new() -> Result<Self> {
++        let device = MetalRenderer::create_device()?;
++
++        #[cfg(feature = "runtime_shaders")]
++        let library = device
++            .newLibraryWithSource_options_error(
++                &NSString::from_str(SHADERS_SOURCE_FILE),
++                Some(&objc2_metal::MTLCompileOptions::new()),
++            )
++            .context("building Metal library")?;
++        #[cfg(not(feature = "runtime_shaders"))]
++        let library = device
++            .newLibraryWithData_error(&dispatch2::DispatchData::from_static_bytes(
++                SHADERS_METALLIB,
++            ))
++            .context("loading Metal library")?;
++
++        fn to_float2_bits(point: PointF) -> u64 {
++            let mut output = point.y.to_bits() as u64;
++            output <<= 32;
++            output |= point.x.to_bits() as u64;
++            output
++        }
++
++        // Shared memory can be used only if CPU and GPU share the same memory space.
++        // https://developer.apple.com/documentation/metal/setting-resource-storage-modes
++        // iOS does not support managed resources. Its simulator may report a
++        // non-unified host GPU even though resources must still use shared storage.
++        let is_unified_memory = cfg!(target_os = "ios") || device.hasUnifiedMemory();
++        // Apple GPU families support memoryless textures, which can significantly reduce
++        // memory usage by keeping render targets in on-chip tile memory instead of
++        // allocating backing store in system memory.
++        // https://developer.apple.com/documentation/metal/mtlgpufamily
++        let is_apple_gpu = device.supportsFamily(MTLGPUFamily::Apple1);
++
++        let unit_vertices = [
++            to_float2_bits(point(0., 0.)),
++            to_float2_bits(point(1., 0.)),
++            to_float2_bits(point(0., 1.)),
++            to_float2_bits(point(0., 1.)),
++            to_float2_bits(point(1., 0.)),
++            to_float2_bits(point(1., 1.)),
++        ];
++        // SAFETY: Metal copies the live array using its exact byte length.
++        let unit_vertices = unsafe {
++            device.newBufferWithBytes_length_options(
++                ptr::NonNull::from(&unit_vertices).cast(),
++                mem::size_of_val(&unit_vertices),
++                if is_unified_memory {
++                    MTLResourceOptions::StorageModeShared
++                        | MTLResourceOptions::CPUCacheModeWriteCombined
++                } else {
++                    MTLResourceOptions::StorageModeManaged
++                },
++            )
++        }
++        .context("allocating unit vertex buffer")?;
++
++        let cache_path = metal_archive_cache_path(&device);
++        let archive_state = open_or_create_binary_archive(&device, cache_path.as_deref());
++        let archive_array = archive_state
++            .as_ref()
++            .filter(|(_, loaded_from_disk)| *loaded_from_disk)
++            .map(|(archive, _)| NSArray::from_retained_slice(&[archive.clone()]));
++
++        let mut descriptors = [
++            (
++                "paths_rasterization",
++                make_path_rasterization_pipeline_descriptor(
++                    &library,
++                    "paths_rasterization",
++                    "path_rasterization_vertex",
++                    "path_rasterization_fragment",
++                    MTLPixelFormat::BGRA8Unorm,
++                    PATH_SAMPLE_COUNT,
++                )?,
++            ),
++            (
++                "path_sprites",
++                make_path_sprite_pipeline_descriptor(
++                    &library,
++                    "path_sprites",
++                    "path_sprite_vertex",
++                    "path_sprite_fragment",
++                    MTLPixelFormat::BGRA8Unorm,
++                )?,
++            ),
++            (
++                "shadows",
++                make_pipeline_descriptor(
++                    &library,
++                    "shadows",
++                    "shadow_vertex",
++                    "shadow_fragment",
++                    MTLPixelFormat::BGRA8Unorm,
++                )?,
++            ),
++            (
++                "quads",
++                make_pipeline_descriptor(
++                    &library,
++                    "quads",
++                    "quad_vertex",
++                    "quad_fragment",
++                    MTLPixelFormat::BGRA8Unorm,
++                )?,
++            ),
++            (
++                "underlines",
++                make_pipeline_descriptor(
++                    &library,
++                    "underlines",
++                    "underline_vertex",
++                    "underline_fragment",
++                    MTLPixelFormat::BGRA8Unorm,
++                )?,
++            ),
++            (
++                "monochrome_sprites",
++                make_pipeline_descriptor(
++                    &library,
++                    "monochrome_sprites",
++                    "monochrome_sprite_vertex",
++                    "monochrome_sprite_fragment",
++                    MTLPixelFormat::BGRA8Unorm,
++                )?,
++            ),
++            (
++                "polychrome_sprites",
++                make_pipeline_descriptor(
++                    &library,
++                    "polychrome_sprites",
++                    "polychrome_sprite_vertex",
++                    "polychrome_sprite_fragment",
++                    MTLPixelFormat::BGRA8Unorm,
++                )?,
++            ),
++            (
++                "surfaces",
++                make_pipeline_descriptor(
++                    &library,
++                    "surfaces",
++                    "surface_vertex",
++                    "surface_fragment",
++                    MTLPixelFormat::BGRA8Unorm,
++                )?,
++            ),
++        ];
++        if let Some(archives) = &archive_array {
++            for (_, descriptor) in &mut descriptors {
++                descriptor.setBinaryArchives(Some(archives));
++            }
++        }
++
++        let shared_device = SendSync(device.clone());
++        let shared_descriptors: Vec<(&'static str, SendSync<Retained<MTLRenderPipelineDescriptor>>)> =
++            descriptors
++                .iter()
++                .map(|(label, desc)| (*label, SendSync(desc.clone())))
++                .collect();
++
++        let pipelines = std::thread::scope(|scope| {
++            let handles: Vec<_> = shared_descriptors
++                .into_iter()
++                .map(|(label, desc)| {
++                    let dev = &shared_device;
++                    scope.spawn(move || {
++                        let desc = desc;
++                        objc2::rc::autoreleasepool(|_| {
++                            dev.0
++                                .newRenderPipelineStateWithDescriptor_error(&desc.0)
++                                .with_context(|| format!("creating {label} render pipeline"))
++                                .map(SendSync)
++                        })
++                    })
++                })
++                .collect();
++
++            handles
++                .into_iter()
++                .map(|handle| {
++                    handle
++                        .join()
++                        .map_err(|_| anyhow::anyhow!("Metal pipeline compilation thread panicked"))?
++                        .map(|wrapped| wrapped.0)
++                })
++                .collect::<Result<Vec<_>>>()
++        })?;
++
++        if let (Some((archive, false)), Some(cache_path)) = (archive_state, cache_path) {
++            let bg_archive = SendSync(archive);
++            let bg_descriptors: Vec<SendSync<Retained<MTLRenderPipelineDescriptor>>> = descriptors
++                .into_iter()
++                .map(|(_, desc)| SendSync(desc))
++                .collect();
++            let _ = std::thread::Builder::new()
++                .name("metal-archive-save".into())
++                .spawn(move || {
++                    objc2::rc::autoreleasepool(|_| {
++                        let _ = &bg_archive;
++                        let _ = &bg_descriptors;
++                        let mut ok = true;
++                        for desc in &bg_descriptors {
++                            if bg_archive
++                                .0
++                                .addRenderPipelineFunctionsWithDescriptor_error(&desc.0)
++                                .is_err()
++                            {
++                                ok = false;
++                                break;
++                            }
++                        }
++                        if ok {
++                            let tmp_path = cache_path.with_extension(format!(
++                                "metallib.tmp.{}",
++                                std::process::id()
++                            ));
++                            let url = NSURL::fileURLWithPath(&NSString::from_str(
++                                &tmp_path.to_string_lossy(),
++                            ));
++                            if bg_archive.0.serializeToURL_error(&url).is_ok() {
++                                let _ = std::fs::rename(&tmp_path, &cache_path);
++                            } else {
++                                let _ = std::fs::remove_file(&tmp_path);
++                            }
++                        }
++                    });
++                });
++        }
++
++        let mut pipelines = pipelines.into_iter();
++        let paths_rasterization_pipeline_state = pipelines.next().unwrap();
++        let path_sprites_pipeline_state = pipelines.next().unwrap();
++        let shadows_pipeline_state = pipelines.next().unwrap();
++        let quads_pipeline_state = pipelines.next().unwrap();
++        let underlines_pipeline_state = pipelines.next().unwrap();
++        let monochrome_sprites_pipeline_state = pipelines.next().unwrap();
++        let polychrome_sprites_pipeline_state = pipelines.next().unwrap();
++        let surfaces_pipeline_state = pipelines.next().unwrap();
++
++        Ok(Self {
++            device,
++            is_apple_gpu,
++            is_unified_memory,
++            unit_vertices,
++            paths_rasterization_pipeline_state,
++            path_sprites_pipeline_state,
++            shadows_pipeline_state,
++            quads_pipeline_state,
++            underlines_pipeline_state,
++            monochrome_sprites_pipeline_state,
++            polychrome_sprites_pipeline_state,
++            surfaces_pipeline_state,
++        })
++    }
++}
++
+ impl MetalRenderer {
+     /// Creates a new MetalRenderer with a CAMetalLayer for window-based rendering.
+     pub fn new(
+@@ -171,10 +628,10 @@ impl MetalRenderer {
+         transparent: bool,
+         use_display_p3: bool,
+     ) -> Result<Self> {
+-        let device = Self::create_device()?;
++        let shared = shared_metal_state()?;
+         let layer = CAMetalLayer::new();
+-        Self::configure_layer(&layer, &device, transparent, use_display_p3);
+-        Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
++        Self::configure_layer(&layer, &shared.device, transparent, use_display_p3);
++        Self::new_internal(shared, Some(layer), !transparent, instance_buffer_pool)
+     }
+ 
+     /// Creates a renderer for a CAMetalLayer owned by a platform view, such as
+@@ -185,10 +642,10 @@ impl MetalRenderer {
+         layer: &CAMetalLayer,
+         transparent: bool,
+     ) -> Result<Self> {
+-        let device = Self::create_device()?;
++        let shared = shared_metal_state()?;
+         let layer = layer.retain();
+-        Self::configure_layer(&layer, &device, transparent, false);
+-        Self::new_internal(device, Some(layer), !transparent, instance_buffer_pool)
++        Self::configure_layer(&layer, &shared.device, transparent, false);
++        Self::new_internal(shared, Some(layer), !transparent, instance_buffer_pool)
+     }
+ 
+     fn configure_layer(
+@@ -211,7 +668,9 @@ impl MetalRenderer {
+         // Support direct-to-display rendering if the window is not transparent
+         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
+         layer.setOpaque(!transparent);
+-        layer.setMaximumDrawableCount(3);
++        // Two drawables instead of three: one fewer window-sized surface (21 MB at
++        // 2874x1876) held for the window's whole life.
++        layer.setMaximumDrawableCount(2);
+         // Allow texture reading for visual tests and UI automation screenshots
+         // (captures without ScreenCaptureKit). Only debug builds pay the
+         // presentation cost, even when `test-support` is compiled in.
+@@ -234,8 +693,8 @@ impl MetalRenderer {
+     /// window, or AppKit. Use `render_scene_to_image()` to render scenes.
+     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+     pub fn new_headless(instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>) -> Result<Self> {
+-        let device = Self::create_device()?;
+-        Self::new_internal(device, None, true, instance_buffer_pool)
++        let shared = shared_metal_state()?;
++        Self::new_internal(shared, None, true, instance_buffer_pool)
+     }
+ 
+     #[cfg(target_os = "macos")]
+@@ -268,131 +727,14 @@ impl MetalRenderer {
+     }
+ 
+     fn new_internal(
+-        device: Retained<ProtocolObject<dyn MTLDevice>>,
++        shared: &SharedMetalState,
+         layer: Option<Retained<CAMetalLayer>>,
+         opaque: bool,
+         instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+     ) -> Result<Self> {
+-        #[cfg(feature = "runtime_shaders")]
+-        let library = device
+-            .newLibraryWithSource_options_error(
+-                &NSString::from_str(SHADERS_SOURCE_FILE),
+-                Some(&objc2_metal::MTLCompileOptions::new()),
+-            )
+-            .context("building Metal library")?;
+-        #[cfg(not(feature = "runtime_shaders"))]
+-        let library = device
+-            .newLibraryWithData_error(&dispatch2::DispatchData::from_static_bytes(
+-                SHADERS_METALLIB,
+-            ))
+-            .context("loading Metal library")?;
+-
+-        fn to_float2_bits(point: PointF) -> u64 {
+-            let mut output = point.y.to_bits() as u64;
+-            output <<= 32;
+-            output |= point.x.to_bits() as u64;
+-            output
+-        }
+-
+-        // Shared memory can be used only if CPU and GPU share the same memory space.
+-        // https://developer.apple.com/documentation/metal/setting-resource-storage-modes
+-        // iOS does not support managed resources. Its simulator may report a
+-        // non-unified host GPU even though resources must still use shared storage.
+-        let is_unified_memory = cfg!(target_os = "ios") || device.hasUnifiedMemory();
+-        // Apple GPU families support memoryless textures, which can significantly reduce
+-        // memory usage by keeping render targets in on-chip tile memory instead of
+-        // allocating backing store in system memory.
+-        // https://developer.apple.com/documentation/metal/mtlgpufamily
+-        let is_apple_gpu = device.supportsFamily(MTLGPUFamily::Apple1);
+-
+-        let unit_vertices = [
+-            to_float2_bits(point(0., 0.)),
+-            to_float2_bits(point(1., 0.)),
+-            to_float2_bits(point(0., 1.)),
+-            to_float2_bits(point(0., 1.)),
+-            to_float2_bits(point(1., 0.)),
+-            to_float2_bits(point(1., 1.)),
+-        ];
+-        // SAFETY: Metal copies the live array using its exact byte length.
+-        let unit_vertices = unsafe {
+-            device.newBufferWithBytes_length_options(
+-                ptr::NonNull::from(&unit_vertices).cast(),
+-                mem::size_of_val(&unit_vertices),
+-                if is_unified_memory {
+-                    MTLResourceOptions::StorageModeShared
+-                        | MTLResourceOptions::CPUCacheModeWriteCombined
+-                } else {
+-                    MTLResourceOptions::StorageModeManaged
+-                },
+-            )
+-        }
+-        .context("allocating unit vertex buffer")?;
+-
+-        let paths_rasterization_pipeline_state = build_path_rasterization_pipeline_state(
+-            &device,
+-            &library,
+-            "paths_rasterization",
+-            "path_rasterization_vertex",
+-            "path_rasterization_fragment",
+-            MTLPixelFormat::BGRA8Unorm,
+-            PATH_SAMPLE_COUNT,
+-        )?;
+-        let path_sprites_pipeline_state = build_path_sprite_pipeline_state(
+-            &device,
+-            &library,
+-            "path_sprites",
+-            "path_sprite_vertex",
+-            "path_sprite_fragment",
+-            MTLPixelFormat::BGRA8Unorm,
+-        )?;
+-        let shadows_pipeline_state = build_pipeline_state(
+-            &device,
+-            &library,
+-            "shadows",
+-            "shadow_vertex",
+-            "shadow_fragment",
+-            MTLPixelFormat::BGRA8Unorm,
+-        )?;
+-        let quads_pipeline_state = build_pipeline_state(
+-            &device,
+-            &library,
+-            "quads",
+-            "quad_vertex",
+-            "quad_fragment",
+-            MTLPixelFormat::BGRA8Unorm,
+-        )?;
+-        let underlines_pipeline_state = build_pipeline_state(
+-            &device,
+-            &library,
+-            "underlines",
+-            "underline_vertex",
+-            "underline_fragment",
+-            MTLPixelFormat::BGRA8Unorm,
+-        )?;
+-        let monochrome_sprites_pipeline_state = build_pipeline_state(
+-            &device,
+-            &library,
+-            "monochrome_sprites",
+-            "monochrome_sprite_vertex",
+-            "monochrome_sprite_fragment",
+-            MTLPixelFormat::BGRA8Unorm,
+-        )?;
+-        let polychrome_sprites_pipeline_state = build_pipeline_state(
+-            &device,
+-            &library,
+-            "polychrome_sprites",
+-            "polychrome_sprite_vertex",
+-            "polychrome_sprite_fragment",
+-            MTLPixelFormat::BGRA8Unorm,
+-        )?;
+-        let surfaces_pipeline_state = build_pipeline_state(
+-            &device,
+-            &library,
+-            "surfaces",
+-            "surface_vertex",
+-            "surface_fragment",
+-            MTLPixelFormat::BGRA8Unorm,
+-        )?;
++        let device = shared.device.clone();
++        let is_apple_gpu = shared.is_apple_gpu;
++        let is_unified_memory = shared.is_unified_memory;
+ 
+         let command_queue = device.newCommandQueue().context("creating command queue")?;
+         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
+@@ -423,21 +765,22 @@ impl MetalRenderer {
+             is_unified_memory,
+             opaque,
+             command_queue,
+-            paths_rasterization_pipeline_state,
+-            path_sprites_pipeline_state,
+-            shadows_pipeline_state,
+-            quads_pipeline_state,
+-            underlines_pipeline_state,
+-            monochrome_sprites_pipeline_state,
+-            polychrome_sprites_pipeline_state,
+-            surfaces_pipeline_state,
+-            unit_vertices,
++            paths_rasterization_pipeline_state: shared.paths_rasterization_pipeline_state.clone(),
++            path_sprites_pipeline_state: shared.path_sprites_pipeline_state.clone(),
++            shadows_pipeline_state: shared.shadows_pipeline_state.clone(),
++            quads_pipeline_state: shared.quads_pipeline_state.clone(),
++            underlines_pipeline_state: shared.underlines_pipeline_state.clone(),
++            monochrome_sprites_pipeline_state: shared.monochrome_sprites_pipeline_state.clone(),
++            polychrome_sprites_pipeline_state: shared.polychrome_sprites_pipeline_state.clone(),
++            surfaces_pipeline_state: shared.surfaces_pipeline_state.clone(),
++            unit_vertices: shared.unit_vertices.clone(),
+             instance_buffer_pool,
+             sprite_atlas,
+             core_video_texture_cache,
+             path_intermediate_texture: None,
+             path_intermediate_msaa_texture: None,
+             path_sample_count: PATH_SAMPLE_COUNT,
++            drawable_purge_state: Arc::new(Mutex::new(DrawablePurgeState::new())),
+             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+             headless_render_target: None,
+         })
+@@ -509,9 +852,6 @@ impl MetalRenderer {
+         if let Some(layer) = &self.layer {
+             layer.setDrawableSize(CGSize::new(size.width.0 as f64, size.height.0 as f64));
+         }
+-        if let Err(error) = self.update_path_intermediate_textures(size) {
+-            log::error!("failed to resize path textures: {error:#}");
+-        }
+     }
+ 
+     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) -> Result<()> {
+@@ -591,6 +931,25 @@ impl MetalRenderer {
+         // nothing to do
+     }
+ 
++    /// Marks the layer's display drawable textures volatile when the window is
++    /// occluded/hidden so macOS can reclaim their ~42 MB IOSurface backing store,
++    /// and restores them to non-volatile before the window becomes visible again.
++    /// Waits for any in-flight GPU command buffers to complete before marking
++    /// textures volatile, as required by Metal.
++    /// Returns `true` if any tracked drawable was purged while volatile.
++    pub fn set_drawables_volatile(&mut self, volatile: bool) -> bool {
++        let mut state = self.drawable_purge_state.lock();
++        state.want_volatile = volatile;
++        if volatile {
++            if state.in_flight_command_buffers == 0 {
++                state.apply_purgeable(MTLPurgeableState::Volatile);
++            }
++            false
++        } else {
++            state.apply_purgeable(MTLPurgeableState::NonVolatile)
++        }
++    }
++
+     pub fn draw(&mut self, scene: &Scene) {
+         let layer = match &self.layer {
+             Some(l) => l.clone(),
+@@ -601,6 +960,13 @@ impl MetalRenderer {
+                 return;
+             }
+         };
++        {
++            let mut state = self.drawable_purge_state.lock();
++            if state.want_volatile {
++                state.want_volatile = false;
++                state.apply_purgeable(MTLPurgeableState::NonVolatile);
++            }
++        }
+         let drawable = match &mut self.display_link_mode {
+             DisplayLinkMode::Attached { drawable } => {
+                 let Some(drawable) = drawable.take() else {
+@@ -623,12 +989,14 @@ impl MetalRenderer {
+         // A display link's drawable was sized when the link handed it out,
+         // which can be before a resize the layer has since taken.
+         let texture = drawable.texture();
++        let _ = texture.setPurgeableState(MTLPurgeableState::NonVolatile);
++        self.drawable_purge_state.lock().track(&texture);
+         let viewport_size: Size<DevicePixels> = size(
+             (texture.width() as i32).into(),
+             (texture.height() as i32).into(),
+         );
+ 
+-        let command_buffer = match self.render_frame(scene, &drawable.texture(), viewport_size) {
++        let command_buffer = match self.render_frame(scene, &texture, viewport_size) {
+             Ok(command_buffer) => command_buffer,
+             Err(error) => {
+                 log::error!("failed to render: {error:#}");
+@@ -636,6 +1004,27 @@ impl MetalRenderer {
+             }
+         };
+ 
++        let purge_state = self.drawable_purge_state.clone();
++        purge_state.lock().in_flight_command_buffers += 1;
++        let completed = Cell::new(false);
++        let purge_block = RcBlock::new(
++            move |_: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
++                if completed.replace(true) {
++                    return;
++                }
++                let mut state = purge_state.lock();
++                state.in_flight_command_buffers =
++                    state.in_flight_command_buffers.saturating_sub(1);
++                if state.in_flight_command_buffers == 0 && state.want_volatile {
++                    state.apply_purgeable(MTLPurgeableState::Volatile);
++                }
++            },
++        );
++        // SAFETY: Metal copies the live block and invokes it once after this command buffer completes.
++        unsafe {
++            command_buffer.addCompletedHandler(RcBlock::as_ptr(&purge_block));
++        }
++
+         if self.presents_with_transaction {
+             command_buffer.commit();
+             command_buffer.waitUntilScheduled();
+@@ -652,8 +1041,18 @@ impl MetalRenderer {
+         texture: &ProtocolObject<dyn MTLTexture>,
+         viewport_size: Size<DevicePixels>,
+     ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+-        if self.path_intermediate_texture.is_none() {
+-            self.update_path_intermediate_textures(viewport_size)?;
++        // Paths are rasterized with multisampling into an intermediate texture. At the
++        // size of the window it stays resident from the first path on (about 29 MB at
++        // 2874x1876; one selection or highlight is enough), so the textures are only as
++        // large as the area this frame's paths cover, and a frame without paths keeps
++        // none. In-flight command buffers keep replaced textures alive until their
++        // frames complete.
++        match path_texture_size(scene, viewport_size) {
++            Some(size) => self.update_path_intermediate_textures(size)?,
++            None => {
++                self.path_intermediate_texture = None;
++                self.path_intermediate_msaa_texture = None;
++            }
+         }
+         let mut writer = InstanceBufferWriter::new(
+             &self.device,
+@@ -683,11 +1082,16 @@ impl MetalRenderer {
+         )?;
+ 
+         let instance_buffer_pool = self.instance_buffer_pool.clone();
+-        let frame_resources = Cell::new(Some((writer.finish(), surface_textures)));
++        let (instance_buffer, used_bytes) = writer.finish();
++        let frame_resources = Cell::new(Some((instance_buffer, used_bytes, surface_textures)));
+         let block = RcBlock::new(
+             move |_: ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+-                if let Some((instance_buffer, _surface_textures)) = frame_resources.take() {
+-                    instance_buffer_pool.lock().release(instance_buffer);
++                if let Some((instance_buffer, used_bytes, _surface_textures)) =
++                    frame_resources.take()
++                {
++                    instance_buffer_pool
++                        .lock()
++                        .release(instance_buffer, used_bytes);
+                 }
+             },
+         );
+@@ -737,10 +1141,7 @@ impl MetalRenderer {
+ 
+         // Headless callers do not have a Cocoa event-loop pool to release
+         // autoreleased command buffers and render-pass descriptors.
+-        objc2::rc::autoreleasepool(|_| {
+-            self.update_path_intermediate_textures(size)?;
+-            self.render_offscreen(scene, size)
+-        })
++        objc2::rc::autoreleasepool(|_| self.render_offscreen(scene, size))
+     }
+ 
+     /// Renders a scene into a new offscreen texture of `size` and reads it
+@@ -805,8 +1206,6 @@ impl MetalRenderer {
+         }
+ 
+         objc2::rc::autoreleasepool(|_| {
+-            self.update_path_intermediate_textures(size)?;
+-
+             let needs_new_target = self.headless_render_target.as_ref().is_none_or(|texture| {
+                 texture.width() != size.width.0 as usize
+                     || texture.height() != size.height.0 as usize
+@@ -878,14 +1277,12 @@ impl MetalRenderer {
+                 }
+                 PrimitiveBatch::Paths(range) => {
+                     let paths = &scene.paths[range];
++                    let Some(region) = path_batch_region(paths, viewport_size) else {
++                        continue;
++                    };
+                     command_encoder.endEncoding();
+ 
+-                    let did_draw = self.draw_paths_to_intermediate(
+-                        paths,
+-                        writer,
+-                        viewport_size,
+-                        &command_buffer,
+-                    )?;
++                    self.draw_paths_to_intermediate(paths, region, writer, &command_buffer)?;
+ 
+                     command_encoder = new_command_encoder_for_texture(
+                         &command_buffer,
+@@ -894,16 +1291,15 @@ impl MetalRenderer {
+                         None,
+                     )?;
+ 
+-                    if did_draw {
+-                        if let Err(error) = self.draw_paths_from_intermediate(
+-                            paths,
+-                            writer,
+-                            viewport_size,
+-                            &command_encoder,
+-                        ) {
+-                            command_encoder.endEncoding();
+-                            return Err(error);
+-                        }
++                    if let Err(error) = self.draw_paths_from_intermediate(
++                        paths,
++                        region,
++                        writer,
++                        viewport_size,
++                        &command_encoder,
++                    ) {
++                        command_encoder.endEncoding();
++                        return Err(error);
+                     }
+                 }
+                 PrimitiveBatch::Underlines(range) => {
+@@ -947,28 +1343,39 @@ impl MetalRenderer {
+         Ok(command_buffer)
+     }
+ 
++    /// Rasterizes `paths` into the intermediate texture, with `region` of the viewport
++    /// at the texture's origin.
+     fn draw_paths_to_intermediate(
+         &self,
+         paths: &[Path<ScaledPixels>],
++        region: Bounds<DevicePixels>,
+         writer: &mut InstanceBufferWriter,
+-        viewport_size: Size<DevicePixels>,
+         command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
+-    ) -> Result<bool> {
+-        if paths.is_empty() {
+-            return Ok(false);
+-        }
++    ) -> Result<()> {
+         let intermediate_texture = self
+             .path_intermediate_texture
+             .as_ref()
+             .context("missing path intermediate texture")?;
++        // The shader maps positions onto the whole render target, which is the texture.
++        let texture_size: Size<DevicePixels> = size(
++            (intermediate_texture.width() as i32).into(),
++            (intermediate_texture.height() as i32).into(),
++        );
++        let region_origin = path_region_origin(region);
+ 
+         let mut vertices = Vec::new();
+         for path in paths {
++            let mut bounds = path.clipped_bounds();
++            bounds.origin.x.0 -= region_origin.x.0;
++            bounds.origin.y.0 -= region_origin.y.0;
+             vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
+-                xy_position: v.xy_position,
++                xy_position: point(
++                    ScaledPixels(v.xy_position.x.0 - region_origin.x.0),
++                    ScaledPixels(v.xy_position.y.0 - region_origin.y.0),
++                ),
+                 st_position: v.st_position,
+                 color: path.color,
+-                bounds: path.bounds.intersect(&path.content_mask.bounds),
++                bounds,
+             }));
+         }
+         let vertex_instance_bindings = writer.write(&vertices)?;
+@@ -1011,8 +1418,8 @@ impl MetalRenderer {
+                 PathRasterizationInputIndex::Vertices as usize,
+             );
+             command_encoder.setVertexBytes_length_atIndex(
+-                ptr::NonNull::from(&viewport_size).cast(),
+-                mem::size_of_val(&viewport_size),
++                ptr::NonNull::from(&texture_size).cast(),
++                mem::size_of_val(&texture_size),
+                 PathRasterizationInputIndex::ViewportSize as usize,
+             );
+             command_encoder.setFragmentBuffer_offset_atIndex(
+@@ -1028,7 +1435,7 @@ impl MetalRenderer {
+         }
+ 
+         command_encoder.endEncoding();
+-        Ok(true)
++        Ok(())
+     }
+ 
+     fn draw_shadows(
+@@ -1121,9 +1528,12 @@ impl MetalRenderer {
+         }
+     }
+ 
++    /// Copies `paths` to the frame from the intermediate texture, which holds `region`
++    /// of the viewport at its origin.
+     fn draw_paths_from_intermediate(
+         &self,
+         paths: &[Path<ScaledPixels>],
++        region: Bounds<DevicePixels>,
+         writer: &mut InstanceBufferWriter,
+         viewport_size: Size<DevicePixels>,
+         command_encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+@@ -1135,6 +1545,11 @@ impl MetalRenderer {
+             .path_intermediate_texture
+             .as_ref()
+             .context("missing path intermediate texture")?;
++        let texture_size: Size<DevicePixels> = size(
++            (intermediate_texture.width() as i32).into(),
++            (intermediate_texture.height() as i32).into(),
++        );
++        let texture_origin = path_region_origin(region);
+ 
+         command_encoder.setRenderPipelineState(&self.path_sprites_pipeline_state);
+         // SAFETY: The shader slots match the unit vertices, copied viewport, and retained path texture.
+@@ -1150,6 +1565,11 @@ impl MetalRenderer {
+                 mem::size_of_val(&viewport_size),
+                 SpriteInputIndex::ViewportSize as usize,
+             );
++            command_encoder.setVertexBytes_length_atIndex(
++                ptr::NonNull::from(&texture_size).cast(),
++                mem::size_of_val(&texture_size),
++                SpriteInputIndex::AtlasTextureSize as usize,
++            );
+             command_encoder.setFragmentTexture_atIndex(
+                 Some(intermediate_texture),
+                 SpriteInputIndex::AtlasTexture as usize,
+@@ -1169,6 +1589,7 @@ impl MetalRenderer {
+                 .iter()
+                 .map(|path| PathSprite {
+                     bounds: path.clipped_bounds(),
++                    texture_origin,
+                 })
+                 .collect();
+         } else {
+@@ -1176,7 +1597,10 @@ impl MetalRenderer {
+             for path in paths.iter().skip(1) {
+                 bounds = bounds.union(&path.clipped_bounds());
+             }
+-            sprites = vec![PathSprite { bounds }];
++            sprites = vec![PathSprite {
++                bounds,
++                texture_origin,
++            }];
+         }
+ 
+         let sprite_instance_bindings = writer.write(&sprites)?;
+@@ -1550,14 +1974,13 @@ fn read_texture_to_image(texture: &ProtocolObject<dyn MTLTexture>) -> Result<Rgb
+     RgbaImage::from_raw(width, height, pixels).context("creating RGBA image from pixel data")
+ }
+ 
+-fn build_pipeline_state(
+-    device: &ProtocolObject<dyn MTLDevice>,
++fn make_pipeline_descriptor(
+     library: &ProtocolObject<dyn MTLLibrary>,
+     label: &str,
+     vertex_fn_name: &str,
+     fragment_fn_name: &str,
+     pixel_format: MTLPixelFormat,
+-) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
++) -> Result<Retained<MTLRenderPipelineDescriptor>> {
+     let vertex_fn = library
+         .newFunctionWithName(&NSString::from_str(vertex_fn_name))
+         .with_context(|| format!("locating vertex function {vertex_fn_name}"))?;
+@@ -1580,19 +2003,16 @@ fn build_pipeline_state(
+     color_attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+     color_attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+ 
+-    device
+-        .newRenderPipelineStateWithDescriptor_error(&descriptor)
+-        .with_context(|| format!("creating {label} render pipeline"))
++    Ok(descriptor)
+ }
+ 
+-fn build_path_sprite_pipeline_state(
+-    device: &ProtocolObject<dyn MTLDevice>,
++fn make_path_sprite_pipeline_descriptor(
+     library: &ProtocolObject<dyn MTLLibrary>,
+     label: &str,
+     vertex_fn_name: &str,
+     fragment_fn_name: &str,
+     pixel_format: MTLPixelFormat,
+-) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
++) -> Result<Retained<MTLRenderPipelineDescriptor>> {
+     let vertex_fn = library
+         .newFunctionWithName(&NSString::from_str(vertex_fn_name))
+         .with_context(|| format!("locating vertex function {vertex_fn_name}"))?;
+@@ -1615,20 +2035,17 @@ fn build_path_sprite_pipeline_state(
+     color_attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+     color_attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+ 
+-    device
+-        .newRenderPipelineStateWithDescriptor_error(&descriptor)
+-        .with_context(|| format!("creating {label} render pipeline"))
++    Ok(descriptor)
+ }
+ 
+-fn build_path_rasterization_pipeline_state(
+-    device: &ProtocolObject<dyn MTLDevice>,
++fn make_path_rasterization_pipeline_descriptor(
+     library: &ProtocolObject<dyn MTLLibrary>,
+     label: &str,
+     vertex_fn_name: &str,
+     fragment_fn_name: &str,
+     pixel_format: MTLPixelFormat,
+     path_sample_count: u32,
+-) -> Result<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
++) -> Result<Retained<MTLRenderPipelineDescriptor>> {
+     let vertex_fn = library
+         .newFunctionWithName(&NSString::from_str(vertex_fn_name))
+         .with_context(|| format!("locating vertex function {vertex_fn_name}"))?;
+@@ -1655,9 +2072,7 @@ fn build_path_rasterization_pipeline_state(
+     color_attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+     color_attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+ 
+-    device
+-        .newRenderPipelineStateWithDescriptor_error(&descriptor)
+-        .with_context(|| format!("creating {label} render pipeline"))
++    Ok(descriptor)
+ }
+ 
+ #[derive(Clone)]
+@@ -1792,7 +2207,7 @@ impl InstanceBufferWriter {
+         Ok(())
+     }
+ 
+-    fn finish(self) -> InstanceBuffer {
++    fn finish(self) -> (InstanceBuffer, usize) {
+         let Self {
+             unified_memory,
+             filled,
+@@ -1801,28 +2216,27 @@ impl InstanceBufferWriter {
+             ..
+         } = self;
+ 
+-        if !unified_memory {
+-            for (buffer, written) in &filled {
+-                if *written == 0 {
+-                    continue;
+-                }
++        let mut total_written = offset;
++        for (buffer, written) in &filled {
++            total_written = total_written.saturating_add(*written);
++            if !unified_memory && *written > 0 {
+                 buffer.metal_buffer.didModifyRange(NSRange {
+                     location: 0,
+                     length: *written,
+                 });
+             }
+-            if offset > 0 {
+-                current.metal_buffer.didModifyRange(NSRange {
+-                    location: 0,
+-                    length: offset,
+-                });
+-            }
++        }
++        if !unified_memory && offset > 0 {
++            current.metal_buffer.didModifyRange(NSRange {
++                location: 0,
++                length: offset,
++            });
+         }
+ 
+         // Metal retains encoded resources until the command buffer completes.
+         // Only the final, largest buffer is worth keeping in the pool.
+         drop(filled);
+-        current
++        (current, total_written)
+     }
+ }
+ 
+@@ -1876,6 +2290,74 @@ enum PathRasterizationInputIndex {
+ #[repr(C)]
+ pub struct PathSprite {
+     pub bounds: Bounds<ScaledPixels>,
++    /// The viewport position of the intermediate texture's top-left texel.
++    pub texture_origin: Point<ScaledPixels>,
++}
++
++/// The part of the viewport a batch of paths draws into, on whole device pixels, or `None`
++/// when the batch lies outside the viewport.
++fn path_batch_region(
++    paths: &[Path<ScaledPixels>],
++    viewport_size: Size<DevicePixels>,
++) -> Option<Bounds<DevicePixels>> {
++    let (mut left, mut top, mut right, mut bottom) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
++    for path in paths {
++        let bounds = path.clipped_bounds();
++        if bounds.size.width.0 > 0. && bounds.size.height.0 > 0. {
++            left = left.min(bounds.origin.x.0);
++            top = top.min(bounds.origin.y.0);
++            right = right.max(bounds.origin.x.0 + bounds.size.width.0);
++            bottom = bottom.max(bounds.origin.y.0 + bounds.size.height.0);
++        }
++    }
++    let left = (left.floor() as i32).max(0);
++    let top = (top.floor() as i32).max(0);
++    let right = (right.ceil() as i32).min(viewport_size.width.0);
++    let bottom = (bottom.ceil() as i32).min(viewport_size.height.0);
++    (right > left && bottom > top).then(|| Bounds {
++        origin: point(DevicePixels(left), DevicePixels(top)),
++        size: size(DevicePixels(right - left), DevicePixels(bottom - top)),
++    })
++}
++
++fn path_region_origin(region: Bounds<DevicePixels>) -> Point<ScaledPixels> {
++    point(
++        ScaledPixels(region.origin.x.0 as f32),
++        ScaledPixels(region.origin.y.0 as f32),
++    )
++}
++
++/// The size the path textures need for a frame: enough for its largest batch of paths, or
++/// `None` when the frame draws no paths.
++fn path_texture_size(
++    scene: &Scene,
++    viewport_size: Size<DevicePixels>,
++) -> Option<Size<DevicePixels>> {
++    if scene.paths.is_empty() {
++        return None;
++    }
++    let mut largest: Option<(i32, i32)> = None;
++    for batch in scene.batches() {
++        if let PrimitiveBatch::Paths(range) = batch
++            && let Some(region) = path_batch_region(&scene.paths[range], viewport_size)
++        {
++            let (width, height) = largest.unwrap_or_default();
++            largest = Some((
++                width.max(region.size.width.0),
++                height.max(region.size.height.0),
++            ));
++        }
++    }
++    let round_up = |length: i32| {
++        (length + PATH_TEXTURE_GRANULARITY - 1) / PATH_TEXTURE_GRANULARITY
++            * PATH_TEXTURE_GRANULARITY
++    };
++    largest.map(|(width, height)| {
++        size(
++            DevicePixels(round_up(width).min(viewport_size.width.0)),
++            DevicePixels(round_up(height).min(viewport_size.height.0)),
++        )
++    })
+ }
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+@@ -1983,6 +2465,99 @@ mod tests {
+         Ok(())
+     }
+ 
++    fn rectangle_path(left: f32, top: f32, right: f32, bottom: f32) -> Path<ScaledPixels> {
++        let mut path = Path::new(point(gpui::px(left), gpui::px(top)));
++        path.line_to(point(gpui::px(right), gpui::px(top)));
++        path.line_to(point(gpui::px(right), gpui::px(bottom)));
++        path.line_to(point(gpui::px(left), gpui::px(bottom)));
++        path.color = gpui::red().into();
++        path.content_mask = ContentMask {
++            bounds: Bounds {
++                origin: point(gpui::px(0.), gpui::px(0.)),
++                size: size(gpui::px(4096.), gpui::px(4096.)),
++            },
++        };
++        path.scale(1.)
++    }
++
++    #[test]
++    fn path_region_is_clipped_to_the_viewport_on_whole_pixels() {
++        let viewport = size(DevicePixels(1024), DevicePixels(768));
++        let region = |paths: &[Path<ScaledPixels>]| {
++            path_batch_region(paths, viewport).map(|region| {
++                (
++                    region.origin.x.0,
++                    region.origin.y.0,
++                    region.size.width.0,
++                    region.size.height.0,
++                )
++            })
++        };
++        assert_eq!(
++            region(&[rectangle_path(700.5, 500.25, 740.5, 520.75)]),
++            Some((700, 500, 41, 21))
++        );
++        assert_eq!(
++            region(&[
++                rectangle_path(10., 20., 30., 40.),
++                rectangle_path(1000., 700., 1100., 800.),
++            ]),
++            Some((10, 20, 1014, 748))
++        );
++        assert_eq!(region(&[rectangle_path(1030., 10., 1040., 20.)]), None);
++        assert_eq!(region(&[]), None);
++    }
++
++    #[test]
++    fn paths_are_drawn_through_textures_the_size_of_their_region() -> Result<()> {
++        let mut renderer =
++            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())))?;
++        let viewport = size(DevicePixels(1024), DevicePixels(768));
++        let red = [255, 0, 0, 255];
++        let background = [0, 0, 0, 255];
++
++        // Far from the viewport's origin, so sampling the texture as if it covered the
++        // whole viewport would miss the path.
++        let mut scene = Scene::default();
++        scene.insert_primitive(rectangle_path(700., 500., 740., 520.));
++        scene.finish();
++        let image = renderer.render_scene_to_image(&scene, viewport)?;
++        for (x, y, expected) in [
++            (700, 500, red),
++            (720, 510, red),
++            (739, 519, red),
++            (699, 510, background),
++            (740, 510, background),
++            (720, 499, background),
++            (720, 520, background),
++            (20, 10, background),
++        ] {
++            assert_eq!(image.get_pixel(x, y).0, expected, "pixel {x},{y}");
++        }
++        let texture = renderer
++            .path_intermediate_texture
++            .as_ref()
++            .context("a frame with paths keeps its path texture")?;
++        assert_eq!((texture.width(), texture.height()), (256, 256));
++
++        let mut scene = Scene::default();
++        scene.insert_primitive(rectangle_path(100., 100., 900., 700.));
++        scene.finish();
++        let image = renderer.render_scene_to_image(&scene, viewport)?;
++        assert_eq!(image.get_pixel(500, 400).0, red);
++        assert_eq!(image.get_pixel(99, 400).0, background);
++        let texture = renderer
++            .path_intermediate_texture
++            .as_ref()
++            .context("a frame with paths keeps its path texture")?;
++        assert_eq!((texture.width(), texture.height()), (1024, 768));
++
++        renderer.render_scene_to_image(&Scene::default(), viewport)?;
++        assert!(renderer.path_intermediate_texture.is_none());
++        assert!(renderer.path_intermediate_msaa_texture.is_none());
++        Ok(())
++    }
++
+     #[test]
+     fn render_to_image_rejects_zero_sized_layer() -> Result<()> {
+         let mut renderer = MetalRenderer::new(Default::default(), false, false)?;
+diff --git a/crates/gpui_apple/src/shaders.metal b/crates/gpui_apple/src/shaders.metal
+index 2b52bb9..22f1cee 100644
+--- a/crates/gpui_apple/src/shaders.metal
++++ b/crates/gpui_apple/src/shaders.metal
+@@ -821,7 +821,8 @@ vertex PathSpriteVertexOutput path_sprite_vertex(
+   uint sprite_id [[instance_id]],
+   constant float2 *unit_vertices [[buffer(SpriteInputIndex_Vertices)]],
+   constant PathSprite *sprites [[buffer(SpriteInputIndex_Sprites)]],
+-  constant Size_DevicePixels *viewport_size [[buffer(SpriteInputIndex_ViewportSize)]]
++  constant Size_DevicePixels *viewport_size [[buffer(SpriteInputIndex_ViewportSize)]],
++  constant Size_DevicePixels *texture_size [[buffer(SpriteInputIndex_AtlasTextureSize)]]
+ ) {
+   float2 unit_vertex = unit_vertices[unit_vertex_id];
+   PathSprite sprite = sprites[sprite_id];
+@@ -831,7 +832,8 @@ vertex PathSpriteVertexOutput path_sprite_vertex(
+       to_device_position(unit_vertex, sprite.bounds, viewport_size);
+ 
+   float2 screen_position = float2(sprite.bounds.origin.x, sprite.bounds.origin.y) + unit_vertex * float2(sprite.bounds.size.width, sprite.bounds.size.height);
+-  float2 texture_coords = screen_position / float2(viewport_size->width, viewport_size->height);
++  // The intermediate texture holds only the part of the viewport that starts at texture_origin.
++  float2 texture_coords = (screen_position - float2(sprite.texture_origin.x, sprite.texture_origin.y)) / float2(texture_size->width, texture_size->height);
+ 
+   return PathSpriteVertexOutput{
+     device_position,
+diff --git a/crates/gpui_apple/src/text_system.rs b/crates/gpui_apple/src/text_system.rs
+index 74cd7cc..791e7ab 100644
+--- a/crates/gpui_apple/src/text_system.rs
++++ b/crates/gpui_apple/src/text_system.rs
+@@ -102,7 +102,24 @@ impl Default for AppleTextSystem {
+ 
+ impl PlatformTextSystem for AppleTextSystem {
+     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+-        self.0.write().add_fonts(fonts)
++        // Parse CGFont/MemSource handles before acquiring the write lock so
++        // concurrent Frame 0/1 layout readers never stall on CoreGraphics work.
++        let handles = fonts
++            .into_iter()
++            .map(|bytes| match bytes {
++                Cow::Borrowed(embedded_font) => {
++                    let data_provider = unsafe {
++                        core_graphics::data_provider::CGDataProvider::from_slice(embedded_font)
++                    };
++                    let font = core_graphics::font::CGFont::from_data_provider(data_provider)
++                        .map_err(|()| anyhow!("Could not load an embedded font."))?;
++                    let font = font_kit::loaders::core_text::Font::from_core_graphics_font(font);
++                    Ok(Handle::from_native(&font))
++                }
++                Cow::Owned(bytes) => Ok(Handle::from_memory(Arc::new(bytes), 0)),
++            })
++            .collect::<Result<Vec<_>>>()?;
++        self.0.write().add_font_handles(handles)
+     }
+ 
+     fn all_font_names(&self) -> Vec<String> {
+@@ -261,23 +278,10 @@ fn font_smoothing_allowed_by_user() -> bool {
+ }
+ 
+ impl AppleTextSystemState {
+-    fn add_fonts(&mut self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+-        let fonts = fonts
+-            .into_iter()
+-            .map(|bytes| match bytes {
+-                Cow::Borrowed(embedded_font) => {
+-                    let data_provider = unsafe {
+-                        core_graphics::data_provider::CGDataProvider::from_slice(embedded_font)
+-                    };
+-                    let font = core_graphics::font::CGFont::from_data_provider(data_provider)
+-                        .map_err(|()| anyhow!("Could not load an embedded font."))?;
+-                    let font = font_kit::loaders::core_text::Font::from_core_graphics_font(font);
+-                    Ok(Handle::from_native(&font))
+-                }
+-                Cow::Owned(bytes) => Ok(Handle::from_memory(Arc::new(bytes), 0)),
+-            })
+-            .collect::<Result<Vec<_>>>()?;
++    fn add_font_handles(&mut self, fonts: Vec<Handle>) -> Result<()> {
+         self.memory_source.add_fonts(fonts.into_iter())?;
++        self.font_selections.clear();
++        self.font_ids_by_font_key.clear();
+         Ok(())
+     }
+ 
+diff --git a/crates/gpui_macos/src/display_link.rs b/crates/gpui_macos/src/display_link.rs
+index 90a2597..1543b50 100644
+--- a/crates/gpui_macos/src/display_link.rs
++++ b/crates/gpui_macos/src/display_link.rs
+@@ -342,6 +342,98 @@ impl MetalFrames {
+     }
+ }
+ 
++/// A window's shared-`CVDisplayLink` subscription, wired into GPUI's frame
++/// waker so an idle window unsubscribes and causes zero vsync wakeups until
++/// GPUI requests another frame.
++#[derive(Default)]
++pub struct DisplayLinkFrames {
++    source: RefCell<Option<WindowFrameSource>>,
++    /// The display this window is currently visible on, or `None` when stopped
++    /// (occluded, hidden, or during a synchronous resize transaction).
++    display_id: Cell<Option<CGDirectDisplayID>>,
++    /// Whether `source` is actively subscribed to the display link right now.
++    active: Cell<bool>,
++    /// Whether GPUI requested a frame since the current callback began.
++    woken: Cell<bool>,
++    /// Whether the window actually drew a frame during the current callback.
++    drew: Cell<bool>,
++}
++
++impl DisplayLinkFrames {
++    pub fn start(
++        &self,
++        display_id: CGDirectDisplayID,
++        data: *mut c_void,
++        callback: extern "C" fn(*mut c_void),
++    ) {
++        self.display_id.set(Some(display_id));
++        self.woken.set(true);
++        let mut source = self.source.borrow_mut();
++        let source = source.get_or_insert_with(|| WindowFrameSource::new(data, callback));
++        if source.start(display_id).log_err().is_some() {
++            self.active.set(true);
++        }
++    }
++
++    pub fn stop(&self) {
++        self.display_id.set(None);
++        self.active.set(false);
++        if let Some(source) = self.source.borrow_mut().as_mut() {
++            source.stop();
++        }
++    }
++
++    pub fn destroy(&self) {
++        self.display_id.set(None);
++        self.active.set(false);
++        drop(self.source.borrow_mut().take());
++    }
++
++    pub fn take_signal(&self) -> Option<(Instant, FrameRequestSource)> {
++        self.source
++            .try_borrow()
++            .ok()?
++            .as_ref()
++            .and_then(|source| source.take_signal())
++    }
++
++    pub fn wake(&self) {
++        self.woken.set(true);
++        if self.active.get() {
++            return;
++        }
++        let Some(display_id) = self.display_id.get() else {
++            return;
++        };
++        if let Ok(mut source) = self.source.try_borrow_mut()
++            && let Some(source) = source.as_mut()
++            && source.start(display_id).log_err().is_some()
++        {
++            self.active.set(true);
++        }
++    }
++
++    pub fn begin_frame(&self) {
++        self.woken.set(false);
++        self.drew.set(false);
++    }
++
++    pub fn record_draw(&self) {
++        self.drew.set(true);
++    }
++
++    pub fn end_frame(&self) {
++        if !self.drew.get() && !self.woken.get() && self.active.get() {
++            self.active.set(false);
++            if let Ok(mut source) = self.source.try_borrow_mut()
++                && let Some(source) = source.as_mut()
++            {
++                source.stop();
++            }
++        }
++    }
++}
++
+ /// A per-window source of frame requests, paced by the display the window is
+ /// on. The wrapped dispatch source coalesces vsync ticks from the display's
+ /// io thread and invokes `callback(data)` on the main queue.
+diff --git a/crates/gpui_macos/src/platform.rs b/crates/gpui_macos/src/platform.rs
+index 7d02fcb..431d67d 100644
+--- a/crates/gpui_macos/src/platform.rs
++++ b/crates/gpui_macos/src/platform.rs
+@@ -171,8 +171,8 @@ pub(crate) struct MacPlatformState {
+     headless: bool,
+     activation_policy: ActivationPolicy,
+     application_created: bool,
+-    general_pasteboard: Option<Pasteboard>,
+-    find_pasteboard: Option<Pasteboard>,
++    general_pasteboard: Option<Option<Pasteboard>>,
++    find_pasteboard: Option<Option<Pasteboard>>,
+     reopen: Option<Box<dyn FnMut()>>,
+     on_keyboard_layout_change: Option<Box<dyn FnMut()>>,
+     thermal_observer: Option<ProcessInfoObserver>,
+@@ -214,6 +214,9 @@ fn native_activation_policy(policy: ActivationPolicy) -> NSApplicationActivation
+ 
+ impl MacPlatform {
+     pub fn new(headless: bool) -> Self {
++        if !headless {
++            renderer::prewarm();
++        }
+         let marker = main_thread_marker().expect("Mac platform not created on main thread");
+         let dispatcher = Arc::new(AppleDispatcher::new());
+ 
+@@ -241,8 +244,8 @@ impl MacPlatform {
+             background_executor: BackgroundExecutor::new(dispatcher.clone()),
+             foreground_executor: ForegroundExecutor::new(dispatcher),
+             renderer_context: renderer::Context::default(),
+-            general_pasteboard: Pasteboard::general(),
+-            find_pasteboard: Pasteboard::find(),
++            general_pasteboard: None,
++            find_pasteboard: None,
+             reopen: None,
+             quit: None,
+             menu_command: None,
+@@ -1204,25 +1207,36 @@ impl Platform for MacPlatform {
+     }
+ 
+     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
+-        let state = self.0.lock();
+-        state.general_pasteboard.as_ref()?.read()
++        let mut state = self.0.lock();
++        state
++            .general_pasteboard
++            .get_or_insert_with(Pasteboard::general)
++            .as_ref()?
++            .read()
+     }
+ 
+     fn write_to_clipboard(&self, item: ClipboardItem) {
+-        let state = self.0.lock();
+-        if let Some(pasteboard) = &state.general_pasteboard {
++        let mut state = self.0.lock();
++        if let Some(pasteboard) = state
++            .general_pasteboard
++            .get_or_insert_with(Pasteboard::general)
++        {
+             pasteboard.write(item);
+         }
+     }
+ 
+     fn read_from_find_pasteboard(&self) -> Option<ClipboardItem> {
+-        let state = self.0.lock();
+-        state.find_pasteboard.as_ref()?.read()
++        let mut state = self.0.lock();
++        state
++            .find_pasteboard
++            .get_or_insert_with(Pasteboard::find)
++            .as_ref()?
++            .read()
+     }
+ 
+     fn write_to_find_pasteboard(&self, item: ClipboardItem) {
+-        let state = self.0.lock();
+-        if let Some(pasteboard) = &state.find_pasteboard {
++        let mut state = self.0.lock();
++        if let Some(pasteboard) = state.find_pasteboard.get_or_insert_with(Pasteboard::find) {
+             pasteboard.write(item);
+         }
+     }
+diff --git a/crates/gpui_macos/src/window.rs b/crates/gpui_macos/src/window.rs
+index 32a6a54..5ae404f 100644
+--- a/crates/gpui_macos/src/window.rs
++++ b/crates/gpui_macos/src/window.rs
+@@ -1,6 +1,6 @@
+ use crate::{
+-    BoolExt, MacDisplay, MetalFrames, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
+-    TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
++    BoolExt, DisplayLinkFrames, MacDisplay, MetalFrames, NSRange, NSStringExt,
++    TISCopyCurrentKeyboardInputSource, TISGetInputSourceProperty, events::platform_input_from_native,
+     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
+     ns_string, renderer,
+ };
+@@ -26,7 +26,6 @@ use core_graphics::display::CGDirectDisplayID;
+ use ctor::ctor;
+ use futures::channel::oneshot;
+ use gpui_apple::display_link::MetalFrameSource;
+-use gpui_util::ResultExt;
+ use objc2::{
+     AnyThread, MainThreadMarker, Message, class, msg_send,
+     rc::{Retained, autoreleasepool},
+@@ -640,11 +639,28 @@ unsafe fn apply_simple_fullscreen_plan(
+ 
+ /// What paces a window's frames. The choice depends only on the OS version,
+ /// so it is made once per window.
++#[derive(Clone)]
+ enum FrameSource {
+     /// macOS 14+: a `CAMetalDisplayLink` that hands out each frame's drawable.
++    #[allow(dead_code)]
+     Metal(Rc<MetalFrames>),
+-    /// Earlier systems: the shared `CVDisplayLink` registry, joined on first start.
+-    DisplayLink(Option<WindowFrameSource>),
++    /// Shared `CVDisplayLink` registry, unsubscribed automatically while idle.
++    DisplayLink(Rc<DisplayLinkFrames>),
++}
++
++impl FrameSource {
++    fn wake(&self) {
++        match self {
++            FrameSource::Metal(metal_frames) => metal_frames.wake(),
++            FrameSource::DisplayLink(display_link_frames) => display_link_frames.wake(),
++        }
++    }
++
++    fn record_draw(&self) {
++        if let FrameSource::DisplayLink(display_link_frames) = self {
++            display_link_frames.record_draw();
++        }
++    }
+ }
+ 
+ struct MacWindowState {
+@@ -700,6 +716,7 @@ struct MacWindowState {
+     select_previous_tab_callback: Option<Box<dyn FnMut()>>,
+     toggle_tab_bar_callback: Option<Box<dyn FnMut()>>,
+     activated_least_once: bool,
++    drawable_purged: bool,
+     closed: Arc<AtomicBool>,
+     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
+     // The parent window if this window is a sheet (Dialog kind)
+@@ -853,17 +870,14 @@ impl MacWindowState {
+                     self.renderer.set_display_link_attached(true);
+                 }
+             }
+-            FrameSource::DisplayLink(frame_source) => {
++            FrameSource::DisplayLink(display_link_frames) => {
+                 let screen: *mut AnyObject = unsafe { msg_send![self.native_window, screen] };
+                 let Some(display_id) = display_id_for_screen(screen) else {
+                     // AppKit can temporarily report no screen while displays are being reconfigured.
+                     return;
+                 };
+                 let data = self.native_view.as_ptr() as *mut c_void;
+-                frame_source
+-                    .get_or_insert_with(|| WindowFrameSource::new(data, step))
+-                    .start(display_id)
+-                    .log_err();
++                display_link_frames.start(display_id, data, step);
+             }
+         }
+     }
+@@ -878,8 +892,7 @@ impl MacWindowState {
+                     self.renderer.set_display_link_attached(false);
+                 }
+             }
+-            FrameSource::DisplayLink(Some(frame_source)) => frame_source.stop(),
+-            FrameSource::DisplayLink(None) => {}
++            FrameSource::DisplayLink(display_link_frames) => display_link_frames.stop(),
+         }
+     }
+ 
+@@ -976,9 +989,9 @@ impl MacWindowState {
+ pub(crate) struct MacWindow(
+     Rc<Mutex<MacWindowState>>,
+     MainThreadMarker,
+-    /// The Metal link's frame waker, kept outside the lock so waking never
+-    /// waits on it. `None` when a `CVDisplayLink` paces frames.
+-    Option<Rc<MetalFrames>>,
++    /// The window's frame source, kept outside the lock so waking never waits
++    /// on `MacWindowState`'s mutex.
++    FrameSource,
+ );
+ 
+ impl MacWindow {
+@@ -1108,7 +1121,11 @@ impl MacWindow {
+             let native_view: *mut AnyObject = msg_send![native_view, initWithFrame: content_bounds];
+             assert!(!native_view.is_null());
+ 
+-            let metal_frames = MetalFrameSource::is_available().then(Rc::<MetalFrames>::default);
++            // Frames are paced by the shared `CVDisplayLink` on every macOS version. With a
++            // `CAMetalDisplayLink` the layer keeps the link's three drawables on top of the
++            // two it allocates for synchronous draws: five window-sized surfaces (105 MB at
++            // 2874x1876) where this path needs only the layer's own.
++            let frame_source = FrameSource::DisplayLink(Rc::new(DisplayLinkFrames::default()));
+             let state = Rc::new(Mutex::new(MacWindowState {
+                 handle,
+                 foreground_executor,
+@@ -1119,10 +1136,7 @@ impl MacWindow {
+                 background_appearance: WindowBackgroundAppearance::Opaque,
+                 cursor_style: CursorStyle::Arrow,
+                 cursor_visible,
+-                frame_source: match &metal_frames {
+-                    Some(metal_frames) => FrameSource::Metal(metal_frames.clone()),
+-                    None => FrameSource::DisplayLink(None),
+-                },
++                frame_source: frame_source.clone(),
+                 renderer,
+                 request_frame_callback: None,
+                 event_callback: None,
+@@ -1162,11 +1176,12 @@ impl MacWindow {
+                 select_previous_tab_callback: None,
+                 toggle_tab_bar_callback: None,
+                 activated_least_once: false,
++                drawable_purged: false,
+                 closed: Arc::new(AtomicBool::new(false)),
+                 accesskit_adapter: None,
+                 sheet_parent: None,
+             }));
+-            let mut window = Self(state, marker, metal_frames);
++            let mut window = Self(state, marker, frame_source);
+ 
+             (*native_window)
+                 .class()
+@@ -1414,7 +1429,7 @@ impl Drop for MacWindow {
+         let sheet_parent = this.sheet_parent.take();
+         match &mut this.frame_source {
+             FrameSource::Metal(metal_frames) => metal_frames.replace(None),
+-            FrameSource::DisplayLink(frame_source) => drop(frame_source.take()),
++            FrameSource::DisplayLink(display_link_frames) => display_link_frames.destroy(),
+         }
+         unsafe {
+             let _: () = msg_send![this.native_window, setDelegate: ptr::null_mut::<AnyObject>()];
+@@ -2144,25 +2159,36 @@ impl PlatformWindow for MacWindow {
+     }
+ 
+     fn draw(&self, scene: &gpui::Scene) {
++        self.2.record_draw();
+         let mut this = self.0.lock();
+         this.renderer.draw(scene);
+     }
+ 
+     // GPUI calls this without waking the frame waker when a window only needs
+-    // a present, so a paused Metal link must resume here too.
++    // a present, so a paused frame source must resume here too.
+     fn schedule_frame(&self) {
+-        if let Some(metal_frames) = &self.2 {
+-            metal_frames.wake();
+-        }
++        self.2.wake();
+     }
+ 
+     fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+-        let metal_frames = Rc::downgrade(self.2.as_ref()?);
+-        Some(Rc::new(move || {
+-            if let Some(metal_frames) = metal_frames.upgrade() {
+-                metal_frames.wake();
++        match &self.2 {
++            FrameSource::Metal(metal_frames) => {
++                let metal_frames = Rc::downgrade(metal_frames);
++                Some(Rc::new(move || {
++                    if let Some(metal_frames) = metal_frames.upgrade() {
++                        metal_frames.wake();
++                    }
++                }))
++            }
++            FrameSource::DisplayLink(display_link_frames) => {
++                let display_link_frames = Rc::downgrade(display_link_frames);
++                Some(Rc::new(move || {
++                    if let Some(display_link_frames) = display_link_frames.upgrade() {
++                        display_link_frames.wake();
++                    }
++                }))
+             }
+-        }))
++        }
+     }
+ 
+     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
+@@ -3060,10 +3086,14 @@ extern "C" fn window_did_change_occlusion_state(this: &AnyObject, _: Sel, _: *mu
+         .occlusionState()
+         .contains(NSWindowOcclusionState::Visible)
+     {
++        if lock.renderer.set_drawables_volatile(false) {
++            lock.drawable_purged = true;
++        }
+         lock.move_traffic_light();
+         lock.start_display_link(&window_state);
+     } else {
+         lock.stop_display_link();
++        let _ = lock.renderer.set_drawables_volatile(true);
+     }
+     drop(lock);
+     // The only visibility source: AppKit posts this for covering, minimizing,
+@@ -3266,10 +3296,15 @@ extern "C" fn window_did_change_key_status(this: &AnyObject, selector: Sel, _: *
+ 
+         if lock.activated_least_once {
+             if let Some(mut callback) = lock.request_frame_callback.take() {
++                if lock.renderer.set_drawables_volatile(false) {
++                    lock.drawable_purged = true;
++                }
++                let require_presentation = std::mem::take(&mut lock.drawable_purged);
+                 lock.renderer.set_presents_with_transaction(true);
+                 lock.stop_display_link();
+                 drop(lock);
+                 callback(RequestFrameOptions {
++                    require_presentation,
+                     signal_at,
+                     signal_source: FrameRequestSource::NativeCallback,
+                     ..Default::default()
+@@ -3392,10 +3427,15 @@ extern "C" fn display_layer(this: &AnyObject, _: Sel, _: *mut AnyObject) {
+     let window_state = unsafe { get_window_state(this) };
+     let mut lock = window_state.lock();
+     if let Some(mut callback) = lock.request_frame_callback.take() {
++        if lock.renderer.set_drawables_volatile(false) {
++            lock.drawable_purged = true;
++        }
++        let require_presentation = std::mem::take(&mut lock.drawable_purged);
+         lock.renderer.set_presents_with_transaction(true);
+         lock.stop_display_link();
+         drop(lock);
+         callback(RequestFrameOptions {
++            require_presentation,
+             signal_at,
+             signal_source: FrameRequestSource::NativeCallback,
+             ..Default::default()
+@@ -3414,21 +3454,32 @@ extern "C" fn step(view: *mut c_void) {
+     let mut lock = window_state.lock();
+ 
+     if let Some(mut callback) = lock.request_frame_callback.take() {
+-        let signal = match &lock.frame_source {
+-            FrameSource::DisplayLink(Some(frame_source)) => frame_source.take_signal(),
+-            _ => None,
++        let require_presentation = std::mem::take(&mut lock.drawable_purged);
++        let (display_link_frames, signal) = match &lock.frame_source {
++            FrameSource::DisplayLink(display_link_frames) => (
++                Some(display_link_frames.clone()),
++                display_link_frames.take_signal(),
++            ),
++            _ => (None, None),
+         };
+         let (signal_at, signal_source) = signal.map_or(
+             (None, FrameRequestSource::NativeCallback),
+             |(at, source)| (Some(at), source),
+         );
+         drop(lock);
++        if let Some(display_link_frames) = &display_link_frames {
++            display_link_frames.begin_frame();
++        }
+         callback(RequestFrameOptions {
++            require_presentation,
+             signal_at,
+             signal_source,
+             ..Default::default()
+         });
+         window_state.lock().request_frame_callback = Some(callback);
++        if let Some(display_link_frames) = &display_link_frames {
++            display_link_frames.end_frame();
++        }
+     }
+ }
+ 
+@@ -3445,10 +3496,12 @@ fn metal_frame(
+     let Some(mut callback) = lock.request_frame_callback.take() else {
+         return;
+     };
++    let require_presentation = std::mem::take(&mut lock.drawable_purged);
+     lock.renderer.set_frame_drawable(Some(update.drawable()));
+     drop(lock);
+     metal_frames.begin_frame();
+     callback(RequestFrameOptions {
++        require_presentation,
+         signal_at,
+         signal_source: FrameRequestSource::NativeCallback,
+         ..Default::default()
+-- 
+2.54.0 (Apple Git-157)
+

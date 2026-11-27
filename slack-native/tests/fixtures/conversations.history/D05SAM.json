@@ -1,0 +1,56 @@
+{
+  "ok": true,
+  "messages": [
+    {
+      "user": "U02SAM",
+      "type": "message",
+      "ts": "1795389840.000109",
+      "client_msg_id": "f7673072-0000-4000-8000-12e9cc9b581d",
+      "text": "can you look at the copy on step 3?",
+      "team": "T0NORTHWND",
+      "blocks": [
+        {
+          "type": "rich_text",
+          "block_id": "b4058",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                {
+                  "type": "text",
+                  "text": "can you look at the copy on step 3?"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "user": "U01ALEX",
+      "type": "message",
+      "ts": "1795389600.000108",
+      "client_msg_id": "c345615b-0000-4000-8000-1e7ae307979f",
+      "text": "Sure, sending notes in a bit",
+      "team": "T0NORTHWND",
+      "blocks": [
+        {
+          "type": "rich_text",
+          "block_id": "b1460",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                {
+                  "type": "text",
+                  "text": "Sure, sending notes in a bit"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "has_more": false
+}

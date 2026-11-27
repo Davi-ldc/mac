@@ -1,0 +1,55 @@
+{
+  "ok": true,
+  "result": {
+    "data": {
+      "user": {
+        "isSelf": false,
+        "profileSections": [
+          {
+            "id": "S1HEADER",
+            "type": "HEADER",
+            "label": "Header",
+            "canEdit": false,
+            "profileElements": [
+              {"__typename": "ProfileTextElement", "id": "E1", "elementKey": "Name Pronunciation", "label": "Name pronunciation", "text": "PREE-yah", "isMissing": false},
+              {"__typename": "ProfileTextElement", "id": "E2", "elementKey": "title", "label": "Title", "text": "Engineering lead", "isMissing": false}
+            ]
+          },
+          {
+            "id": "S2CONTACT",
+            "type": "CONTACT",
+            "label": "Contact information",
+            "canEdit": false,
+            "profileElements": [
+              {"__typename": "ProfileTextElement", "id": "E3", "elementKey": "email", "label": "Email address", "text": "priya@northwind.example", "isMissing": false},
+              {"__typename": "ProfileTextElement", "id": "E4", "elementKey": "phone", "label": "Phone", "text": "+44 20 7946 0000", "isMissing": false},
+              {"__typename": "ProfileTextElement", "id": "E5", "elementKey": "secondEmail", "label": "Secondary email", "text": "", "isMissing": true}
+            ]
+          },
+          {
+            "id": "S3ABOUT",
+            "type": "ADDITIONAL_INFO",
+            "label": "About me",
+            "canEdit": false,
+            "profileElements": [
+              {"__typename": "ProfileTextElement", "id": "E6", "elementKey": "Xf01TEAM", "label": "Team", "text": "Platform", "isMissing": false},
+              {"__typename": "ProfileLinkElement", "id": "E7", "elementKey": "Xf02SITE", "label": "Website", "uri": "https://northwind.example/priya", "displayText": "northwind.example/priya", "isMissing": false},
+              {"__typename": "ProfileDateElement", "id": "E8", "elementKey": "Xf03START", "label": "Start date", "date": "2021-03-15", "isMissing": false},
+              {"__typename": "ProfileTagsElement", "id": "E9", "elementKey": "Xf04SKILLS", "label": "Skills", "tags": ["Go", "Postgres", "On-call"], "isMissing": false},
+              {"__typename": "ProfileTextElement", "id": "E10", "elementKey": "Xf05HOBBY", "label": "Hobbies", "text": "", "isMissing": true}
+            ]
+          },
+          {
+            "id": "S4PEOPLE",
+            "type": "PEOPLE",
+            "label": "People",
+            "canEdit": false,
+            "profileElements": [
+              {"__typename": "ProfilePersonElement", "id": "E11", "elementKey": "Xf06MANAGER", "label": "Manager", "persons": [{"id": "U04JORDAN"}], "isMissing": false}
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

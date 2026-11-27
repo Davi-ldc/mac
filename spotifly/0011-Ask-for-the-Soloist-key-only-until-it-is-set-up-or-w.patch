@@ -1,0 +1,175 @@
+From d50a96589c5b04f14265d3c34c7fc3793cbf983a Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Thu, 26 Nov 2026 15:01:42 -0300
+Subject: [PATCH 11/11] Ask for the Soloist key only until it is set up, or
+ while Soloist has failed
+
+---
+ Spotifly/Soloist/SoloistEngine.swift  | 11 +++++++++
+ Spotifly/Views/PreferencesView.swift  | 34 ++++++---------------------
+ Spotifly/de.lproj/Localizable.strings |  2 --
+ Spotifly/en.lproj/Localizable.strings |  2 --
+ Spotifly/fr.lproj/Localizable.strings |  2 --
+ SpotiflyTests/SoloistTests.swift      | 13 ++++++++++
+ 6 files changed, 31 insertions(+), 33 deletions(-)
+
+diff --git a/Spotifly/Soloist/SoloistEngine.swift b/Spotifly/Soloist/SoloistEngine.swift
+index 62ff787..cf088b1 100644
+--- a/Spotifly/Soloist/SoloistEngine.swift
++++ b/Spotifly/Soloist/SoloistEngine.swift
+@@ -138,6 +138,17 @@ final class SoloistEngine {
+         await start()
+     }
+ 
++    /// Whether Settings asks for the key: until Soloist is set up, and while it has failed. Its
++    /// errors ask for the key again (`soloist.error.no_key`, `.keeps_stopping`), and entering it
++    /// is what starts over a Soloist whose first download failed. A key that works is not shown.
++    static func asksForKey(isSetUp: Bool, status: Status) -> Bool {
++        guard isSetUp else { return true }
++        if case .failed = status {
++            return true
++        }
++        return false
++    }
++
+     /// Starts Soloist if it is set up and not running: installs or renews the build first.
+     func start() async {
+         guard Self.isSetUp, process == nil, !isStarting else { return }
+diff --git a/Spotifly/Views/PreferencesView.swift b/Spotifly/Views/PreferencesView.swift
+index d34c5ce..9cd9e5b 100644
+--- a/Spotifly/Views/PreferencesView.swift
++++ b/Spotifly/Views/PreferencesView.swift
+@@ -81,47 +81,33 @@ private struct PlaybackSettingsView: View {
+     }
+ }
+ 
+-/// Spotify's Soloist as this Mac's player: the key, the download, and where it stands
+-/// (`SoloistEngine`), with the build it runs and how long that has left. Once set up, the key
+-/// shows as saved, never as itself, and Change opens the field again: a new key restarts
+-/// Soloist with it.
++/// Spotify's Soloist as this Mac's player: the key until it is set up, then where it stands
++/// (`SoloistEngine`), with the build it runs and how long that has left. A key that works is
++/// not shown at all, so there is nothing to manage; the field comes back only when Soloist asks
++/// for the key (`SoloistEngine.asksForKey`), and a key entered then restarts Soloist with it.
+ private struct SoloistSection: View {
+     @AppStorage(SoloistEngine.setUpKey) private var isSetUp = false
+     @State private var key = ""
+-    @State private var isChangingKey = false
+     private let engine = SoloistEngine.shared
+ 
+     var body: some View {
+         Section {
++            // Where it stands is what Settings has left to say once the key is in: the pick it
++            // waits for in the Spotify app, and why it failed.
+             if isSetUp {
+                 LabeledContent("soloist.status") {
+                     Text(statusText)
+                         .foregroundStyle(isFailed ? .red : .secondary)
+                 }
+             }
+-            if !editsKey {
+-                LabeledContent("soloist.key") {
+-                    HStack {
+-                        Text("soloist.key_saved")
+-                            .foregroundStyle(.secondary)
+-                        Button("soloist.edit_key") { isChangingKey = true }
+-                    }
+-                }
+-            } else {
++            if SoloistEngine.asksForKey(isSetUp: isSetUp, status: engine.status) {
+                 SecureField("soloist.key", text: $key)
+                 HStack {
+                     Link("soloist.get_key", destination: URL(string: "https://developer.spotify.com/dashboard/soloist")!)
+                     Spacer()
+-                    if isChangingKey {
+-                        Button("action.cancel") {
+-                            key = ""
+-                            isChangingKey = false
+-                        }
+-                    }
+                     Button(isSetUp ? "soloist.change_key" : "soloist.use") {
+                         let entered = key
+                         key = ""
+-                        isChangingKey = false
+                         Task { await engine.choose(key: entered) }
+                     }
+                     .disabled(key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+@@ -170,12 +156,6 @@ private struct SoloistSection: View {
+         return formatter
+     }()
+ 
+-    /// The field shows until a key is set up, while the user changes it, and while Soloist has
+-    /// failed, since its errors ask for the key again.
+-    private var editsKey: Bool {
+-        !isSetUp || isChangingKey || isFailed
+-    }
+-
+     private var isFailed: Bool {
+         if case .failed = engine.status {
+             true
+diff --git a/Spotifly/de.lproj/Localizable.strings b/Spotifly/de.lproj/Localizable.strings
+index 6bea3d0..46462ba 100644
+--- a/Spotifly/de.lproj/Localizable.strings
++++ b/Spotifly/de.lproj/Localizable.strings
+@@ -332,8 +332,6 @@
+ "soloist.set_up_message" = "Dieser Mac spielt über Spotifys Soloist, den du einmal in den Einstellungen einrichtest. Bis dahin starte die Wiedergabe auf einem anderen Gerät.";
+ "soloist.open_settings" = "Einstellungen öffnen";
+ "soloist.change_key" = "Diesen Key verwenden";
+-"soloist.key_saved" = "Gespeichert";
+-"soloist.edit_key" = "Ändern …";
+ "soloist.version" = "Version";
+ "soloist.reinstall" = "Neu laden";
+ "soloist.validity" = "Gültigkeit";
+diff --git a/Spotifly/en.lproj/Localizable.strings b/Spotifly/en.lproj/Localizable.strings
+index f3abeda..0a6b64a 100644
+--- a/Spotifly/en.lproj/Localizable.strings
++++ b/Spotifly/en.lproj/Localizable.strings
+@@ -332,8 +332,6 @@
+ "soloist.set_up_message" = "This Mac plays through Spotify's Soloist, which you set up once in Settings. Until then, start playback on another device.";
+ "soloist.open_settings" = "Open Settings";
+ "soloist.change_key" = "Use This Key";
+-"soloist.key_saved" = "Saved";
+-"soloist.edit_key" = "Change…";
+ "soloist.version" = "Version";
+ "soloist.reinstall" = "Download Again";
+ "soloist.validity" = "Valid";
+diff --git a/Spotifly/fr.lproj/Localizable.strings b/Spotifly/fr.lproj/Localizable.strings
+index 5a0b480..013b4be 100644
+--- a/Spotifly/fr.lproj/Localizable.strings
++++ b/Spotifly/fr.lproj/Localizable.strings
+@@ -332,8 +332,6 @@
+ "soloist.set_up_message" = "Ce Mac lit via Soloist de Spotify, à configurer une fois dans les Réglages. D'ici là, lancez la lecture sur un autre appareil.";
+ "soloist.open_settings" = "Ouvrir les Réglages";
+ "soloist.change_key" = "Utiliser cette clé";
+-"soloist.key_saved" = "Enregistrée";
+-"soloist.edit_key" = "Modifier…";
+ "soloist.version" = "Version";
+ "soloist.reinstall" = "Retélécharger";
+ "soloist.validity" = "Validité";
+diff --git a/SpotiflyTests/SoloistTests.swift b/SpotiflyTests/SoloistTests.swift
+index 4b22199..f894e0b 100644
+--- a/SpotiflyTests/SoloistTests.swift
++++ b/SpotiflyTests/SoloistTests.swift
+@@ -87,6 +87,19 @@ struct SoloistEventTests {
+         #expect(!SoloistEngine.startsAgain(status: .failed("key"), isRunning: true, networkReturned: true))
+     }
+ 
++    /// Settings asks for the key until Soloist is set up and while it has failed, never while
++    /// the key works.
++    @MainActor
++    @Test func `a key that works is not asked for`() {
++        #expect(SoloistEngine.asksForKey(isSetUp: false, status: .off))
++        #expect(SoloistEngine.asksForKey(isSetUp: true, status: .failed(String(localized: "soloist.error.no_key"))))
++        #expect(SoloistEngine.asksForKey(isSetUp: true, status: .failed(String(localized: "soloist.error.keeps_stopping"))))
++
++        for status: SoloistEngine.Status in [.off, .installing, .starting, .waitingForPairing, .ready] {
++            #expect(!SoloistEngine.asksForKey(isSetUp: true, status: status))
++        }
++    }
++
+     /// Soloist goes by this Mac's name, as Spotify's desktop app does, and the pairing hint names
+     /// what to pick.
+     @MainActor
+-- 
+2.54.0 (Apple Git-157)
+

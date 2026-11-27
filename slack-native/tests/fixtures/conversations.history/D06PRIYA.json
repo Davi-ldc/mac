@@ -1,0 +1,31 @@
+{
+  "ok": true,
+  "messages": [
+    {
+      "user": "U01ALEX",
+      "type": "message",
+      "ts": "1795294800.000110",
+      "client_msg_id": "47eb3076-0000-4000-8000-1a5392ea8cd5",
+      "text": "See you at the crit",
+      "team": "T0NORTHWND",
+      "blocks": [
+        {
+          "type": "rich_text",
+          "block_id": "b4047",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                {
+                  "type": "text",
+                  "text": "See you at the crit"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "has_more": false
+}

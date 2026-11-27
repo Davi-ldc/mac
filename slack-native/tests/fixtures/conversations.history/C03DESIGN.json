@@ -1,0 +1,834 @@
+{
+ "ok": true,
+ "messages": [
+  {
+   "subtype": "thread_broadcast",
+   "text": "also sent to the channel",
+   "thread_ts": "1795300444.000012",
+   "blocks": [
+    {
+     "type": "rich_text",
+     "block_id": "r1",
+     "elements": [
+      {
+       "type": "rich_text_section",
+       "elements": [
+        {
+         "type": "text",
+         "text": "Also sent to the channel"
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "type": "message",
+   "user": "U03PRIYA",
+   "ts": "1795300592.000016"
+  },
+  {
+   "subtype": "me_message",
+   "text": "waves at everyone",
+   "type": "message",
+   "user": "U04JORDAN",
+   "ts": "1795300555.000015"
+  },
+  {
+   "subtype": "channel_join",
+   "text": "<@U07CASEY> has joined the channel",
+   "type": "message",
+   "user": "U07CASEY",
+   "ts": "1795300518.000014"
+  },
+  {
+   "text": "grouped one",
+   "blocks": [
+    {
+     "type": "rich_text",
+     "block_id": "r1",
+     "elements": [
+      {
+       "type": "rich_text_section",
+       "elements": [
+        {
+         "type": "text",
+         "text": "A second message in the same group"
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "type": "message",
+   "user": "U02SAM",
+   "ts": "1795300481.000013"
+  },
+  {
+   "text": "reacted",
+   "blocks": [
+    {
+     "type": "rich_text",
+     "block_id": "r1",
+     "elements": [
+      {
+       "type": "rich_text_section",
+       "elements": [
+        {
+         "type": "text",
+         "text": "Reactions here"
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "reactions": [
+    {
+     "name": "tada",
+     "users": [
+      "U01ALEX",
+      "U03PRIYA"
+     ],
+     "count": 2
+    },
+    {
+     "name": "+1::skin-tone-3",
+     "users": [
+      "U04JORDAN"
+     ],
+     "count": 1
+    },
+    {
+     "name": "eyes",
+     "users": [
+      "U05TAYLOR"
+     ],
+     "count": 4
+    }
+   ],
+   "thread_ts": "1795300444.000012",
+   "reply_count": 3,
+   "reply_users_count": 2,
+   "reply_users": [
+    "U03PRIYA",
+    "U04JORDAN"
+   ],
+   "latest_reply": "1795300900.000100",
+   "edited": {
+    "user": "U02SAM",
+    "ts": "1795300500.000000"
+   },
+   "type": "message",
+   "user": "U02SAM",
+   "ts": "1795300444.000012"
+  },
+  {
+   "text": "files",
+   "files": [
+    {
+     "id": "F09CHART",
+     "name": "chart.png",
+     "title": "chart.png",
+     "mimetype": "image/png",
+     "filetype": "png",
+     "pretty_type": "PNG",
+     "size": 2048,
+     "mode": "hosted",
+     "thumb_360": "https://files.example.com/chart.png",
+     "thumb_480": "https://files.example.com/chart.png",
+     "original_w": 600,
+     "original_h": 300
+    },
+    {
+     "id": "F09SPEC",
+     "name": "spec.pdf",
+     "title": "Spec v2",
+     "mimetype": "application/pdf",
+     "filetype": "pdf",
+     "pretty_type": "PDF",
+     "size": 482113,
+     "mode": "hosted"
+    }
+   ],
+   "blocks": [
+    {
+     "type": "rich_text",
+     "block_id": "r1",
+     "elements": [
+      {
+       "type": "rich_text_section",
+       "elements": [
+        {
+         "type": "text",
+         "text": "Two files"
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "type": "message",
+   "user": "U02SAM",
+   "ts": "1795300407.000011"
+  },
+  {
+   "text": "kit",
+   "bot_id": "B01BUILD",
+   "username": "Build Bot",
+   "subtype": "bot_message",
+   "blocks": [
+    {
+     "type": "header",
+     "text": {
+      "type": "plain_text",
+      "text": "Weekly report"
+     }
+    },
+    {
+     "type": "section",
+     "text": {
+      "type": "mrkdwn",
+      "text": "*Builds* are green"
+     },
+     "accessory": {
+      "type": "image",
+      "image_url": "https://avatars.example.com/u06build-72.png",
+      "alt_text": "bot"
+     }
+    },
+    {
+     "type": "section",
+     "fields": [
+      {
+       "type": "mrkdwn",
+       "text": "*Passed*\n312"
+      },
+      {
+       "type": "mrkdwn",
+       "text": "*Failed*\n0"
+      }
+     ]
+    },
+    {
+     "type": "divider"
+    },
+    {
+     "type": "context",
+     "elements": [
+      {
+       "type": "image",
+       "image_url": "https://avatars.example.com/u07casey-72.png",
+       "alt_text": "casey"
+      },
+      {
+       "type": "mrkdwn",
+       "text": "Updated by *Casey*"
+      }
+     ]
+    },
+    {
+     "type": "image",
+     "image_url": "https://files.example.com/chart.png",
+     "alt_text": "chart",
+     "title": {
+      "type": "plain_text",
+      "text": "Chart"
+     },
+     "image_width": 600,
+     "image_height": 300
+    },
+    {
+     "type": "actions",
+     "elements": [
+      {
+       "type": "button",
+       "text": {
+        "type": "plain_text",
+        "text": "Approve"
+       },
+       "style": "primary",
+       "action_id": "approve"
+      },
+      {
+       "type": "button",
+       "text": {
+        "type": "plain_text",
+        "text": "Reject"
+       },
+       "style": "danger",
+       "action_id": "reject"
+      },
+      {
+       "type": "button",
+       "text": {
+        "type": "plain_text",
+        "text": "Open"
+       },
+       "url": "https://example.com/open"
+      }
+     ]
+    },
+    {
+     "type": "table",
+     "rows": [
+      [
+       {
+        "type": "raw_text",
+        "text": "Name"
+       },
+       {
+        "type": "raw_text",
+        "text": "Count"
+       }
+      ],
+      [
+       {
+        "type": "raw_text",
+        "text": "alpha"
+       },
+       {
+        "type": "raw_text",
+        "text": "3"
+       }
+      ]
+     ]
+    }
+   ],
+   "type": "message",
+   "ts": "1795300370.000010"
+  },
+  {
+   "text": "shared",
+   "attachments": [
+    {
+     "is_share": true,
+     "is_msg_unfurl": true,
+     "author_name": "Taylor Kim",
+     "author_icon": "https://avatars.example.com/u05taylor-72.png",
+     "footer": "Posted in #general",
+     "ts": 1795290000,
+     "message_blocks": [
+      {
+       "message": {
+        "blocks": [
+         {
+          "type": "rich_text",
+          "block_id": "r2",
+          "elements": [
+           {
+            "type": "rich_text_section",
+            "elements": [
+             {
+              "type": "user",
+              "user_id": "U02SAM"
+             },
+             {
+              "type": "text",
+              "text": " two notes:"
+             }
+            ]
+           },
+           {
+            "type": "rich_text_list",
+            "style": "ordered",
+            "indent": 0,
+            "elements": [
+             {
+              "type": "rich_text_section",
+              "elements": [
+               {
+                "type": "text",
+                "text": "ship on Friday"
+               }
+              ]
+             },
+             {
+              "type": "rich_text_section",
+              "elements": [
+               {
+                "type": "text",
+                "text": "keep the old flow"
+               }
+              ]
+             }
+            ]
+           }
+          ]
+         }
+        ]
+       }
+      }
+     ]
+    }
+   ],
+   "type": "message",
+   "user": "U03PRIYA",
+   "ts": "1795300333.000009"
+  },
+  {
+   "subtype": "bot_message",
+   "bot_id": "B01BUILD",
+   "username": "Build Bot",
+   "text": "",
+   "attachments": [
+    {
+     "color": "good",
+     "pretext": "Deploy finished",
+     "author_name": "CI",
+     "title": "Release 3.2",
+     "title_link": "https://example.com/r/3.2",
+     "text": "All *312* checks passed",
+     "fields": [
+      {
+       "title": "Branch",
+       "value": "main",
+       "short": true
+      },
+      {
+       "title": "Time",
+       "value": "6m 12s",
+       "short": true
+      }
+     ],
+     "footer": "CI",
+     "ts": 1795300000,
+     "thumb_url": "https://avatars.example.com/u06build-72.png"
+    },
+    {
+     "color": "#e01e5a",
+     "title": "Flaky test",
+     "text": "One retry"
+    }
+   ],
+   "type": "message",
+   "ts": "1795300296.000008"
+  },
+  {
+   "text": "Fallback *bold* _italic_ ~strike~ `code` <@U03PRIYA> <#C01GENERAL|general> <!channel> <!subteam^S01|@designers> <!date^1795300000^{date_num}|fallback> <https://example.com|a link> &lt;escaped&gt; &amp; :smile: :thumbsup::skin-tone-2:\n```\nfenced code\n```\n&gt; quoted line\n&gt; second quoted\nlast line",
+   "type": "message",
+   "user": "U02SAM",
+   "ts": "1795300259.000007"
+  },
+  {
+   "text": "<https://example.com/pull/42>",
+   "blocks": [
+    {
+     "type": "rich_text",
+     "block_id": "r1",
+     "elements": [
+      {
+       "type": "rich_text_section",
+       "elements": [
+        {
+         "type": "link",
+         "url": "https://example.com/pull/42"
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "type": "message",
+   "user": "U01ALEX",
+   "ts": "1795300222.000006"
+  },
+  {
+   "text": ":tada::tada::rocket:",
+   "blocks": [
+    {
+     "type": "rich_text",
+     "block_id": "r1",
+     "elements": [
+      {
+       "type": "rich_text_section",
+       "elements": [
+        {
+         "type": "emoji",
+         "name": "tada"
+        },
+        {
+         "type": "emoji",
+         "name": "tada"
+        },
+        {
+         "type": "emoji",
+         "name": "rocket"
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "type": "message",
+   "user": "U02SAM",
+   "ts": "1795300185.000005"
+  },
+  {
+   "text": "quote",
+   "blocks": [
+    {
+     "type": "rich_text",
+     "block_id": "r3",
+     "elements": [
+      {
+       "type": "rich_text_quote",
+       "elements": [
+        {
+         "type": "text",
+         "text": "Quoted words "
+        },
+        {
+         "type": "text",
+         "text": "with bold",
+         "style": {
+          "bold": true
+         }
+        }
+       ]
+      },
+      {
+       "type": "rich_text_preformatted",
+       "elements": [
+        {
+         "type": "text",
+         "text": "let x = 1\nprint(x)"
+        }
+       ]
+      },
+      {
+       "type": "rich_text_section",
+       "elements": [
+        {
+         "type": "text",
+         "text": "first paragraph\n\nsecond paragraph"
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "type": "message",
+   "user": "U02SAM",
+   "ts": "1795300148.000004"
+  },
+  {
+   "text": "lists",
+   "blocks": [
+    {
+     "type": "rich_text",
+     "block_id": "r6",
+     "elements": [
+      {
+       "type": "rich_text_section",
+       "elements": [
+        {
+         "type": "text",
+         "text": "Plan:\n"
+        }
+       ]
+      },
+      {
+       "type": "rich_text_list",
+       "style": "bullet",
+       "indent": 0,
+       "elements": [
+        {
+         "type": "rich_text_section",
+         "elements": [
+          {
+           "type": "text",
+           "text": "first point"
+          }
+         ]
+        },
+        {
+         "type": "rich_text_section",
+         "elements": [
+          {
+           "type": "text",
+           "text": "second point"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "type": "rich_text_list",
+       "style": "bullet",
+       "indent": 1,
+       "elements": [
+        {
+         "type": "rich_text_section",
+         "elements": [
+          {
+           "type": "text",
+           "text": "nested point"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "type": "rich_text_list",
+       "style": "ordered",
+       "indent": 0,
+       "elements": [
+        {
+         "type": "rich_text_section",
+         "elements": [
+          {
+           "type": "text",
+           "text": "step one"
+          }
+         ]
+        },
+        {
+         "type": "rich_text_section",
+         "elements": [
+          {
+           "type": "text",
+           "text": "step two, long enough to wrap onto a second line when the column is narrow"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "type": "rich_text_list",
+       "style": "ordered",
+       "indent": 1,
+       "elements": [
+        {
+         "type": "rich_text_section",
+         "elements": [
+          {
+           "type": "text",
+           "text": "sub step"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "type": "rich_text_section",
+       "elements": [
+        {
+         "type": "text",
+         "text": "\nAfter the list."
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "type": "message",
+   "user": "U02SAM",
+   "ts": "1795300111.000003"
+  },
+  {
+   "text": "inline",
+   "blocks": [
+    {
+     "type": "rich_text",
+     "block_id": "r1",
+     "elements": [
+      {
+       "type": "rich_text_section",
+       "elements": [
+        {
+         "type": "text",
+         "text": "Hi "
+        },
+        {
+         "type": "user",
+         "user_id": "U03PRIYA"
+        },
+        {
+         "type": "text",
+         "text": " and "
+        },
+        {
+         "type": "user",
+         "user_id": "U01ALEX"
+        },
+        {
+         "type": "text",
+         "text": ", see "
+        },
+        {
+         "type": "channel",
+         "channel_id": "C01GENERAL"
+        },
+        {
+         "type": "text",
+         "text": " with "
+        },
+        {
+         "type": "usergroup",
+         "usergroup_id": "S01DESIGNERS"
+        },
+        {
+         "type": "text",
+         "text": ", "
+        },
+        {
+         "type": "broadcast",
+         "range": "here"
+        },
+        {
+         "type": "text",
+         "text": ". Docs: "
+        },
+        {
+         "type": "link",
+         "url": "https://example.com/docs",
+         "text": "the docs"
+        },
+        {
+         "type": "text",
+         "text": " or "
+        },
+        {
+         "type": "link",
+         "url": "https://example.com/raw"
+        },
+        {
+         "type": "text",
+         "text": ". Due "
+        },
+        {
+         "type": "date",
+         "timestamp": 1795300000,
+         "format": "{date_short_pretty} at {time}",
+         "fallback": "Nov 21"
+        },
+        {
+         "type": "text",
+         "text": " in "
+        },
+        {
+         "type": "color",
+         "value": "#1d9bd1"
+        },
+        {
+         "type": "text",
+         "text": " "
+        },
+        {
+         "type": "emoji",
+         "name": "wave",
+         "unicode": "1f44b"
+        },
+        {
+         "type": "emoji",
+         "name": "+1",
+         "unicode": "1f44d-1f3fd",
+         "skin_tone": 4
+        },
+        {
+         "type": "emoji",
+         "name": "partyparrot"
+        },
+        {
+         "type": "emoji",
+         "name": "not_an_emoji_name"
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "type": "message",
+   "user": "U01ALEX",
+   "ts": "1795300074.000002"
+  },
+  {
+   "text": "styles",
+   "blocks": [
+    {
+     "type": "rich_text",
+     "block_id": "r1",
+     "elements": [
+      {
+       "type": "rich_text_section",
+       "elements": [
+        {
+         "type": "text",
+         "text": "Plain, "
+        },
+        {
+         "type": "text",
+         "text": "bold",
+         "style": {
+          "bold": true
+         }
+        },
+        {
+         "type": "text",
+         "text": ", "
+        },
+        {
+         "type": "text",
+         "text": "italic",
+         "style": {
+          "italic": true
+         }
+        },
+        {
+         "type": "text",
+         "text": ", "
+        },
+        {
+         "type": "text",
+         "text": "struck",
+         "style": {
+          "strike": true
+         }
+        },
+        {
+         "type": "text",
+         "text": ", "
+        },
+        {
+         "type": "text",
+         "text": "underlined",
+         "style": {
+          "underline": true
+         }
+        },
+        {
+         "type": "text",
+         "text": ", "
+        },
+        {
+         "type": "text",
+         "text": "code",
+         "style": {
+          "code": true
+         }
+        },
+        {
+         "type": "text",
+         "text": " and "
+        },
+        {
+         "type": "text",
+         "text": "all",
+         "style": {
+          "bold": true,
+          "italic": true,
+          "strike": true
+         }
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "type": "message",
+   "user": "U02SAM",
+   "ts": "1795300037.000001"
+  }
+ ],
+ "has_more": false
+}

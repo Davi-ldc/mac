@@ -1,0 +1,26 @@
+build/
+spotify-native/tools/fairplay_probe
+.DS_Store
+# Upstream checkouts and anything else that must never be published live here.
+local/
+logs/
+*.log
+*.sqlite*
+# Trademarked artwork (app icons) is copied at install time, never stored.
+*.icns
+*.car
+# Company content and research for the Slack client.
+slack-native/design/
+slack-native/design-ref/
+slack-native/research/
+# Zed Mini's benchmark scratch: personal config copies, databases, screenshots, clones.
+zed-mini/bench/data/
+zed-mini/bench/runs/
+zed-mini/bench/bin/
+zed-mini/bench/stage/
+zed-mini/bench/project/
+zed-mini/bench/db-template*/
+# Our working notes stay local; only READMEs are published.
+notes/
+*.md
+!README.md

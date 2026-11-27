@@ -1,0 +1,118 @@
+# Fast, lean zsh config (no oh-my-zsh overhead) — managed by ~/Desktop/mac/shell.
+
+# Powerlevel10k instant prompt must stay near the top.
+if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
+  source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
+fi
+
+# Ghostty shell integration (needed explicitly when Ghostty runs `command = ttyhints ...`).
+if [[ -n "$GHOSTTY_RESOURCES_DIR" && -r "$GHOSTTY_RESOURCES_DIR/shell-integration/zsh/ghostty-integration" ]]; then
+  builtin source "$GHOSTTY_RESOURCES_DIR/shell-integration/zsh/ghostty-integration"
+fi
+
+# --- PATH ---
+typeset -U path PATH
+path=(
+  "$HOME/.local/bin"
+  /opt/homebrew/bin
+  /opt/homebrew/sbin
+  $path
+)
+export PATH
+
+# --- Shell options & history ---
+HISTFILE="$HOME/.zsh_history"
+HISTSIZE=50000
+SAVEHIST=50000
+setopt EXTENDED_HISTORY
+setopt HIST_EXPIRE_DUPS_FIRST
+setopt HIST_IGNORE_DUPS
+setopt HIST_IGNORE_SPACE
+setopt HIST_VERIFY
+setopt SHARE_HISTORY
+setopt AUTO_CD
+setopt AUTO_PUSHD
+setopt PUSHD_IGNORE_DUPS
+setopt PUSHD_MINUS
+setopt INTERACTIVE_COMMENTS
+
+# --- Completion (rebuild zcompdump at most once per day) ---
+fpath=(/opt/homebrew/share/zsh/site-functions $fpath)
+autoload -Uz compinit
+_zcompdump="${XDG_CACHE_HOME:-$HOME/.cache}/zcompdump-${HOST}-${ZSH_VERSION}"
+mkdir -p "${_zcompdump:h}"
+if [[ -r "$_zcompdump" && -z "$_zcompdump"(#qN.mh+24) ]]; then
+  compinit -C -d "$_zcompdump"
+else
+  compinit -i -d "$_zcompdump"
+  [[ -r "$_zcompdump" ]] && zcompile "$_zcompdump" 2>/dev/null
+fi
+unset _zcompdump
+
+zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}' 'r:|=*' 'l:|=* r:|=*'
+zstyle ':completion:*' menu select
+zstyle ':completion:*' special-dirs true
+zstyle ':completion:*' list-colors "${(s.:.)LS_COLORS}"
+
+# --- Keybindings ---
+bindkey -e
+autoload -Uz up-line-or-beginning-search down-line-or-beginning-search
+zle -N up-line-or-beginning-search
+zle -N down-line-or-beginning-search
+bindkey '^[[A' up-line-or-beginning-search
+bindkey '^[[B' down-line-or-beginning-search
+bindkey '^[OA' up-line-or-beginning-search
+bindkey '^[OB' down-line-or-beginning-search
+bindkey '^[[3~' delete-char
+bindkey '^[[1;3D' backward-word
+bindkey '^[[1;3C' forward-word
+bindkey '^[b' backward-word
+bindkey '^[f' forward-word
+
+# --- Prompt (powerlevel10k loaded directly, no oh-my-zsh) ---
+_p10k_theme="$HOME/.oh-my-zsh/custom/themes/powerlevel10k/powerlevel10k.zsh-theme"
+[[ -r "$_p10k_theme" ]] && source "$_p10k_theme"
+unset _p10k_theme
+[[ -r "$HOME/.p10k.zsh" ]] && source "$HOME/.p10k.zsh"
+
+# --- Cached tool init (zoxide + fzf) ---
+_zsh_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/zsh"
+mkdir -p "$_zsh_cache_dir"
+
+_cached_eval() {
+  local name=$1 bin=$2 cmd=$3
+  (( $+commands[$bin] )) || return
+  local bin_path=${commands[$bin]}
+  local cache="$_zsh_cache_dir/${name}.zsh"
+  if [[ ! -r "$cache" || "$bin_path" -nt "$cache" ]]; then
+    eval "$cmd" >| "$cache" 2>/dev/null
+    zcompile "$cache" 2>/dev/null
+  fi
+  source "$cache"
+}
+
+_cached_eval zoxide zoxide 'zoxide init zsh'
+_cached_eval fzf fzf 'fzf --zsh'
+unset -f _cached_eval
+unset _zsh_cache_dir
+
+# --- Autosuggestions + smart strategies ---
+_autosuggest_plugin="$HOME/.oh-my-zsh/custom/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh"
+[[ -r "$_autosuggest_plugin" ]] && source "$_autosuggest_plugin"
+unset _autosuggest_plugin
+
+_shell_dir="${${(%):-%x}:A:h}"
+[[ -r "$_shell_dir/autosuggest.zsh" ]] && source "$_shell_dir/autosuggest.zsh"
+unset _shell_dir
+
+# --- Aliases ---
+alias ls='eza --icons --group-directories-first'
+alias ll='eza -la --icons --group-directories-first --git'
+alias tree='eza --tree --icons'
+alias cat='bat --paging=never --style=plain'
+alias cskip='claude --dangerously-skip-permissions'
+
+# --- Syntax highlighting (must be sourced last) ---
+_syntax_plugin="$HOME/.oh-my-zsh/custom/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh"
+[[ -r "$_syntax_plugin" ]] && source "$_syntax_plugin"
+unset _syntax_plugin

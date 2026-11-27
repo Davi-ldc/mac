@@ -1,0 +1,93 @@
+{
+ "ok": true,
+ "messages": [
+  {
+   "type": "message",
+   "subtype": "huddle_thread",
+   "user": "U02SAM",
+   "text": "",
+   "ts": "1795294800.000110",
+   "thread_ts": "1795294800.000110",
+   "reply_count": 1,
+   "reply_users_count": 1,
+   "reply_users": [
+    "U03PRIYA"
+   ],
+   "latest_reply": "1795294860.000111",
+   "no_notifications": true,
+   "room": {
+    "id": "R01LIVE",
+    "name": "",
+    "media_server": "",
+    "created_by": "U02SAM",
+    "date_start": 1795294800,
+    "date_end": 0,
+    "participants": [
+     "U02SAM",
+     "U03PRIYA"
+    ],
+    "participant_history": [
+     "U02SAM",
+     "U03PRIYA",
+     "U04JORDAN"
+    ],
+    "participants_camera_on": [],
+    "participants_camera_off": [],
+    "participants_screenshare_on": [],
+    "participants_screenshare_off": [],
+    "canvas_thread_ts": "1795294800.000110",
+    "thread_root_ts": "1795294800.000110",
+    "channels": [
+     "C02RANDOM"
+    ],
+    "is_dm_call": false,
+    "was_rejected": false,
+    "was_missed": false,
+    "was_accepted": false,
+    "has_ended": false,
+    "background_id": "GRADIENT_03",
+    "canvas_background": "GRADIENT_03",
+    "is_prewarmed": false,
+    "is_scheduled": false,
+    "attached_file_ids": [],
+    "media_backend_type": "free_willy",
+    "display_id": "",
+    "external_unique_id": "r01live-0000-4000-8000-000000000000",
+    "app_id": "A00",
+    "call_family": "huddle",
+    "pending_invitees": {},
+    "last_invite_status_by_user": {},
+    "knocks": {}
+   }
+  },
+  {
+   "type": "message",
+   "user": "U03PRIYA",
+   "text": "notes from the huddle in here",
+   "ts": "1795294860.000111",
+   "thread_ts": "1795294800.000110",
+   "parent_user_id": "U02SAM",
+   "blocks": [
+    {
+     "type": "rich_text",
+     "block_id": "r1",
+     "elements": [
+      {
+       "type": "rich_text_section",
+       "elements": [
+        {
+         "type": "text",
+         "text": "notes from the huddle in here"
+        }
+       ]
+      }
+     ]
+    }
+   ]
+  }
+ ],
+ "has_more": false,
+ "response_metadata": {
+  "next_cursor": ""
+ }
+}

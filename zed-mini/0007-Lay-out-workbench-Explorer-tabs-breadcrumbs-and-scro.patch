@@ -1,0 +1,4231 @@
+From e1d65e02730a9df2cbf199038c2c8f3a53e4618c Mon Sep 17 00:00:00 2001
+From: mini <mini@local>
+Date: Fri, 27 Nov 2026 03:37:38 -0300
+Subject: [PATCH 07/10] Lay out workbench, Explorer, tabs, breadcrumbs, and
+ scrollbars like VS Code
+
+Consolidates the VS Code Dracula activity bar, Explorer with Outline
+section (expanding folders_expanded on F2 rename), floating card layout,
+connected tabs, path-boundary-safe breadcrumbs, VS Code scrollbars, and
+active-tab-first parallel workspace restoration with async toolchains.
+---
+ Cargo.lock                                    |   1 +
+ assets/icons/breadcrumb_separator.svg         |   4 +
+ assets/icons/editor_action_more.svg           |   4 +
+ assets/icons/editor_action_split.svg          |   4 +
+ assets/icons/file_add.svg                     |   5 +
+ assets/icons/tab_close.svg                    |   4 +
+ assets/icons/tab_dirty.svg                    |   4 +
+ crates/breadcrumbs/src/breadcrumbs.rs         |   6 +-
+ crates/editor/src/element.rs                  | 296 ++++++---
+ crates/editor/src/items.rs                    |  16 +-
+ crates/editor/src/scroll.rs                   |  44 ++
+ crates/icons/src/icons.rs                     |   6 +
+ crates/outline_panel/src/outline_panel.rs     |   8 -
+ crates/project_panel/Cargo.toml               |   1 +
+ crates/project_panel/src/project_panel.rs     | 608 ++++++++++++++++--
+ crates/title_bar/src/title_bar.rs             |  81 ++-
+ .../ui/src/components/button/icon_button.rs   |  11 +
+ crates/ui/src/components/scrollbar.rs         |  12 +-
+ crates/ui/src/components/tab.rs               | 212 ++++--
+ crates/ui/src/components/tab_bar.rs           |  38 +-
+ crates/ui/src/prelude.rs                      |   3 +-
+ crates/ui/src/styles/units.rs                 |   7 +
+ crates/workspace/src/dock.rs                  | 238 ++++++-
+ crates/workspace/src/pane.rs                  | 293 ++++++---
+ crates/workspace/src/persistence/model.rs     | 210 +++++-
+ crates/workspace/src/toolbar.rs               |  71 +-
+ crates/workspace/src/workspace.rs             | 593 ++++++++++++-----
+ crates/zed/src/zed/quick_action_bar.rs        |  13 +-
+ .../zed/src/zed/quick_action_bar/preview.rs   |   2 +-
+ 29 files changed, 2276 insertions(+), 519 deletions(-)
+ create mode 100644 assets/icons/breadcrumb_separator.svg
+ create mode 100644 assets/icons/editor_action_more.svg
+ create mode 100644 assets/icons/editor_action_split.svg
+ create mode 100644 assets/icons/file_add.svg
+ create mode 100644 assets/icons/tab_close.svg
+ create mode 100644 assets/icons/tab_dirty.svg
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 5ec53b3..5c3e77b 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -14013,6 +14013,7 @@ dependencies = [
+  "client",
+  "collections",
+  "criterion",
++ "db",
+  "editor",
+  "file_icons",
+  "fs",
+diff --git a/assets/icons/breadcrumb_separator.svg b/assets/icons/breadcrumb_separator.svg
+new file mode 100644
+index 0000000..e22462e
+--- /dev/null
++++ b/assets/icons/breadcrumb_separator.svg
+@@ -0,0 +1,4 @@
++<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
++<!-- VS Code's "chevron-right" codicon (github.com/microsoft/vscode-codicons, CC BY 4.0), as its breadcrumbs separate items. -->
++<path fill-rule="evenodd" clip-rule="evenodd" d="M6.133 3.147Q5.973 3.307 5.973 3.493Q5.973 3.68 6.133 3.84L10.293 8L6.133 12.16Q5.973 12.267 5.973 12.48Q5.973 12.693 6.133 12.853Q6.293 13.013 6.507 13.013Q6.72 13.013 6.827 12.853L11.36 8.373Q11.52 8.213 11.52 8Q11.52 7.787 11.36 7.627L6.827 3.147Q6.72 2.987 6.507 2.987Q6.293 2.987 6.133 3.147Z" fill="black"/>
++</svg>
+diff --git a/assets/icons/editor_action_more.svg b/assets/icons/editor_action_more.svg
+new file mode 100644
+index 0000000..46b75c5
+--- /dev/null
++++ b/assets/icons/editor_action_more.svg
+@@ -0,0 +1,4 @@
++<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
++<!-- VS Code's "ellipsis" codicon (github.com/microsoft/vscode-codicons, CC BY 4.0), as its More Actions button draws it. -->
++<path fill-rule="evenodd" clip-rule="evenodd" d="M5.013 8Q5.013 8.427 4.72 8.72Q4.427 9.013 4 9.013Q3.573 9.013 3.28 8.72Q2.987 8.427 2.987 8Q2.987 7.573 3.28 7.28Q3.573 6.987 4 6.987Q4.427 6.987 4.72 7.28Q5.013 7.573 5.013 8ZM9.013 8Q9.013 8.427 8.72 8.72Q8.427 9.013 8 9.013Q7.573 9.013 7.28 8.72Q6.987 8.427 6.987 8Q6.987 7.573 7.28 7.28Q7.573 6.987 8 6.987Q8.427 6.987 8.72 7.28Q9.013 7.573 9.013 8ZM12 9.013Q12.427 9.013 12.72 8.72Q13.013 8.427 13.013 8Q13.013 7.573 12.72 7.28Q12.427 6.987 12 6.987Q11.573 6.987 11.28 7.28Q10.987 7.573 10.987 8Q10.987 8.427 11.28 8.72Q11.573 9.013 12 9.013Z" fill="black"/>
++</svg>
+diff --git a/assets/icons/editor_action_split.svg b/assets/icons/editor_action_split.svg
+new file mode 100644
+index 0000000..8e0f533
+--- /dev/null
++++ b/assets/icons/editor_action_split.svg
+@@ -0,0 +1,4 @@
++<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
++<!-- VS Code's "split-horizontal" codicon (github.com/microsoft/vscode-codicons, CC BY 4.0), as its Split Editor Right action draws it. -->
++<path fill-rule="evenodd" clip-rule="evenodd" d="M12.48 1.013L3.52 1.013Q2.453 1.013 1.733 1.733Q1.013 2.453 1.013 3.52L1.013 12.48Q1.013 13.547 1.733 14.267Q2.453 14.987 3.52 14.987L12.48 14.987Q13.547 14.987 14.267 14.267Q14.987 13.547 14.987 12.48L14.987 3.52Q14.987 2.453 14.267 1.733Q13.547 1.013 12.48 1.013ZM2.027 12.48L2.027 3.52Q2.027 2.88 2.453 2.427Q2.88 1.973 3.52 1.973L7.52 1.973L7.52 13.973L3.52 13.973Q2.88 13.973 2.453 13.547Q2.027 13.12 2.027 12.48ZM14.027 12.48Q14.027 13.12 13.573 13.547Q13.12 13.973 12.48 13.973L8.48 13.973L8.48 1.973L12.48 1.973Q13.12 1.973 13.573 2.427Q14.027 2.88 14.027 3.52L14.027 12.48Z" fill="black"/>
++</svg>
+diff --git a/assets/icons/file_add.svg b/assets/icons/file_add.svg
+new file mode 100644
+index 0000000..6da8474
+--- /dev/null
++++ b/assets/icons/file_add.svg
+@@ -0,0 +1,5 @@
++<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
++<path d="M9 2V4.24394C9 4.5622 9.12643 4.86743 9.35147 5.09247C9.57652 5.31751 9.88174 5.44394 10.2 5.44394H12.5" stroke="#DCE0E5" stroke-width="1.2" stroke-linejoin="round"/>
++<path d="M7 14H4.625C4.32663 14 4.04048 13.8736 3.8295 13.6485C3.61853 13.4235 3.5 13.1183 3.5 12.8V3.2C3.5 2.88174 3.61853 2.57652 3.8295 2.35147C4.04048 2.12643 4.32663 2 4.625 2H8.60442C9.29544 2 9.95564 2.28602 10.4283 2.79015L11.8238 4.27877C12.2582 4.74213 12.5 5.35347 12.5 5.98862V7.5" stroke="#DCE0E5" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
++<path d="M9 11.8H11.8M11.8 11.8H14.6M11.8 11.8V9M11.8 11.8V14.6" stroke="#DCE0E5" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
++</svg>
+diff --git a/assets/icons/tab_close.svg b/assets/icons/tab_close.svg
+new file mode 100644
+index 0000000..827f1d8
+--- /dev/null
++++ b/assets/icons/tab_close.svg
+@@ -0,0 +1,4 @@
++<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
++<!-- VS Code's "close" codicon (github.com/microsoft/vscode-codicons, CC BY 4.0), as its tabs draw it. -->
++<path fill-rule="evenodd" clip-rule="evenodd" d="M13.867 13.173Q14.027 13.28 14.027 13.493Q14.027 13.707 13.867 13.867Q13.707 14.027 13.493 14.027Q13.28 14.027 13.173 13.867L8 8.693L2.827 13.867Q2.72 14.027 2.507 14.027Q2.293 14.027 2.16 13.867Q2.027 13.707 2.027 13.493Q2.027 13.28 2.133 13.173L7.307 8L2.133 2.827Q2.027 2.72 2.027 2.507Q2.027 2.293 2.16 2.133Q2.293 1.973 2.507 1.973Q2.72 1.973 2.88 2.133L8 7.307L13.173 2.133Q13.333 1.973 13.52 1.973Q13.707 1.973 13.867 2.133Q14.027 2.293 14.027 2.507Q14.027 2.72 13.867 2.827L8.747 8L13.867 13.173L13.867 13.173Z" fill="black"/>
++</svg>
+diff --git a/assets/icons/tab_dirty.svg b/assets/icons/tab_dirty.svg
+new file mode 100644
+index 0000000..43b62d0
+--- /dev/null
++++ b/assets/icons/tab_dirty.svg
+@@ -0,0 +1,4 @@
++<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
++<!-- VS Code's "circle-filled" codicon (github.com/microsoft/vscode-codicons, CC BY 4.0), as its tabs draw it. -->
++<path fill-rule="evenodd" clip-rule="evenodd" d="M8 4Q8.533 4 9.067 4.133Q9.6 4.267 10.027 4.533Q10.453 4.8 10.827 5.173Q11.2 5.547 11.467 5.973Q11.733 6.4 11.867 6.933Q12 7.467 12 8Q12 8.533 11.867 9.067Q11.733 9.6 11.467 10.027Q11.2 10.453 10.827 10.827Q10.453 11.2 10.027 11.467Q9.6 11.733 9.067 11.867Q8.533 12 8 12Q7.467 12 6.933 11.867Q6.4 11.733 5.973 11.467Q5.547 11.2 5.173 10.827Q4.8 10.453 4.533 10.027Q4.267 9.6 4.133 9.067Q4 8.533 4 8Q4 7.467 4.133 6.933Q4.267 6.4 4.533 5.973Q4.8 5.547 5.173 5.173Q5.547 4.8 5.973 4.533Q6.4 4.267 6.933 4.133Q7.467 4 8 4Z" fill="black"/>
++</svg>
+diff --git a/crates/breadcrumbs/src/breadcrumbs.rs b/crates/breadcrumbs/src/breadcrumbs.rs
+index b981e17..e73fe73 100644
+--- a/crates/breadcrumbs/src/breadcrumbs.rs
++++ b/crates/breadcrumbs/src/breadcrumbs.rs
+@@ -50,7 +50,7 @@ impl Render for Breadcrumbs {
+         let element = h_flex()
+             .id("breadcrumb-container")
+             .flex_grow_1()
+-            .h_8()
++            .h_full()
+             .overflow_x_scroll()
+             .text_ui(cx);
+ 
+@@ -116,6 +116,10 @@ impl ToolbarItemView for Breadcrumbs {
+         item.breadcrumb_location(cx)
+     }
+ 
++    fn is_breadcrumbs(&self) -> bool {
++        true
++    }
++
+     fn pane_focus_update(
+         &mut self,
+         pane_focused: bool,
+diff --git a/crates/editor/src/element.rs b/crates/editor/src/element.rs
+index 331291e..4502966 100644
+--- a/crates/editor/src/element.rs
++++ b/crates/editor/src/element.rs
+@@ -363,6 +363,10 @@ pub enum SplitSide {
+     Right,
+ }
+ 
++/// VS Code's `--vscode-cornerRadius-small`, which its modern UI gives the scrollbar and minimap
++/// sliders.
++const THUMB_CORNER_RADIUS: Pixels = px(4.);
++
+ impl EditorElement {
+     pub(crate) const SCROLLBAR_WIDTH: Pixels = ui::EDITOR_SCROLLBAR_WIDTH;
+ 
+@@ -1542,11 +1546,22 @@ impl EditorElement {
+                 ||
+                 // Scrollmanager
+                 editor.scroll_manager.scrollbars_visible()
++                ||
++                editor.scroll_manager.scrollbar_thumb_visible()
+             }
+             ShowScrollbar::System => self.editor.read(cx).scroll_manager.scrollbars_visible(),
+             ShowScrollbar::Always => true,
+             ShowScrollbar::Never => return None,
+         };
++        // In "auto", as in VS Code, the markers stay but the thumb only shows while the mouse
++        // is over the editor, while it is dragged and for a moment after scrolling.
++        let show_thumbs = show_scrollbars
++            && (scrollbar_settings.show != ShowScrollbar::Auto
++                || self
++                    .editor
++                    .read(cx)
++                    .scroll_manager
++                    .scrollbar_thumb_visible());
+ 
+         // The horizontal scrollbar is usually slightly offset to align nicely with
+         // indent guides. However, this offset is not needed if indent guides are
+@@ -1573,6 +1588,7 @@ impl EditorElement {
+             right_margin,
+             editor_width,
+             show_scrollbars,
++            show_thumbs,
+             self.editor.read(cx).scroll_manager.active_scrollbar_state(),
+             window,
+         ))
+@@ -1631,13 +1647,16 @@ impl EditorElement {
+             .map(|vertical_scrollbar| vertical_scrollbar.hitbox.origin)
+             .unwrap_or_else(|| editor_bounds.top_right());
+ 
+-        let thumb_state = self
+-            .editor
+-            .read_with(cx, |editor, _| editor.scroll_manager.minimap_thumb_state());
++        let (thumb_state, thumbs_revealed) = self.editor.read_with(cx, |editor, _| {
++            (
++                editor.scroll_manager.minimap_thumb_state(),
++                editor.scroll_manager.thumbs_revealed(),
++            )
++        });
+ 
+         let show_thumb = match minimap_settings.thumb {
+             MinimapThumb::Always => true,
+-            MinimapThumb::Hover => thumb_state.is_some(),
++            MinimapThumb::Hover => thumb_state.is_some() || thumbs_revealed,
+         };
+ 
+         let minimap_bounds = Bounds::from_anchor_and_size(
+@@ -6212,7 +6231,7 @@ impl EditorElement {
+                         };
+                         window.paint_quad(quad(
+                             thumb_bounds,
+-                            Corners::default(),
++                            Corners::all(THUMB_CORNER_RADIUS),
+                             scrollbar_thumb_color,
+                             scrollbar_edges,
+                             cx.theme().colors().scrollbar_thumb_border,
+@@ -6229,9 +6248,22 @@ impl EditorElement {
+             }
+         }
+ 
++        window.on_mouse_event({
++            let editor = self.editor.clone();
++            move |_event: &gpui::MouseExitEvent, phase, _window, cx| {
++                if phase == DispatchPhase::Capture {
++                    return;
++                }
++                editor.update(cx, |editor, cx| {
++                    editor.scroll_manager.set_mouse_over_editor(false, cx);
++                });
++            }
++        });
++
+         window.on_mouse_event({
+             let editor = self.editor.clone();
+             let scrollbars_layout = scrollbars_layout.clone();
++            let editor_bounds = layout.hitbox.bounds;
+ 
+             let mut mouse_position = window.mouse_position();
+             move |event: &MouseMoveEvent, phase, window, cx| {
+@@ -6240,6 +6272,9 @@ impl EditorElement {
+                 }
+ 
+                 editor.update(cx, |editor, cx| {
++                    editor
++                        .scroll_manager
++                        .set_mouse_over_editor(editor_bounds.contains(&event.position), cx);
+                     if let Some((scrollbar_layout, axis)) = event
+                         .pressed_button
+                         .filter(|button| *button == MouseButton::Left)
+@@ -6750,7 +6785,7 @@ impl EditorElement {
+                         window.paint_layer(minimap_hitbox.bounds, |window| {
+                             window.paint_quad(quad(
+                                 thumb_bounds,
+-                                Corners::default(),
++                                Corners::all(THUMB_CORNER_RADIUS),
+                                 minimap_thumb_color,
+                                 minimap_thumb_border,
+                                 cx.theme().colors().minimap_thumb_border,
+@@ -7141,6 +7176,21 @@ pub fn render_breadcrumb_text(
+ 
+     let element = h_flex().flex_grow_1().text_ui(cx);
+ 
++    if !multibuffer_header {
++        let breadcrumbs = render_breadcrumbs_bar(segments, prefix, active_item, cx);
++        return match active_item.downcast::<Editor>() {
++            Some(editor) => element
++                .id("breadcrumb_container")
++                .overflow_x_scroll()
++                .child(breadcrumbs_button(breadcrumbs, editor, active_item, cx))
++                .into_any_element(),
++            None => element
++                .h(rems_from_vscode_px(22.))
++                .child(breadcrumbs)
++                .into_any_element(),
++        };
++    }
++
+     let prefix_end_ix = cmp::min(segments.len(), MAX_SEGMENTS / 2);
+     let suffix_start_ix = cmp::max(
+         prefix_end_ix,
+@@ -7186,11 +7236,9 @@ pub fn render_breadcrumb_text(
+ 
+     let breadcrumbs_stack = h_flex()
+         .gap_1()
+-        .when(multibuffer_header, |this| {
+-            this.pl_2()
+-                .border_l_1()
+-                .border_color(cx.theme().colors().border.opacity(0.6))
+-        })
++        .pl_2()
++        .border_l_1()
++        .border_color(cx.theme().colors().border.opacity(0.6))
+         .children(breadcrumbs);
+ 
+     let breadcrumbs = if let Some(prefix) = prefix {
+@@ -7199,82 +7247,13 @@ pub fn render_breadcrumb_text(
+         breadcrumbs_stack
+     };
+ 
+-    let editor = active_item
+-        .downcast::<Editor>()
+-        .map(|editor| editor.downgrade());
+-
+-    let has_project_path = active_item.project_path(cx).is_some();
+-
+-    match editor {
+-        Some(editor) => element
++    match active_item.downcast::<Editor>() {
++        Some(_) => element
+             .id("breadcrumb_container")
+-            .when(!multibuffer_header, |this| this.overflow_x_scroll())
+             .child(
+                 ButtonLike::new("toggle outline view")
+                     .child(breadcrumbs)
+-                    .when(multibuffer_header, |this| {
+-                        this.style(ButtonStyle::Transparent)
+-                    })
+-                    .when(!multibuffer_header, |this| {
+-                        let focus_handle = editor.upgrade().unwrap().focus_handle(&cx);
+-
+-                        this.tooltip(Tooltip::element(move |_window, cx| {
+-                            v_flex()
+-                                .gap_1()
+-                                .child(
+-                                    h_flex()
+-                                        .gap_1()
+-                                        .justify_between()
+-                                        .child(Label::new("Show Symbol Outline"))
+-                                        .child(ui::KeyBinding::for_action_in(
+-                                            &zed_actions::outline::ToggleOutline,
+-                                            &focus_handle,
+-                                            cx,
+-                                        )),
+-                                )
+-                                .when(has_project_path, |this| {
+-                                    this.child(
+-                                        h_flex()
+-                                            .gap_1()
+-                                            .justify_between()
+-                                            .pt_1()
+-                                            .border_t_1()
+-                                            .border_color(cx.theme().colors().border_variant)
+-                                            .child(Label::new("Right-Click to Copy Path")),
+-                                    )
+-                                })
+-                                .into_any_element()
+-                        }))
+-                        .on_click({
+-                            let editor = editor.clone();
+-                            move |_, window, cx| {
+-                                if let Some((editor, callback)) = editor
+-                                    .upgrade()
+-                                    .zip(zed_actions::outline::TOGGLE_OUTLINE.get())
+-                                {
+-                                    callback(editor.to_any_view(), window, cx);
+-                                }
+-                            }
+-                        })
+-                        .when(has_project_path, |this| {
+-                            this.on_right_click({
+-                                let editor = editor.clone();
+-                                move |_, _, cx| {
+-                                    if let Some(abs_path) = editor.upgrade().and_then(|editor| {
+-                                        editor.update(cx, |editor, cx| {
+-                                            editor.target_file_abs_path(cx)
+-                                        })
+-                                    }) {
+-                                        if let Some(path_str) = abs_path.to_str() {
+-                                            cx.write_to_clipboard(ClipboardItem::new_string(
+-                                                path_str.to_string(),
+-                                            ));
+-                                        }
+-                                    }
+-                                }
+-                            })
+-                        })
+-                    }),
++                    .style(ButtonStyle::Transparent),
+             )
+             .into_any_element(),
+         None => element
+@@ -7285,6 +7264,154 @@ pub fn render_breadcrumb_text(
+     }
+ }
+ 
++/// VS Code's breadcrumbs under the tabs: 13 px items in the muted text colour (its
++/// breadcrumb.foreground) after 16 px of space, the file's folders and the file as items of
++/// their own (folders without an icon, the file with its icon 6 px before the name), symbols as
++/// plain text, and the chevron codicon in a 16 px box between items.
++fn render_breadcrumbs_bar(
++    segments: Vec<HighlightedText>,
++    prefix: Option<gpui::AnyElement>,
++    active_item: &dyn ItemHandle,
++    cx: &App,
++) -> gpui::AnyElement {
++    let item =
++        |icon: Option<SharedString>, text: String, emphasized: bool| {
++            h_flex()
++                .flex_none()
++                .gap(rems_from_vscode_px(6.))
++                .children(icon.map(|icon| {
++                    Icon::from_path(icon).size(IconSize::Custom(rems_from_vscode_px(16.)))
++                }))
++                .child(Label::new(text).single_line().map(|label| {
++                    if emphasized {
++                        label.color(Color::Default).weight(FontWeight::BOLD)
++                    } else {
++                        label.color(Color::Muted)
++                    }
++                }))
++                .into_any_element()
++        };
++
++    let file_name = active_item
++        .project_path(cx)
++        .and_then(|project_path| Some(project_path.path.file_name()?.to_string()));
++    // Without a tab bar, the breadcrumbs are what shows that the file has unsaved changes.
++    let emphasize_file =
++        !workspace::TabBarSettings::get_global(cx).show && active_item.is_dirty(cx);
++
++    let mut items = Vec::new();
++    let mut segments = segments
++        .into_iter()
++        .map(|segment| segment.text.replace('\n', " "));
++    if let Some(path) = segments.next() {
++        let matched_file_name = file_name.filter(|file_name| {
++            !path.contains(" ↔ ")
++                && path.ends_with(file_name.as_str())
++                && (path.len() == file_name.len()
++                    || matches!(
++                        path.as_bytes()[path.len() - file_name.len() - 1],
++                        b'/' | b'\\'
++                    ))
++        });
++        match matched_file_name {
++            Some(file_name) => {
++                let folders = &path[..path.len() - file_name.len()];
++                items.extend(
++                    folders
++                        .split(['/', '\\'])
++                        .filter(|folder| !folder.is_empty())
++                        .map(|folder| item(None, folder.to_string(), false)),
++                );
++                let icon = file_icons::FileIcons::get_icon(std::path::Path::new(&file_name), cx);
++                items.push(item(icon, file_name, emphasize_file));
++            }
++            None => items.push(item(None, path, false)),
++        }
++    }
++    items.extend(segments.map(|symbol| item(None, symbol, false)));
++
++    let separator = || {
++        Icon::new(IconName::BreadcrumbSeparator)
++            .size(IconSize::Custom(rems_from_vscode_px(16.)))
++            .color(Color::Muted)
++            .into_any_element()
++    };
++    h_flex()
++        .h(rems_from_vscode_px(22.))
++        .pl(rems_from_vscode_px(16.))
++        .pr(rems_from_vscode_px(8.))
++        .children(prefix)
++        .children(Itertools::intersperse_with(items.into_iter(), separator))
++        .into_any_element()
++}
++
++/// Clicking the breadcrumbs opens the outline and right-clicking copies the file's path. VS Code
++/// gives its breadcrumbs no hover background, so neither does this button.
++fn breadcrumbs_button(
++    breadcrumbs: gpui::AnyElement,
++    editor: Entity<Editor>,
++    active_item: &dyn ItemHandle,
++    cx: &App,
++) -> ButtonLike {
++    let has_project_path = active_item.project_path(cx).is_some();
++    let focus_handle = editor.focus_handle(cx);
++    let editor = editor.downgrade();
++    ButtonLike::new("toggle outline view")
++        .child(breadcrumbs)
++        .style(ButtonStyle::Transparent)
++        .size(ButtonSize::None)
++        .height(rems_from_vscode_px(22.).into())
++        .tooltip(Tooltip::element(move |_window, cx| {
++            v_flex()
++                .gap_1()
++                .child(
++                    h_flex()
++                        .gap_1()
++                        .justify_between()
++                        .child(Label::new("Show Symbol Outline"))
++                        .child(ui::KeyBinding::for_action_in(
++                            &zed_actions::outline::ToggleOutline,
++                            &focus_handle,
++                            cx,
++                        )),
++                )
++                .when(has_project_path, |this| {
++                    this.child(
++                        h_flex()
++                            .gap_1()
++                            .justify_between()
++                            .pt_1()
++                            .border_t_1()
++                            .border_color(cx.theme().colors().border_variant)
++                            .child(Label::new("Right-Click to Copy Path")),
++                    )
++                })
++                .into_any_element()
++        }))
++        .on_click({
++            let editor = editor.clone();
++            move |_, window, cx| {
++                if let Some((editor, callback)) = editor
++                    .upgrade()
++                    .zip(zed_actions::outline::TOGGLE_OUTLINE.get())
++                {
++                    callback(editor.to_any_view(), window, cx);
++                }
++            }
++        })
++        .when(has_project_path, |this| {
++            this.on_right_click(move |_, _, cx| {
++                if let Some(abs_path) = editor.upgrade().and_then(|editor| {
++                    editor.update(cx, |editor, cx| editor.target_file_abs_path(cx))
++                }) {
++                    if let Some(path_str) = abs_path.to_str() {
++                        cx.write_to_clipboard(ClipboardItem::new_string(path_str.to_string()));
++                    }
++                }
++            })
++        })
++}
++
+ fn apply_dirty_filename_style(
+     segment: &HighlightedText,
+     text_style: &gpui::TextStyle,
+@@ -10363,6 +10490,7 @@ impl EditorScrollbars {
+         right_margin: Pixels,
+         editor_width: Pixels,
+         show_scrollbars: bool,
++        show_thumbs: bool,
+         scrollbar_state: Option<&ActiveScrollbarState>,
+         window: &mut Window,
+     ) -> Self {
+@@ -10407,7 +10535,7 @@ impl EditorScrollbars {
+                         glyph_grid_cell.along(axis),
+                         content_offset.along(axis),
+                         scroll_position.along(axis),
+-                        show_scrollbars,
++                        show_thumbs,
+                         axis,
+                     )
+                     .with_thumb_state(
+diff --git a/crates/editor/src/items.rs b/crates/editor/src/items.rs
+index c583333..d71fbea 100644
+--- a/crates/editor/src/items.rs
++++ b/crates/editor/src/items.rs
+@@ -63,7 +63,7 @@ use workspace::{
+     },
+ };
+ use workspace::{
+-    Pane, TabBarSettings, WorkspaceSettings,
++    Pane, WorkspaceSettings,
+     item::{FollowEvent, ProjectItemKind},
+     searchable::SearchOptions,
+ };
+@@ -1099,20 +1099,6 @@ impl Item for Editor {
+         }
+     }
+ 
+-    fn breadcrumb_prefix(
+-        &self,
+-        _window: &mut Window,
+-        cx: &mut Context<Self>,
+-    ) -> Option<gpui::AnyElement> {
+-        (!TabBarSettings::get_global(cx).show && ItemSettings::get_global(cx).file_icons)
+-            .then(|| {
+-                path_for_buffer(&self.buffer, 0, true, cx)
+-                    .and_then(|path| FileIcons::get_icon(Path::new(&*path), cx))
+-            })
+-            .flatten()
+-            .map(|icon_path| Icon::from_path(icon_path).into_any_element())
+-    }
+-
+     fn added_to_workspace(
+         &mut self,
+         workspace: &mut Workspace,
+diff --git a/crates/editor/src/scroll.rs b/crates/editor/src/scroll.rs
+index 4183365..0f53214 100644
+--- a/crates/editor/src/scroll.rs
++++ b/crates/editor/src/scroll.rs
+@@ -26,6 +26,8 @@ use util::ResultExt;
+ use workspace::{ItemId, WorkspaceId};
+ 
+ const SCROLLBAR_SHOW_INTERVAL: Duration = Duration::from_secs(1);
++/// How long VS Code keeps the scrollbar and minimap thumbs on screen after a scroll.
++const THUMB_REVEAL_INTERVAL: Duration = Duration::from_millis(500);
+ 
+ pub struct WasScrolled(pub(crate) bool);
+ 
+@@ -163,6 +165,9 @@ pub struct ScrollManager {
+     visible_column_count: Option<f64>,
+     forbid_vertical_scroll: bool,
+     minimap_thumb_state: Option<ScrollbarThumbState>,
++    thumbs_revealed: bool,
++    hide_thumbs_task: Option<Task<()>>,
++    mouse_over_editor: bool,
+     _save_scroll_position_task: Task<()>,
+ }
+ 
+@@ -186,6 +191,9 @@ impl ScrollManager {
+             visible_column_count: None,
+             forbid_vertical_scroll: false,
+             minimap_thumb_state: None,
++            thumbs_revealed: false,
++            hide_thumbs_task: None,
++            mouse_over_editor: false,
+             _save_scroll_position_task: Task::ready(()),
+         }
+     }
+@@ -409,6 +417,7 @@ impl ScrollManager {
+         });
+         cx.emit(EditorEvent::ScrollPositionChanged { local, autoscroll });
+         self.show_scrollbars(window, cx);
++        self.reveal_thumbs(window, cx);
+         if let Some(workspace_id) = workspace_id {
+             let item_id = cx.entity().entity_id().as_u64() as ItemId;
+             let executor = cx.background_executor().clone();
+@@ -462,6 +471,41 @@ impl ScrollManager {
+         self.show_scrollbars
+     }
+ 
++    fn reveal_thumbs(&mut self, window: &mut Window, cx: &mut Context<Editor>) {
++        if !self.thumbs_revealed {
++            self.thumbs_revealed = true;
++            cx.notify();
++        }
++        self.hide_thumbs_task = Some(cx.spawn_in(window, async move |editor, cx| {
++            cx.background_executor().timer(THUMB_REVEAL_INTERVAL).await;
++            editor
++                .update(cx, |editor, cx| {
++                    editor.scroll_manager.thumbs_revealed = false;
++                    cx.notify();
++                })
++                .log_err();
++        }));
++    }
++
++    /// Whether the editor scrolled within the last moment, which shows the scrollbar and
++    /// minimap thumbs as in VS Code.
++    pub(crate) fn thumbs_revealed(&self) -> bool {
++        self.thumbs_revealed
++    }
++
++    pub(crate) fn set_mouse_over_editor(&mut self, mouse_over: bool, cx: &mut Context<Editor>) {
++        if self.mouse_over_editor != mouse_over {
++            self.mouse_over_editor = mouse_over;
++            cx.notify();
++        }
++    }
++
++    /// VS Code shows the scrollbar thumb while the mouse is over the editor, while it is
++    /// dragged, and for a moment after each scroll.
++    pub(crate) fn scrollbar_thumb_visible(&self) -> bool {
++        self.mouse_over_editor || self.thumbs_revealed || self.any_scrollbar_dragged()
++    }
++
+     pub fn has_autoscroll_request(&self) -> bool {
+         self.autoscroll_request.is_some()
+     }
+diff --git a/crates/icons/src/icons.rs b/crates/icons/src/icons.rs
+index 9ac47bb..26087fc 100644
+--- a/crates/icons/src/icons.rs
++++ b/crates/icons/src/icons.rs
+@@ -58,6 +58,7 @@ pub enum IconName {
+     BookCopy,
+     Box,
+     BoxOpen,
++    BreadcrumbSeparator,
+     CaseSensitive,
+     Chat,
+     Check,
+@@ -108,6 +109,8 @@ pub enum IconName {
+     DiffUnified,
+     Disconnected,
+     Download,
++    EditorActionMore,
++    EditorActionSplit,
+     EditorAtom,
+     EditorCursor,
+     EditorEmacs,
+@@ -127,6 +130,7 @@ pub enum IconName {
+     FastForward,
+     FastForwardOff,
+     File,
++    FileAdd,
+     FileCode,
+     FileCodeOff,
+     FileDiff,
+@@ -254,6 +258,8 @@ pub enum IconName {
+     StarFilled,
+     Stop,
+     Tab,
++    TabClose,
++    TabDirty,
+     Table,
+     Terminal,
+     TerminalAlt,
+diff --git a/crates/outline_panel/src/outline_panel.rs b/crates/outline_panel/src/outline_panel.rs
+index f35d5d6..7d3b531 100644
+--- a/crates/outline_panel/src/outline_panel.rs
++++ b/crates/outline_panel/src/outline_panel.rs
+@@ -1004,14 +1004,6 @@ struct SerializedOutlinePanel {
+ 
+ pub fn init(cx: &mut App) {
+     cx.observe_new(|workspace: &mut Workspace, _, _| {
+-        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
+-            workspace.toggle_panel_focus::<OutlinePanel>(window, cx);
+-        });
+-        workspace.register_action(|workspace, _: &Toggle, window, cx| {
+-            if !workspace.toggle_panel_focus::<OutlinePanel>(window, cx) {
+-                workspace.close_panel::<OutlinePanel>(window, cx);
+-            }
+-        });
+         workspace.register_action(|workspace, _: &ToggleSymbols, window, cx| {
+             if let Some(outline_panel) = workspace.panel::<OutlinePanel>(cx) {
+                 // Defer to avoid updating the panel while the workspace is still being updated.
+diff --git a/crates/project_panel/Cargo.toml b/crates/project_panel/Cargo.toml
+index 7dd40a2..bf9171e 100644
+--- a/crates/project_panel/Cargo.toml
++++ b/crates/project_panel/Cargo.toml
+@@ -19,6 +19,7 @@ doctest = false
+ [dependencies]
+ anyhow.workspace = true
+ collections.workspace = true
++db.workspace = true
+ editor.workspace = true
+ file_icons.workspace = true
+ futures.workspace = true
+diff --git a/crates/project_panel/src/project_panel.rs b/crates/project_panel/src/project_panel.rs
+index cc8b23d..1a5fa1c 100644
+--- a/crates/project_panel/src/project_panel.rs
++++ b/crates/project_panel/src/project_panel.rs
+@@ -5,6 +5,7 @@ mod utils;
+ use anyhow::{Context as _, Result};
+ use client::{ErrorCode, ErrorExt};
+ use collections::{BTreeSet, HashMap, hash_map};
++use db::kvp::KeyValueStore;
+ use editor::{
+     Editor, EditorEvent, MultiBufferOffset,
+     items::{
+@@ -18,7 +19,7 @@ use git;
+ use git::status::GitSummary;
+ use git_ui_core::file_diff_view::FileDiffView;
+ use gpui::{
+-    Action, Anchor, AnyElement, App, AsyncWindowContext, Bounds,
++    Action, Anchor, AnyElement, AnyView, App, AsyncWindowContext, Bounds,
+     ClipboardEntry as GpuiClipboardEntry, ClipboardItem, Context, CursorStyle, DismissEvent, Div,
+     DragMoveEvent, Entity, EventEmitter, ExternalDragPayload, ExternalPaths, FileDragPaths,
+     FileDropEvent, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement, KeyContext,
+@@ -55,6 +56,7 @@ use std::{
+     collections::HashSet,
+     ops::{Neg, Range},
+     path::{Path, PathBuf},
++    rc::Rc,
+     sync::Arc,
+     time::{Duration, Instant},
+ };
+@@ -62,8 +64,9 @@ use svg_preview::svg_preview_view::SvgPreviewView;
+ use theme_settings::ThemeSettings;
+ use ui::{
+     ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind, IndentGuideColors,
+-    IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, ProjectEmptyState,
+-    ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
++    IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, PopoverMenu,
++    ProjectEmptyState, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip,
++    WithScrollbar, prelude::*,
+ };
+ use util::{
+     ResultExt, TryFutureExt,
+@@ -92,8 +95,25 @@ use crate::{
+ };
+ 
+ const PROJECT_PANEL_KEY: &str = "ProjectPanel";
++/// VS Code's sidebar lists are 13 px at default UI scale (matching `rems_from_vscode_px`, where
++/// `0.875 rem` maps to 13 px), with 12 px semibold headers and 16 px icons. Deriving the
++/// Explorer's rem from `ui_font_size` keeps Explorer, Activity Bar, Tabs, and Breadcrumbs scaling
++/// together consistently.
++const EXPLORER_HEADER_TEXT: Rems = rems(0.875 * 12. / 13.);
++const EXPLORER_ICON_SIZE: Rems = rems(0.875 * 16. / 13.);
++
++fn explorer_rem_size(cx: &App) -> Pixels {
++    ThemeSettings::get_global(cx).ui_font_size(cx) * (13. / 14.)
++}
++const EXPLORER_SECTIONS_KEY: &str = "ExplorerSections";
+ const NEW_ENTRY_ID: ProjectEntryId = ProjectEntryId::MAX;
+ 
++/// With one folder open, its name is the Explorer's folders header, so its root entry has no
++/// row (whatever hide_root says) and, as in VS Code, is not renamed from the tree.
++fn root_row_hidden(visible_worktrees: usize) -> bool {
++    visible_worktrees == 1
++}
++
+ struct VisibleEntriesForWorktree {
+     worktree_id: WorktreeId,
+     entries: Vec<GitEntry>,
+@@ -136,6 +156,89 @@ impl State {
+     }
+ }
+ 
++/// Opens the project panel with the section titled `title` expanded, and focuses the section.
++pub fn focus_section(
++    workspace: &mut Workspace,
++    title: &str,
++    window: &mut Window,
++    cx: &mut Context<Workspace>,
++) {
++    let Some(project_panel) = workspace.panel::<ProjectPanel>(cx) else {
++        return;
++    };
++    workspace.reveal_panel::<ProjectPanel>(window, cx);
++    if let Some(focus_handle) =
++        project_panel.update(cx, |panel, cx| panel.expand_section(title, window, cx))
++    {
++        window.focus(&focus_handle, cx);
++    }
++}
++
++/// Focuses the Explorer section titled `title`, or returns focus to the active center pane
++/// if the section is already expanded and focused.
++pub fn toggle_section_focus(
++    workspace: &mut Workspace,
++    title: &str,
++    window: &mut Window,
++    cx: &mut Context<Workspace>,
++) {
++    let Some(project_panel) = workspace.panel::<ProjectPanel>(cx) else {
++        return;
++    };
++    let already_focused = {
++        let panel = project_panel.read(cx);
++        panel.is_visible && panel.is_section_expanded_and_focused(title, window, cx)
++    };
++    if already_focused {
++        let active_pane_focus = workspace.active_pane().read(cx).focus_handle(cx);
++        window.focus(&active_pane_focus, cx);
++    } else {
++        focus_section(workspace, title, window, cx);
++    }
++}
++
++/// Toggles the Explorer section titled `title`: collapses it (and returns focus to the active
++/// center pane if it was focused) when currently visible and expanded, otherwise opens and
++/// focuses it.
++pub fn toggle_section_visibility(
++    workspace: &mut Workspace,
++    title: &str,
++    window: &mut Window,
++    cx: &mut Context<Workspace>,
++) {
++    let Some(project_panel) = workspace.panel::<ProjectPanel>(cx) else {
++        return;
++    };
++    let is_open_and_expanded = {
++        let panel = project_panel.read(cx);
++        panel.is_visible && panel.is_section_expanded(title)
++    };
++    if is_open_and_expanded {
++        let was_focused = project_panel
++            .read(cx)
++            .is_section_expanded_and_focused(title, window, cx);
++        project_panel.update(cx, |panel, cx| panel.collapse_section(title, window, cx));
++        if was_focused {
++            let active_pane_focus = workspace.active_pane().read(cx).focus_handle(cx);
++            window.focus(&active_pane_focus, cx);
++        }
++    } else {
++        focus_section(workspace, title, window, cx);
++    }
++}
++
++/// A collapsible view under the file tree, like the Outline and Timeline views under VS Code's
++/// Explorer. Another crate owns the view; the panel only lays it out.
++pub struct ExplorerSection {
++    pub title: SharedString,
++    pub view: AnyView,
++    pub focus_handle: FocusHandle,
++    /// Called with whether the section is on screen (expanded, in an open panel), so its view
++    /// can stop tracking the editor while nobody sees it.
++    pub set_visible: Rc<dyn Fn(bool, &mut Window, &mut App)>,
++    pub expanded: bool,
++}
++
+ pub struct ProjectPanel {
+     project: Entity<Project>,
+     fs: Arc<dyn Fs>,
+@@ -167,6 +270,12 @@ pub struct ProjectPanel {
+     update_visible_entries_task: UpdateVisibleEntriesTask,
+     undo_manager: UndoManager,
+     state: State,
++    folders_expanded: bool,
++    sections: Vec<ExplorerSection>,
++    /// Expanded state of the folders (under the empty title) and of each section, by title,
++    /// as last saved.
++    saved_sections: HashMap<String, bool>,
++    is_visible: bool,
+ }
+ 
+ struct UpdateVisibleEntriesTask {
+@@ -458,6 +567,8 @@ actions!(
+         OpenContextMenu,
+         /// Opens an SVG preview for the selected file.
+         OpenSvgPreview,
++        /// Rescans the project's folders from disk.
++        Refresh,
+     ]
+ );
+ 
+@@ -721,6 +832,27 @@ impl ProjectPanel {
+             let focus_handle = cx.focus_handle();
+             cx.on_focus(&focus_handle, window, Self::focus_in).detach();
+ 
++            // The activity bar's badge counts unsaved files, read when the panel notifies.
++            let notify_on_dirty_change =
++                |buffer: &Entity<language::Buffer>, cx: &mut Context<Self>| {
++                    cx.subscribe(buffer, |_, _, event: &language::BufferEvent, cx| {
++                        if matches!(event, language::BufferEvent::DirtyChanged) {
++                            cx.notify();
++                        }
++                    })
++                    .detach();
++                };
++            let buffer_store = project.read(cx).buffer_store().clone();
++            for buffer in buffer_store.read(cx).buffers().collect::<Vec<_>>() {
++                notify_on_dirty_change(&buffer, cx);
++            }
++            cx.subscribe(&buffer_store, move |_, _, event, cx| {
++                if let project::buffer_store::BufferStoreEvent::BufferAdded(buffer) = event {
++                    notify_on_dirty_change(buffer, cx);
++                }
++            })
++            .detach();
++
+             cx.subscribe_in(
+                 &git_store,
+                 window,
+@@ -928,6 +1060,10 @@ impl ProjectPanel {
+                     project.read(cx).is_via_collab(),
+                     &cx,
+                 ),
++                folders_expanded: true,
++                sections: Vec::new(),
++                saved_sections: HashMap::default(),
++                is_visible: false,
+             };
+             this.update_visible_entries(None, false, false, window, cx);
+ 
+@@ -1027,11 +1163,127 @@ impl ProjectPanel {
+         workspace: WeakEntity<Workspace>,
+         mut cx: AsyncWindowContext,
+     ) -> Result<Entity<Self>> {
++        let kvp = cx.update(|_, cx| KeyValueStore::global(cx))?;
++        let saved_sections = cx
++            .background_spawn(async move { kvp.read_kvp(EXPLORER_SECTIONS_KEY) })
++            .await
++            .log_err()
++            .flatten()
++            .and_then(|json| serde_json::from_str::<HashMap<String, bool>>(&json).log_err())
++            .unwrap_or_default();
+         workspace.update_in(&mut cx, |workspace, window, cx| {
+-            ProjectPanel::new(workspace, window, cx)
++            let panel = ProjectPanel::new(workspace, window, cx);
++            panel.update(cx, |panel, _| {
++                panel.folders_expanded = saved_sections.get("").copied().unwrap_or(true);
++                panel.saved_sections = saved_sections;
++            });
++            panel
+         })
+     }
+ 
++    /// Adds a section under the file tree, expanded as it was last time if it was shown before.
++    pub fn add_section(
++        &mut self,
++        mut section: ExplorerSection,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        if let Some(expanded) = self.saved_sections.get(section.title.as_ref()) {
++            section.expanded = *expanded;
++        }
++        (section.set_visible)(self.is_visible && section.expanded, window, cx);
++        self.sections.push(section);
++        cx.notify();
++    }
++
++    /// Expands the section with this title and returns its focus handle, so the caller can
++    /// focus it once the panel itself is open.
++    pub fn expand_section(
++        &mut self,
++        title: &str,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) -> Option<FocusHandle> {
++        let index = self
++            .sections
++            .iter()
++            .position(|section| section.title.as_ref() == title)?;
++        if !self.sections[index].expanded {
++            self.toggle_section(index, window, cx);
++        }
++        Some(self.sections[index].focus_handle.clone())
++    }
++
++    pub fn collapse_section(&mut self, title: &str, window: &mut Window, cx: &mut Context<Self>) {
++        if let Some(index) = self
++            .sections
++            .iter()
++            .position(|section| section.title.as_ref() == title)
++            && self.sections[index].expanded
++        {
++            self.toggle_section(index, window, cx);
++        }
++    }
++
++    pub fn is_section_expanded(&self, title: &str) -> bool {
++        self.sections
++            .iter()
++            .find(|section| section.title.as_ref() == title)
++            .is_some_and(|section| section.expanded)
++    }
++
++    pub fn is_section_expanded_and_focused(
++        &self,
++        title: &str,
++        window: &Window,
++        cx: &App,
++    ) -> bool {
++        self.sections
++            .iter()
++            .find(|section| section.title.as_ref() == title)
++            .is_some_and(|section| section.expanded && section.focus_handle.contains_focused(window, cx))
++    }
++
++    fn toggle_section(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
++        let Some(section) = self.sections.get_mut(index) else {
++            return;
++        };
++        section.expanded = !section.expanded;
++        (section.set_visible)(self.is_visible && section.expanded, window, cx);
++        let (title, expanded) = (section.title.to_string(), section.expanded);
++        self.save_section_state(title, expanded, cx);
++        cx.notify();
++    }
++
++    fn toggle_folders(&mut self, cx: &mut Context<Self>) {
++        self.folders_expanded = !self.folders_expanded;
++        self.save_section_state(String::new(), self.folders_expanded, cx);
++        cx.notify();
++    }
++
++    fn save_section_state(&mut self, title: String, expanded: bool, cx: &mut Context<Self>) {
++        self.saved_sections.insert(title, expanded);
++        let Some(json) = serde_json::to_string(&self.saved_sections).log_err() else {
++            return;
++        };
++        let kvp = KeyValueStore::global(cx);
++        cx.background_spawn(async move {
++            kvp.write_kvp(EXPLORER_SECTIONS_KEY.to_string(), json)
++                .await
++                .log_err();
++        })
++        .detach();
++    }
++
++    fn refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
++        for worktree in self.project.read(cx).visible_worktrees(cx) {
++            if let Some(local) = worktree.read(cx).as_local() {
++                // The scanner reports when it is done; the panel updates from its events.
++                drop(local.refresh_entries_for_paths(vec![RelPath::empty_arc()]));
++            }
++        }
++    }
++
+     fn update_diagnostics(&mut self, cx: &mut Context<Self>) {
+         let mut diagnostics: HashMap<(WorktreeId, Arc<RelPath>), DiagnosticSeverity> =
+             Default::default();
+@@ -1161,11 +1413,9 @@ impl ProjectPanel {
+                 !is_dir && MarkdownPreviewView::is_markdown_path(file_name, project.languages());
+             let is_svg = !is_dir && SvgPreviewView::is_svg_path(file_name);
+ 
+-            let settings = ProjectPanelSettings::get_global(cx);
+             let visible_worktrees_count = project.visible_worktrees(cx).count();
+             let should_hide_rename = is_root
+-                && (cfg!(target_os = "windows")
+-                    || (settings.hide_root && visible_worktrees_count == 1));
++                && (cfg!(target_os = "windows") || root_row_hidden(visible_worktrees_count));
+             let should_show_compare = !is_dir && self.file_abs_paths_to_diff(cx).is_some();
+ 
+             let (has_git_repo, has_history) = {
+@@ -1231,7 +1481,7 @@ impl ProjectPanel {
+                                 menu.separator()
+                                     .action("Compare Marked Files", Box::new(CompareMarkedFiles))
+                             })
+-                            .separator()
++                                .separator()
+                             .action("Cut", Box::new(Cut))
+                             .action("Copy", Box::new(Copy))
+                             .action("Duplicate", Box::new(Duplicate))
+@@ -2520,6 +2770,10 @@ impl ProjectPanel {
+             return;
+         };
+ 
++        if !self.folders_expanded {
++            self.folders_expanded = true;
++            self.save_section_state(String::new(), true, cx);
++        }
+         self.marked_entries.clear();
+         self.state.edit_state = Some(EditState {
+             worktree_id,
+@@ -2578,15 +2832,13 @@ impl ProjectPanel {
+                     return;
+                 }
+ 
+-                if Some(entry) == worktree.read(cx).root_entry() {
+-                    let settings = ProjectPanelSettings::get_global(cx);
+-                    let visible_worktrees_count =
+-                        self.project.read(cx).visible_worktrees(cx).count();
+-                    if settings.hide_root && visible_worktrees_count == 1 {
+-                        return;
+-                    }
++                if Some(entry) == worktree.read(cx).root_entry()
++                    && root_row_hidden(self.project.read(cx).visible_worktrees(cx).count())
++                {
++                    return;
+                 }
+ 
++                self.folders_expanded = true;
+                 self.state.edit_state = Some(EditState {
+                     worktree_id,
+                     entry_id: sub_entry_id,
+@@ -4633,7 +4885,7 @@ impl ProjectPanel {
+             .visible_worktrees(cx)
+             .map(|worktree| worktree.read(cx).snapshot())
+             .collect();
+-        let hide_root = settings.hide_root && visible_worktrees.len() == 1;
++        let hide_root = root_row_hidden(visible_worktrees.len());
+         let hide_hidden = settings.hide_hidden;
+ 
+         let visible_entries_task = cx.spawn_in(window, async move |this, cx| {
+@@ -6150,14 +6402,26 @@ impl ProjectPanel {
+         let depth = details.depth;
+         let worktree_id = details.worktree_id;
+ 
+-        let bg_color = if is_marked {
+-            item_colors.marked
++        let panel_focused = self.contains_focus(window, cx);
++        // As VS Code's lists: the selection is filled while the panel has focus and dimmed
++        // to the hover colour while it does not, and the keyboard cursor is outlined. A row
++        // being renamed is VS Code's input box instead (input.background, which Dracula sets
++        // to the editor's, inside the outline): on the fill, the part of the name selected for
++        // renaming would vanish, Dracula's text selection being the fill's colour (#44475a).
++        let bg_color = if show_editor {
++            cx.theme().colors().editor_background
++        } else if is_marked || is_active {
++            if panel_focused {
++                item_colors.marked
++            } else {
++                item_colors.hover
++            }
+         } else {
+             item_colors.default
+         };
+ 
+-        let bg_hover_color = if is_marked {
+-            item_colors.marked
++        let bg_hover_color = if is_marked || is_active {
++            bg_color
+         } else {
+             item_colors.hover
+         };
+@@ -6177,7 +6441,7 @@ impl ProjectPanel {
+             None
+         };
+ 
+-        let show_focused_border = !self.mouse_down && is_active && self.contains_focus(window, cx);
++        let show_focused_border = !self.mouse_down && is_active && panel_focused;
+ 
+         let border_color = if show_focused_border {
+             match validation_color_and_message {
+@@ -6269,10 +6533,11 @@ impl ProjectPanel {
+                 },
+             )
+             .cursor_pointer()
+-            .rounded_none()
++            .mx(rems_from_vscode_px(4.))
++            .pl_1p5()
++            .rounded(px(4.))
+             .bg(bg_color)
+             .border_1()
+-            .border_r_2()
+             .border_color(border_color)
+             .hover(|style| style.bg(bg_hover_color).border_color(border_hover_color))
+             .when(is_sticky, |this| this.block_mouse_except_scroll())
+@@ -6706,7 +6971,9 @@ impl ProjectPanel {
+                                          decoration_kind: IconDecorationKind,
+                                          color: Color| {
+                             DecoratedIcon::new(
+-                                Icon::from_path(glyph).color(Color::Muted),
++                                Icon::from_path(glyph)
++                                    .size(IconSize::Custom(EXPLORER_ICON_SIZE))
++                                    .color(Color::Muted),
+                                 Some(
+                                     IconDecoration::new(decoration_kind, bg_color, cx)
+                                         .group_name(Some(GROUP_NAME.into()))
+@@ -6726,8 +6993,11 @@ impl ProjectPanel {
+                                 Some((DiagnosticMark::OnIcon(decoration_kind), color)) => {
+                                     div().child(decorated(icon.clone(), decoration_kind, color))
+                                 }
+-                                _ => h_flex()
+-                                    .child(Icon::from_path(icon.to_string()).color(Color::Muted)),
++                                _ => h_flex().child(
++                                    Icon::from_path(icon.to_string())
++                                        .size(IconSize::Custom(EXPLORER_ICON_SIZE))
++                                        .color(Color::Muted),
++                                ),
+                             })
+                         } else if let Some(DiagnosticMark::Standalone(icon_name)) = diagnostic_mark
+                         {
+@@ -6736,19 +7006,14 @@ impl ProjectPanel {
+                                     .map_or(Color::Error, |(_, color)| color);
+                             Some(
+                                 h_flex()
+-                                    .size(IconSize::default().rems())
++                                    .size(EXPLORER_ICON_SIZE)
+                                     .child(Icon::new(icon_name).color(color).size(IconSize::Small)),
+                             )
+                         } else if chevron.is_some() {
+                             // The chevron already fills this slot; a spacer would double its width.
+                             None
+                         } else {
+-                            Some(
+-                                h_flex()
+-                                    .size(IconSize::default().rems())
+-                                    .invisible()
+-                                    .flex_none(),
+-                            )
++                            Some(h_flex().size(EXPLORER_ICON_SIZE).invisible().flex_none())
+                         };
+ 
+                         let chevron =
+@@ -6757,23 +7022,20 @@ impl ProjectPanel {
+                                     decorated(chevron, decoration_kind, color)
+                                 }
+                                 _ => Icon::from_path(chevron)
+-                                    .color(Color::Muted)
++                                    .size(IconSize::Custom(EXPLORER_ICON_SIZE))
+                                     .into_any_element(),
+                             });
+ 
+                         match (chevron, icon_slot) {
+                             (Some(chevron), Some(icon_slot)) => {
+-                                this.child(h_flex().gap_0p5().child(chevron).child(icon_slot))
++                                this.child(h_flex().gap_1p5().child(chevron).child(icon_slot))
+                             }
+                             (Some(chevron), None) => this.child(h_flex().child(chevron)),
+                             (None, Some(icon_slot)) if reserves_chevron_slot => this.child(
+                                 h_flex()
+-                                    .gap_0p5()
++                                    .gap_1p5()
+                                     .child(
+-                                        h_flex()
+-                                            .size(IconSize::default().rems())
+-                                            .invisible()
+-                                            .flex_none(),
++                                        h_flex().size(EXPLORER_ICON_SIZE).invisible().flex_none(),
+                                     )
+                                     .child(icon_slot),
+                             ),
+@@ -7199,8 +7461,8 @@ impl ProjectPanel {
+         let reserves_chevron_slot =
+             chevron.is_none() && folder_indicator.shows_chevron() && folder_indicator.shows_icon();
+ 
+-        let filename_text_color =
+-            entry_git_aware_label_color(git_status, entry.is_ignored, is_marked);
++        // VS Code draws every row in the foreground colour unless git or .gitignore says otherwise.
++        let filename_text_color = entry_git_aware_label_color(git_status, entry.is_ignored, true);
+ 
+         let is_cut = self
+             .clipboard
+@@ -7271,6 +7533,10 @@ impl ProjectPanel {
+                 anyhow::bail!("can't reveal an ignored entry in the project panel");
+             }
+ 
++            if !self.folders_expanded {
++                self.folders_expanded = true;
++                self.save_section_state(String::new(), true, cx);
++            }
+             self.selection = Some(SelectedEntry {
+                 worktree_id,
+                 entry_id,
+@@ -7294,6 +7560,10 @@ impl ProjectPanel {
+             return Ok(());
+         }
+ 
++        if !self.folders_expanded {
++            self.folders_expanded = true;
++            self.save_section_state(String::new(), true, cx);
++        }
+         self.expand_entry(worktree_id, entry_id, cx);
+         self.update_visible_entries(Some((worktree_id, entry_id)), false, true, window, cx);
+         self.marked_entries.clear();
+@@ -7527,6 +7797,219 @@ fn item_width_estimate(depth: usize, item_text_chars: usize, is_symlink: bool) -
+ 
+ impl Render for ProjectPanel {
+     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        let folders = self.render_folders(window, cx);
++        ui::utils::WithRemSize::new(explorer_rem_size(cx))
++            .size_full()
++            .child(
++                v_flex()
++                    .id("explorer")
++                    .group("explorer")
++                    .size_full()
++                    .child(self.render_explorer_title(cx))
++                    .children(self.render_folders_header(cx))
++                    .child(folders)
++                    .children(self.render_sections(cx)),
++            )
++    }
++}
++
++impl ProjectPanel {
++    fn render_explorer_title(&self, cx: &mut Context<Self>) -> impl IntoElement {
++        let settings = ProjectPanelSettings::get_global(cx);
++        let (hide_hidden, hide_gitignore) = (settings.hide_hidden, settings.hide_gitignore);
++        let focus_handle = self.focus_handle.clone();
++        // VS Code's modern sidebar title: 32 px tall, 8 px inset, actions 4 px from the edge.
++        h_flex()
++            .flex_none()
++            .h(rems_from_vscode_px(32.))
++            .pl(rems_from_vscode_px(8.))
++            .pr(rems_from_vscode_px(4.))
++            .justify_between()
++            .child(
++                Label::new("Explorer")
++                    .size(LabelSize::Custom(EXPLORER_HEADER_TEXT))
++                    .weight(FontWeight::SEMIBOLD),
++            )
++            .child(
++                PopoverMenu::new("explorer-menu")
++                    .trigger_with_tooltip(
++                        IconButton::new("explorer-menu-button", IconName::Ellipsis)
++                            .icon_size(IconSize::Custom(EXPLORER_ICON_SIZE))
++                            .width(rems_from_vscode_px(22.))
++                            .hover_background(cx.theme().colors().toolbar_hover_background),
++                        Tooltip::text("Views and More Actions…"),
++                    )
++                    .anchor(Anchor::TopRight)
++                    .menu(move |window, cx| {
++                        let focus_handle = focus_handle.clone();
++                        Some(ContextMenu::build(window, cx, move |menu, _, _| {
++                            menu.context(focus_handle)
++                                .action("Collapse All Folders", CollapseAllEntries.boxed_clone())
++                                .separator()
++                                .toggleable_entry(
++                                    "Show Hidden Files",
++                                    !hide_hidden,
++                                    IconPosition::Start,
++                                    Some(ToggleHideHidden.boxed_clone()),
++                                    |window, cx| {
++                                        window.dispatch_action(ToggleHideHidden.boxed_clone(), cx)
++                                    },
++                                )
++                                .toggleable_entry(
++                                    "Show Git-Ignored Files",
++                                    !hide_gitignore,
++                                    IconPosition::Start,
++                                    Some(ToggleHideGitIgnore.boxed_clone()),
++                                    |window, cx| {
++                                        window
++                                            .dispatch_action(ToggleHideGitIgnore.boxed_clone(), cx)
++                                    },
++                                )
++                        }))
++                    }),
++            )
++    }
++
++    /// A VS Code pane header in its modern UI: 28 px tall, its twistie 10 px in with 2 px on each
++    /// side, and its actions 4 px from the edge.
++    fn render_section_header(
++        id: impl Into<ElementId>,
++        title: SharedString,
++        expanded: bool,
++        cx: &App,
++    ) -> Stateful<Div> {
++        h_flex()
++            .id(id)
++            .flex_none()
++            .h(rems_from_vscode_px(28.))
++            .pl(rems_from_vscode_px(10.))
++            .pr(rems_from_vscode_px(4.))
++            .gap(rems_from_vscode_px(2.))
++            .cursor_pointer()
++            .child(
++                Icon::new(if expanded {
++                    IconName::ChevronDown
++                } else {
++                    IconName::ChevronRight
++                })
++                .size(IconSize::Custom(EXPLORER_ICON_SIZE)),
++            )
++            .child(
++                Label::new(title)
++                    .size(LabelSize::Custom(EXPLORER_HEADER_TEXT))
++                    .weight(FontWeight::SEMIBOLD)
++                    .single_line()
++                    .truncate(),
++            )
++            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
++    }
++
++    fn render_folders_header(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
++        let project = self.project.read(cx);
++        let names: Vec<_> = project
++            .visible_worktrees(cx)
++            .map(|worktree| worktree.read(cx).root_name().as_unix_str().to_string())
++            .collect();
++        if names.is_empty() {
++            return None;
++        }
++        let hover_background = cx.theme().colors().toolbar_hover_background;
++        // VS Code's view actions: a 16 px codicon with 3 px of padding, rounded 4 px.
++        let action_button = move |id: &'static str, icon: IconName, tooltip: &'static str| {
++            div()
++                .id(id)
++                .size(rems_from_vscode_px(22.))
++                .flex()
++                .flex_none()
++                .items_center()
++                .justify_center()
++                .rounded(px(4.))
++                .cursor_pointer()
++                .hover(move |style| style.bg(hover_background))
++                .child(Icon::new(icon).size(IconSize::Custom(EXPLORER_ICON_SIZE)))
++                .tooltip(Tooltip::text(tooltip))
++        };
++        Some(
++            Self::render_section_header(
++                "explorer-folders",
++                names.join(", ").into(),
++                self.folders_expanded,
++                cx,
++            )
++            .on_click(cx.listener(|this, _, _, cx| this.toggle_folders(cx)))
++            .child(
++                h_flex()
++                    .ml_auto()
++                    .gap_0p5()
++                    .visible_on_hover("explorer")
++                    .child(
++                        action_button("explorer-new-file", IconName::FileAdd, "New File…")
++                            .on_click(cx.listener(|this, _, window, cx| {
++                                cx.stop_propagation();
++                                this.folders_expanded = true;
++                                this.new_file(&NewFile, window, cx);
++                            })),
++                    )
++                    .child(
++                        action_button("explorer-new-folder", IconName::FolderAdd, "New Folder…")
++                            .on_click(cx.listener(|this, _, window, cx| {
++                                cx.stop_propagation();
++                                this.folders_expanded = true;
++                                this.new_directory(&NewDirectory, window, cx);
++                            })),
++                    )
++                    .child(
++                        action_button("explorer-refresh", IconName::RotateCw, "Refresh Explorer")
++                            .on_click(cx.listener(|this, _, window, cx| {
++                                cx.stop_propagation();
++                                this.refresh(&Refresh, window, cx);
++                            })),
++                    )
++                    .child(
++                        action_button(
++                            "explorer-collapse-all",
++                            IconName::ListCollapse,
++                            "Collapse Folders in Explorer",
++                        )
++                        .on_click(cx.listener(|this, _, window, cx| {
++                            cx.stop_propagation();
++                            this.collapse_all_entries(&CollapseAllEntries, window, cx);
++                        })),
++                    ),
++            ),
++        )
++    }
++
++    fn render_sections(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
++        let border = cx.theme().colors().border_variant;
++        self.sections
++            .iter()
++            .enumerate()
++            .map(|(index, section)| {
++                v_flex()
++                    .when(section.expanded, |this| this.flex_1().min_h_0())
++                    .border_t_1()
++                    .border_color(border)
++                    .child(
++                        Self::render_section_header(
++                            ("explorer-section", index),
++                            section.title.clone(),
++                            section.expanded,
++                            cx,
++                        )
++                        .on_click(cx.listener(
++                            move |this, _, window, cx| this.toggle_section(index, window, cx),
++                        )),
++                    )
++                    .when(section.expanded, |this| {
++                        this.child(div().flex_1().min_h_0().child(section.view.clone()))
++                    })
++                    .into_any_element()
++            })
++            .collect()
++    }
++
++    fn render_folders(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
+         if !cx.has_active_drag() {
+             self.clear_drag_state(cx);
+         }
+@@ -7636,6 +8119,18 @@ impl Render for ProjectPanel {
+             h_flex()
+                 .id("project-panel")
+                 .group("project-panel")
++                .w_full()
++                .min_h_0()
++                // Collapsed, the tree keeps its (empty) place so the panel stays focusable and
++                // its actions keep working.
++                .map(|this| {
++                    if self.folders_expanded {
++                        this.flex_1()
++                    } else {
++                        this.h_0()
++                    }
++                })
++                .overflow_hidden()
+                 .when(panel_settings.drag_and_drop, |this| {
+                     this.on_drag_move(cx.listener(handle_drag_move::<ExternalPaths>))
+                         .on_drag_move(cx.listener(handle_drag_move::<DraggedSelection>))
+@@ -7647,7 +8142,6 @@ impl Render for ProjectPanel {
+                             this.clear_drag_state(cx);
+                         }))
+                 })
+-                .size_full()
+                 .relative()
+                 .on_modifiers_changed(cx.listener(
+                     |this, event: &ModifiersChangedEvent, window, cx| {
+@@ -7674,6 +8168,7 @@ impl Render for ProjectPanel {
+                 .on_action(cx.listener(Self::expand_selected_entry))
+                 .on_action(cx.listener(Self::collapse_selected_entry))
+                 .on_action(cx.listener(Self::collapse_all_entries))
++                .on_action(cx.listener(Self::refresh))
+                 .on_action(cx.listener(Self::expand_all_entries))
+                 .on_action(cx.listener(Self::collapse_selected_entry_and_children))
+                 .on_action(cx.listener(Self::expand_selected_entry_and_children))
+@@ -8152,7 +8647,9 @@ impl Render for ProjectPanel {
+ 
+             v_flex()
+                 .id("empty-project_panel-wrapper")
+-                .size_full()
++                .w_full()
++                .flex_1()
++                .min_h_0()
+                 .child(
+                     ProjectEmptyState::new(
+                         "Project Panel",
+@@ -8278,11 +8775,24 @@ impl Panel for ProjectPanel {
+     fn icon(&self, _: &Window, cx: &App) -> Option<IconName> {
+         ProjectPanelSettings::get_global(cx)
+             .button
+-            .then_some(IconName::FileTree)
++            .then_some(IconName::FileMultiple)
+     }
+ 
+     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+-        Some("Project Panel")
++        Some("Explorer")
++    }
++
++    /// VS Code badges the Explorer with the number of files that have unsaved changes.
++    fn icon_label(&self, _window: &Window, cx: &App) -> Option<String> {
++        let unsaved = self
++            .project
++            .read(cx)
++            .buffer_store()
++            .read(cx)
++            .buffers()
++            .filter(|buffer| buffer.read(cx).is_dirty())
++            .count();
++        (unsaved > 0).then(|| unsaved.to_string())
+     }
+ 
+     fn toggle_action(&self) -> Box<dyn Action> {
+@@ -8316,6 +8826,12 @@ impl Panel for ProjectPanel {
+                 panel.preload_initial_entry_icons(window, cx);
+             });
+         }
++        if self.is_visible != active {
++            self.is_visible = active;
++            for section in &self.sections {
++                (section.set_visible)(active && section.expanded, window, cx);
++            }
++        }
+     }
+ 
+     fn activation_priority(&self) -> u32 {
+diff --git a/crates/title_bar/src/title_bar.rs b/crates/title_bar/src/title_bar.rs
+index 4f1b09c..e042824 100644
+--- a/crates/title_bar/src/title_bar.rs
++++ b/crates/title_bar/src/title_bar.rs
+@@ -294,8 +294,13 @@ impl Render for TitleBar {
+             }
+         }
+ 
++        let command_center_shown = project_name.is_some();
++        let project_name_for_center = project_name.clone();
+         children.push(
+             h_flex()
++                .flex_1()
++                .min_w_0()
++                .overflow_hidden()
+                 .h_full()
+                 .gap_0p5()
+                 .map(|title_bar| {
+@@ -319,9 +324,14 @@ impl Render for TitleBar {
+                         .when(render_project_items, |title_bar| {
+                             title_bar
+                                 .when(title_bar_settings.show_project_items, |title_bar| {
+-                                    title_bar
+-                                        .children(self.render_project_host(cx))
+-                                        .child(self.render_project_name(project_name, window, cx))
++                                    title_bar.children(self.render_project_host(cx)).when(
++                                        !command_center_shown,
++                                        |title_bar| {
++                                            title_bar.child(
++                                                self.render_project_name(project_name, window, cx),
++                                            )
++                                        },
++                                    )
+                                 })
+                                 .when_some(
+                                     repository.filter(|_| is_git_enabled),
+@@ -335,17 +345,20 @@ impl Render for TitleBar {
+                                 )
+                         })
+                 })
++                .child(self.render_collaborator_list(window, cx))
+                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                 .into_any_element(),
+         );
+ 
+-        children.push(self.render_collaborator_list(window, cx).into_any_element());
++        children.extend(
++            self.render_command_center(project_name_for_center, window, cx)
++                .map(IntoElement::into_any_element),
++        );
+ 
+-        if title_bar_settings.show_onboarding_banner {
+-            if let Some(banner) = &self.banner {
+-                children.push(banner.clone().into_any_element())
+-            }
+-        }
++        let onboarding_banner = title_bar_settings
++            .show_onboarding_banner
++            .then(|| self.banner.clone())
++            .flatten();
+ 
+         let status = self.client.status();
+         let status = &*status.borrow();
+@@ -365,9 +378,13 @@ impl Render for TitleBar {
+ 
+         children.push(
+             h_flex()
++                .flex_1()
++                .min_w_0()
++                .justify_end()
+                 .pr_1()
+                 .gap_1()
+                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
++                .children(onboarding_banner)
+                 .child(self.render_call_controls(window, cx))
+                 .children(self.render_connection_status(status, cx))
+                 .child(self.update_version.clone())
+@@ -436,6 +453,52 @@ impl Render for TitleBar {
+ }
+ 
+ impl TitleBar {
++    /// VS Code's command center as its modern UI draws it (the agent status pill): the project's
++    /// name in a 22 px field centred in the title bar, 38% of the window wide up to 600 px, with
++    /// a 1 px outline of the title bar's text at 20% (30% hovered), a 4 px radius, 10 px of
++    /// padding and its label at 60% opacity. Clicking it opens the file finder, as VS Code's
++    /// opens Quick Open.
++    fn render_command_center(
++        &self,
++        project_name: Option<SharedString>,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) -> Option<impl IntoElement> {
++        let project_name = project_name?;
++        let text = cx.theme().colors().text;
++        let width = (window.viewport_size().width * 0.38).min(px(600.));
++        Some(
++            h_flex()
++                .flex_shrink(1.)
++                .min_w_0()
++                .px_2()
++                .justify_center()
++                .child(
++                    h_flex()
++                        .id("command-center")
++                        .w(width)
++                        .max_w_full()
++                        .min_w_0()
++                        .h(px(22.))
++                        .px(px(10.))
++                        .rounded(px(4.))
++                        .border_1()
++                        .border_color(text.opacity(0.2))
++                        .hover(|style| style.border_color(text.opacity(0.3)))
++                        .cursor_pointer()
++                        .overflow_hidden()
++                        .child(Label::new(project_name).single_line().truncate().alpha(0.6))
++                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
++                        .on_click(|_, window, cx| {
++                            window.dispatch_action(
++                                workspace::ToggleFileFinder::default().boxed_clone(),
++                                cx,
++                            )
++                        }),
++                ),
++        )
++    }
++
+     pub fn new(
+         id: impl Into<ElementId>,
+         workspace: &Workspace,
+diff --git a/crates/ui/src/components/button/icon_button.rs b/crates/ui/src/components/button/icon_button.rs
+index 330605f..f3de300 100644
+--- a/crates/ui/src/components/button/icon_button.rs
++++ b/crates/ui/src/components/button/icon_button.rs
+@@ -55,6 +55,17 @@ impl IconButton {
+         self
+     }
+ 
++    /// Sizes the button as VS Code's action bars do its editor actions: a 16 px codicon in a
++    /// 22 px square.
++    pub fn editor_action(mut self) -> Self {
++        self.icon_size = IconSize::Custom(rems_from_vscode_px(16.));
++        self.base = self
++            .base
++            .width(rems_from_vscode_px(22.))
++            .height(rems_from_vscode_px(22.).into());
++        self
++    }
++
+     /// Sets the label announced by assistive technology.
+     ///
+     /// Icon buttons have no visible text, so they should always set this for
+diff --git a/crates/ui/src/components/scrollbar.rs b/crates/ui/src/components/scrollbar.rs
+index de9df11..d12eff4 100644
+--- a/crates/ui/src/components/scrollbar.rs
++++ b/crates/ui/src/components/scrollbar.rs
+@@ -27,7 +27,8 @@ const SCROLLBAR_HIDE_DURATION: Duration = Duration::from_millis(400);
+ const SCROLLBAR_SHOW_DURATION: Duration = Duration::from_millis(50);
+ 
+ pub const EDITOR_SCROLLBAR_WIDTH: Pixels = ScrollbarStyle::Editor.to_pixels();
+-const SCROLLBAR_PADDING: Pixels = px(4.);
++// VS Code's lists put their slider flush against the edge, full length.
++const SCROLLBAR_PADDING: Pixels = px(0.);
+ const BORDER_WIDTH: Pixels = px(1.);
+ 
+ pub mod scrollbars {
+@@ -421,8 +422,10 @@ impl ScrollbarRevealPolicy {
+ impl ScrollbarStyle {
+     pub const fn to_pixels(&self) -> Pixels {
+         match self {
+-            ScrollbarStyle::Regular => px(6.),
+-            ScrollbarStyle::Editor => px(15.),
++            // VS Code's modern UI: every scrollable without its own size (lists, trees) gets
++            // 8 px scrollbars, whose 4 px corner radius makes the slider a pill.
++            ScrollbarStyle::Regular => px(8.),
++            ScrollbarStyle::Editor => px(14.),
+         }
+     }
+ }
+@@ -1586,7 +1589,8 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
+                         match style {
+                             ScrollbarStyle::Regular => Corners::all(Pixels::MAX)
+                                 .clamp_radii_for_quad_size(thumb_bounds.size),
+-                            ScrollbarStyle::Editor => Corners::default(),
++                            // VS Code's modern UI rounds every slider by --vscode-cornerRadius-small.
++                            ScrollbarStyle::Editor => Corners::all(px(4.)),
+                         },
+                         thumb_color,
+                         Edges::default(),
+diff --git a/crates/ui/src/components/tab.rs b/crates/ui/src/components/tab.rs
+index 6a25ad4..eb076cb 100644
+--- a/crates/ui/src/components/tab.rs
++++ b/crates/ui/src/components/tab.rs
+@@ -6,7 +6,32 @@ use smallvec::SmallVec;
+ use crate::prelude::*;
+ 
+ const START_TAB_SLOT_SIZE: Pixels = px(12.);
+-const END_TAB_SLOT_SIZE: Pixels = px(14.);
++/// VS Code's tab action: a 16 px codicon with 2 px of padding.
++const END_TAB_SLOT_SIZE: Rems = rems_from_vscode_px(20.);
++
++// VS Code 1.147's editor tabs as its modern UI connects them to the editor: a 31 px row
++// (--modern-ui-connected-tab-row-height, its 24 px tab height plus 4 px above and below, less
++// the stroke) over a 1 px line in tab.border.
++const TAB_ROW_HEIGHT: f32 = 31.;
++/// The label's inset on the side away from the action: --modern-ui-editor-tab-left-inset, 6 px
++/// before a file icon and 8 px without one.
++const TAB_LABEL_INSET: Rems = rems_from_vscode_px(8.);
++const TAB_ICON_INSET: Rems = rems_from_vscode_px(6.);
++/// The action's 20 px button is centred in a 24 px box 4.5 px from the tab's edge
++/// (--modern-ui-connected-tab-action-inset less 2 px), 4 px after the label: 30.5 px of
++/// padding that every tab reserves (workbench.editor.tabActionReserveSpace).
++const TAB_ACTION_INSET: Rems = rems_from_vscode_px(6.5);
++const TAB_ACTION_GAP: Rems = rems_from_vscode_px(4.);
++/// The active tab's top corners (--modern-ui-connected-tab-cap-radius) and the inverted curves
++/// that join its bottom corners to the line (--modern-ui-connected-tab-shoulder-radius):
++/// --vscode-cornerRadius-medium plus the stroke.
++const ACTIVE_TAB_RADIUS: Rems = rems_from_vscode_px(7.);
++/// Inactive tabs fill a 24 px pill inset 2 px from their sides, rounded 4 px
++/// (--vscode-cornerRadius-small), which grows to the full row on hover.
++const INACTIVE_FILL_INSET_X: Rems = rems_from_vscode_px(2.);
++const INACTIVE_FILL_INSET_Y: Rems = rems_from_vscode_px((TAB_ROW_HEIGHT - 24.) / 2.);
++const INACTIVE_FILL_RADIUS: Rems = rems_from_vscode_px(4.);
++const TAB_GROUP: &str = "tab";
+ 
+ /// The position of a [`Tab`] within a list of tabs.
+ #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+@@ -35,6 +60,7 @@ pub struct Tab {
+     selected: bool,
+     position: TabPosition,
+     close_side: TabCloseSide,
++    starts_with_icon: bool,
+     start_slot: Option<AnyElement>,
+     end_slot: Option<AnyElement>,
+     children: SmallVec<[AnyElement; 2]>,
+@@ -50,6 +76,7 @@ impl Tab {
+             selected: false,
+             position: TabPosition::First,
+             close_side: TabCloseSide::End,
++            starts_with_icon: false,
+             start_slot: None,
+             end_slot: None,
+             children: SmallVec::new(),
+@@ -66,6 +93,13 @@ impl Tab {
+         self
+     }
+ 
++    /// Whether the tab's content starts with a file icon, which VS Code brings 2 px closer to
++    /// the tab's edge than a bare label.
++    pub fn starts_with_icon(mut self, starts_with_icon: bool) -> Self {
++        self.starts_with_icon = starts_with_icon;
++        self
++    }
++
+     pub fn start_slot<E: IntoElement>(mut self, element: impl Into<Option<E>>) -> Self {
+         self.start_slot = element.into().map(IntoElement::into_any_element);
+         self
+@@ -77,11 +111,12 @@ impl Tab {
+     }
+ 
+     pub fn content_height(cx: &App) -> Pixels {
+-        DynamicSpacing::Base32.px(cx) - px(1.)
++        Self::container_height(cx) - px(1.)
+     }
+ 
+     pub fn container_height(cx: &App) -> Pixels {
+-        DynamicSpacing::Base32.px(cx)
++        rems_from_vscode_px(TAB_ROW_HEIGHT + 1.)
++            .to_pixels(theme::theme_settings(cx).ui_font_size(cx))
+     }
+ }
+ 
+@@ -108,27 +143,23 @@ impl ParentElement for Tab {
+ 
+ impl RenderOnce for Tab {
+     #[allow(refining_impl_trait)]
+-    fn render(self, _: &mut Window, cx: &mut App) -> Stateful<Div> {
+-        let (text_color, tab_bg, _tab_hover_bg, _tab_active_bg) = match self.selected {
+-            false => (
+-                cx.theme().colors().text_muted,
+-                cx.theme().colors().tab_inactive_background,
+-                cx.theme().colors().ghost_element_hover,
+-                cx.theme().colors().ghost_element_active,
+-            ),
+-            true => (
+-                cx.theme().colors().text,
+-                cx.theme().colors().tab_active_background,
+-                cx.theme().colors().element_hover,
+-                cx.theme().colors().element_active,
+-            ),
++    fn render(self, window: &mut Window, cx: &mut App) -> Stateful<Div> {
++        let colors = cx.theme().colors();
++        let text_color = if self.selected {
++            colors.text
++        } else {
++            colors.text_muted
+         };
+ 
++        let close_side = self.close_side;
+         let (start_slot, end_slot) = {
+-            let start_slot = h_flex()
+-                .size(START_TAB_SLOT_SIZE)
+-                .justify_center()
+-                .children(self.start_slot);
++            // Empty, the start slot would push the label away from VS Code's inset.
++            let start_slot = self.start_slot.map(|start_slot| {
++                h_flex()
++                    .size(START_TAB_SLOT_SIZE)
++                    .justify_center()
++                    .child(start_slot)
++            });
+ 
+             let end_slot = h_flex()
+                 .size(END_TAB_SLOT_SIZE)
+@@ -136,46 +167,131 @@ impl RenderOnce for Tab {
+                 .children(self.end_slot);
+ 
+             match self.close_side {
+-                TabCloseSide::End => (start_slot, end_slot),
+-                TabCloseSide::Start => (end_slot, start_slot),
++                TabCloseSide::End => (
++                    start_slot.map(|slot| slot.into_any_element()),
++                    Some(end_slot.into_any_element()),
++                ),
++                TabCloseSide::Start => (
++                    Some(end_slot.into_any_element()),
++                    start_slot.map(|slot| slot.into_any_element()),
++                ),
+             }
+         };
++        let label_inset = if self.starts_with_icon {
++            TAB_ICON_INSET
++        } else {
++            TAB_LABEL_INSET
++        };
++
++        // The first tab sits against the editor's rounded corner, so VS Code gives it neither a
++        // left curve nor a left edge.
++        let is_first = self.position == TabPosition::First;
++        let rem_size = window.rem_size();
++        let radius = ACTIVE_TAB_RADIUS.to_pixels(rem_size);
++        let fill = if self.selected {
++            // Each curve is the active colour in a square beside the tab's bottom corner, under
++            // a circle in the tab bar's colour, outlined like the tab's edge, of which the square
++            // shows the quarter away from the tab. A circle because GPUI caps a corner's radius at
++            // half its quad's side.
++            let curve = |left_side: bool| {
++                div()
++                    .absolute()
++                    .bottom_0()
++                    .size(radius)
++                    .overflow_hidden()
++                    // 1 px inside the tab, as VS Code anchors its curves to the fill's padding box,
++                    // so the curve's outline continues the edge's.
++                    .map(|this| {
++                        if left_side {
++                            this.left(-radius + px(1.))
++                        } else {
++                            this.right(-radius + px(1.))
++                        }
++                    })
++                    .bg(colors.tab_active_background)
++                    .child(
++                        div()
++                            .absolute()
++                            .top(-radius)
++                            .left(if left_side { -radius } else { px(0.) })
++                            .size(radius * 2.)
++                            .rounded(radius)
++                            .bg(colors.tab_bar_background)
++                            .border_1()
++                            .border_color(colors.border_variant),
++                    )
++            };
++            div()
++                .absolute()
++                .inset_0()
++                .child(
++                    div()
++                        .absolute()
++                        .inset_0()
++                        .bg(colors.tab_active_background)
++                        .map(|this| {
++                            if is_first {
++                                this.rounded_tr(radius)
++                            } else {
++                                this.rounded_t(radius)
++                            }
++                        }),
++                )
++                // Over the fill, as VS Code's curves are its pseudo-elements.
++                .children((!is_first).then(|| curve(true)))
++                .child(curve(false))
++                // The edge stops where the curves take over. Its top lies under the editor's
++                // outline, as VS Code's does.
++                .child(
++                    div()
++                        .absolute()
++                        .top_0()
++                        .left_0()
++                        .right_0()
++                        .bottom(radius)
++                        .border_color(colors.border_variant)
++                        .border_r_1()
++                        .when(!is_first, |this| this.border_l_1()),
++                )
++        } else {
++            let hover_background = colors.tab_bar_background.blend(colors.text.opacity(0.06));
++            div().absolute().inset_0().child(
++                div()
++                    .absolute()
++                    .left(INACTIVE_FILL_INSET_X)
++                    .right(INACTIVE_FILL_INSET_X)
++                    .top(INACTIVE_FILL_INSET_Y)
++                    // Above the tab bar's line, which a hovered tab covers.
++                    .bottom(INACTIVE_FILL_INSET_Y.to_pixels(rem_size) + px(1.))
++                    .rounded(INACTIVE_FILL_RADIUS)
++                    .bg(colors.tab_inactive_background)
++                    .group_hover(TAB_GROUP, |style| {
++                        style.top_0().bottom_0().bg(hover_background)
++                    }),
++            )
++        };
+ 
+         self.div
++            .group(TAB_GROUP)
++            .relative()
++            .flex_none()
+             .h(Tab::container_height(cx))
+-            .bg(tab_bg)
+-            .border_color(cx.theme().colors().border)
+-            .map(|this| match self.position {
+-                TabPosition::First => {
+-                    if self.selected {
+-                        this.pl_px().border_r_1().pb_px()
+-                    } else {
+-                        this.pl_px().pr_px().border_b_1()
+-                    }
+-                }
+-                TabPosition::Last => {
+-                    if self.selected {
+-                        this.border_l_1().border_r_1().pb_px()
+-                    } else {
+-                        this.pl_px().border_b_1().border_r_1()
+-                    }
+-                }
+-                TabPosition::Middle(Ordering::Equal) => this.border_l_1().border_r_1().pb_px(),
+-                TabPosition::Middle(Ordering::Less) => this.border_l_1().pr_px().border_b_1(),
+-                TabPosition::Middle(Ordering::Greater) => this.border_r_1().pl_px().border_b_1(),
+-            })
+             .cursor_pointer()
++            .child(fill)
+             .child(
+                 h_flex()
+                     .group("")
+                     .relative()
+                     .h(Tab::content_height(cx))
+-                    .px(DynamicSpacing::Base04.px(cx))
+-                    .gap(DynamicSpacing::Base04.rems(cx))
++                    .map(|this| match close_side {
++                        TabCloseSide::End => this.pl(label_inset).pr(TAB_ACTION_INSET),
++                        TabCloseSide::Start => this.pl(TAB_ACTION_INSET).pr(label_inset),
++                    })
++                    .gap(TAB_ACTION_GAP)
+                     .text_color(text_color)
+-                    .child(start_slot)
++                    .children(start_slot)
+                     .children(self.children)
+-                    .child(end_slot),
++                    .children(end_slot),
+             )
+     }
+ }
+diff --git a/crates/ui/src/components/tab_bar.rs b/crates/ui/src/components/tab_bar.rs
+index 524f880..29d6174 100644
+--- a/crates/ui/src/components/tab_bar.rs
++++ b/crates/ui/src/components/tab_bar.rs
+@@ -91,23 +91,34 @@ impl ParentElement for TabBar {
+ 
+ impl RenderOnce for TabBar {
+     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
++        let colors = cx.theme().colors();
+         div()
+             .id(self.id)
+             .group("tab_bar")
++            .relative()
+             .flex()
+             .flex_none()
+             .w_full()
+             .h(Tab::container_height(cx))
+-            .bg(cx.theme().colors().tab_bar_background)
++            .bg(colors.tab_bar_background)
++            // VS Code's line under the tabs, all across the bar; the active tab covers it to join
++            // the editor.
++            .child(
++                div()
++                    .absolute()
++                    .left_0()
++                    .right_0()
++                    .bottom_0()
++                    .h_px()
++                    .bg(colors.border_variant),
++            )
+             .when(!self.start_children.is_empty(), |this| {
+                 this.child(
+                     h_flex()
+                         .flex_none()
++                        .h(Tab::content_height(cx))
+                         .gap(DynamicSpacing::Base04.rems(cx))
+                         .px(DynamicSpacing::Base06.rems(cx))
+-                        .border_b_1()
+-                        .border_r_1()
+-                        .border_color(cx.theme().colors().border)
+                         .children(self.start_children),
+                 )
+             })
+@@ -117,15 +128,6 @@ impl RenderOnce for TabBar {
+                     .flex_1()
+                     .h_full()
+                     .overflow_x_hidden()
+-                    .child(
+-                        div()
+-                            .absolute()
+-                            .top_0()
+-                            .left_0()
+-                            .size_full()
+-                            .border_b_1()
+-                            .border_color(cx.theme().colors().border),
+-                    )
+                     .child(
+                         h_flex()
+                             .id("tabs")
+@@ -137,15 +139,15 @@ impl RenderOnce for TabBar {
+                             .children(self.children),
+                     ),
+             )
++            // VS Code's editor actions: 4 px in from the bar's end, 4 px apart, centred above the
++            // line.
+             .when(!self.end_children.is_empty(), |this| {
+                 this.child(
+                     h_flex()
+                         .flex_none()
+-                        .gap(DynamicSpacing::Base04.rems(cx))
+-                        .px(DynamicSpacing::Base06.rems(cx))
+-                        .border_color(cx.theme().colors().border)
+-                        .border_b_1()
+-                        .border_l_1()
++                        .h(Tab::content_height(cx))
++                        .gap(rems_from_vscode_px(4.))
++                        .px(rems_from_vscode_px(4.))
+                         .children(self.end_children),
+                 )
+             })
+diff --git a/crates/ui/src/prelude.rs b/crates/ui/src/prelude.rs
+index 2aa918c..e495548 100644
+--- a/crates/ui/src/prelude.rs
++++ b/crates/ui/src/prelude.rs
+@@ -15,7 +15,8 @@ pub use ui_macros::RegisterComponent;
+ pub use crate::DynamicSpacing;
+ pub use crate::animation::{AnimationDirection, AnimationDuration, DefaultAnimations};
+ pub use crate::styles::{
+-    PlatformStyle, Severity, StyledTypography, TextSize, rems_from_px, vh, vw,
++    PlatformStyle, Severity, StyledTypography, TextSize, rems_from_px, rems_from_vscode_px, vh,
++    vw,
+ };
+ pub use crate::traits::clickable::*;
+ pub use crate::traits::disableable::*;
+diff --git a/crates/ui/src/styles/units.rs b/crates/ui/src/styles/units.rs
+index e5e22c4..f08120a 100644
+--- a/crates/ui/src/styles/units.rs
++++ b/crates/ui/src/styles/units.rs
+@@ -14,6 +14,13 @@ pub fn rems_from_px(px: impl Into<f32>) -> Rems {
+     rems(px.into() / BASE_REM_SIZE_IN_PX)
+ }
+ 
++/// Converts a length VS Code's workbench gives in pixels next to its 13 px text into rems
++/// next to a default label (0.875 rem), so a VS Code layout keeps its proportions to the text
++/// at any UI font size.
++pub const fn rems_from_vscode_px(px: f32) -> Rems {
++    rems(px * 0.875 / 13.)
++}
++
+ /// Returns a [`Length`] corresponding to the specified percentage of the viewport's width.
+ ///
+ /// `percent` should be a value between `0.0` and `1.0`.
+diff --git a/crates/workspace/src/dock.rs b/crates/workspace/src/dock.rs
+index 41b3df0..929ab8a 100644
+--- a/crates/workspace/src/dock.rs
++++ b/crates/workspace/src/dock.rs
+@@ -11,14 +11,14 @@ use gpui::{
+     Action, Anchor, AnyView, App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle,
+     Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
+     Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
+-    px,
++    px, svg,
+ };
+ use serde::{Deserialize, Serialize};
+ use settings::{Settings, SettingsStore, TerminalDockPosition};
+ use std::sync::Arc;
+ use ui::{
+-    ContextMenu, CountBadge, Divider, DividerColor, IconButton, Tooltip, prelude::*,
+-    right_click_menu,
++    ButtonLike, ContextMenu, CountBadge, Divider, DividerColor, IconButton, PopoverMenu, Tooltip,
++    prelude::*, right_click_menu,
+ };
+ use util::ResultExt as _;
+ 
+@@ -1344,7 +1344,6 @@ impl Render for Dock {
+                 .focus_follows_mouse(WorkspaceSettings::get_global(cx).focus_follows_mouse, cx)
+                 .flex()
+                 .bg(cx.theme().colors().panel_background)
+-                .border_color(cx.theme().colors().border)
+                 .overflow_hidden()
+                 .map(|this| match self.position().axis() {
+                     // Width and height are always set on the workspace wrapper in
+@@ -1352,11 +1351,6 @@ impl Render for Dock {
+                     Axis::Horizontal => this.w_full().h_full().flex_row(),
+                     Axis::Vertical => this.h_full().w_full().flex_col(),
+                 })
+-                .map(|this| match self.position() {
+-                    DockPosition::Left => this.border_r_1(),
+-                    DockPosition::Right => this.border_l_1(),
+-                    DockPosition::Bottom => this.border_t_1(),
+-                })
+                 .child(
+                     div()
+                         .map(|this| match self.position().axis() {
+@@ -1607,6 +1601,232 @@ impl StatusItemView for PanelButtons {
+     }
+ }
+ 
++/// Width of the [`ActivityBar`]: VS Code's floating activity bar, 36 px for the actions and an
++/// 8 px lane (FLOATING_ACTIVITYBAR_WIDTH, FLOATING_LANE).
++pub const ACTIVITY_BAR_WIDTH: Rems = rems_from_vscode_px(36. + 8.);
++const ACTION_HEIGHT: Rems = rems_from_vscode_px(36.);
++const ACTION_GAP: Rems = rems_from_vscode_px(8.);
++const ACTION_ICON_SIZE: Rems = rems_from_vscode_px(24.);
++/// The rounded square behind the open panel's (or hovered) icon: the action height less 4 px.
++const ACTION_INDICATOR_SIZE: Rems = rems_from_vscode_px(32.);
++/// The actions start and end 3 px in: half the lane less the 1 px outline.
++const ACTIONS_INSET: Rems = rems_from_vscode_px(3.);
++
++/// The column of buttons at the left edge of the window, as in VS Code: one per left dock
++/// panel, project search after the first of them, and a settings menu at the bottom. It
++/// replaces the left dock's buttons in the status bar.
++pub struct ActivityBar {
++    dock: Entity<Dock>,
++    _settings_subscription: Subscription,
++}
++
++impl ActivityBar {
++    pub fn new(dock: Entity<Dock>, cx: &mut Context<Self>) -> Self {
++        cx.observe(&dock, |_, _, cx| cx.notify()).detach();
++        let settings_subscription = cx.observe_global::<SettingsStore>(|_, cx| cx.notify());
++        Self {
++            dock,
++            _settings_subscription: settings_subscription,
++        }
++    }
++
++    fn item(
++        id: &'static str,
++        icon: IconName,
++        tooltip: SharedString,
++        action: Box<dyn Action>,
++        is_active: bool,
++        badge: Option<SharedString>,
++        focus_handle: FocusHandle,
++        cx: &App,
++    ) -> AnyElement {
++        let colors = cx.theme().colors();
++        let group = SharedString::from(format!("activity-bar-{id}"));
++        let (foreground, hover_background) =
++            (colors.activity_bar_foreground, colors.ghost_element_hover);
++        div()
++            .id(id)
++            .group(group.clone())
++            .relative()
++            .w(ACTIVITY_BAR_WIDTH)
++            .h(ACTION_HEIGHT)
++            .flex()
++            .flex_none()
++            .items_center()
++            .justify_center()
++            .cursor_pointer()
++            .child(
++                div()
++                    .absolute()
++                    .size(ACTION_INDICATOR_SIZE)
++                    .rounded(px(4.))
++                    .when(is_active, |this| {
++                        this.bg(colors.activity_bar_active_background)
++                    })
++                    .when(!is_active, |this| {
++                        this.group_hover(group.clone(), move |style| style.bg(hover_background))
++                    }),
++            )
++            .child(
++                svg()
++                    .path(icon.path())
++                    .size(ACTION_ICON_SIZE)
++                    .text_color(if is_active {
++                        foreground
++                    } else {
++                        colors.activity_bar_inactive_foreground
++                    })
++                    .group_hover(group, move |style| style.text_color(foreground)),
++            )
++            .children(badge.map(|badge| {
++                // VS Code's badge: 9 px text in a 16 px pill, 18 px down and 3 px in from the
++                // action's right edge.
++                div()
++                    .absolute()
++                    .top(rems_from_vscode_px(18.))
++                    .right(rems_from_vscode_px(3.))
++                    .h(rems_from_vscode_px(16.))
++                    .min_w(rems_from_vscode_px(16.))
++                    .px(rems_from_vscode_px(4.))
++                    .flex()
++                    .items_center()
++                    .justify_center()
++                    .rounded_full()
++                    .bg(colors.activity_bar_badge_background)
++                    .text_color(colors.activity_bar_badge_foreground)
++                    .text_size(rems_from_vscode_px(9.))
++                    .child(badge)
++            }))
++            .tooltip(Tooltip::for_action_title(tooltip, &*action))
++            .on_click(move |_, window, cx| {
++                window.focus(&focus_handle, cx);
++                window.dispatch_action(action.boxed_clone(), cx)
++            })
++            .into_any_element()
++    }
++}
++
++impl Render for ActivityBar {
++    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        let dock = self.dock.read(cx);
++        let focus_handle = dock.panel_button_focus_handle(window, cx);
++        let mut items: Vec<AnyElement> = dock
++            .panel_entries
++            .iter()
++            .enumerate()
++            .filter_map(|(index, entry)| {
++                let icon = entry.panel.icon(window, cx)?;
++                let tooltip = entry.panel.icon_tooltip(window, cx)?;
++                // Clicking the open panel's button closes the dock, as in VS Code.
++                let is_active = Some(index) == dock.active_panel_index && dock.is_open;
++                let action = if is_active {
++                    dock.toggle_action()
++                } else {
++                    entry.panel.toggle_action(window, cx)
++                };
++                Some(Self::item(
++                    entry.panel.persistent_name(),
++                    icon,
++                    tooltip.into(),
++                    action,
++                    is_active,
++                    entry.panel.icon_label(window, cx).map(SharedString::from),
++                    focus_handle.clone(),
++                    cx,
++                ))
++            })
++            .collect();
++        items.insert(
++            items.len().min(1),
++            Self::item(
++                "Search",
++                IconName::MagnifyingGlass,
++                "Search".into(),
++                Box::new(crate::DeploySearch::default()),
++                false,
++                None,
++                focus_handle,
++                cx,
++            ),
++        );
++
++        let colors = cx.theme().colors();
++        let (foreground, hover_background) =
++            (colors.activity_bar_foreground, colors.ghost_element_hover);
++        v_flex()
++            .id("activity-bar")
++            .w(ACTIVITY_BAR_WIDTH)
++            .h_full()
++            .flex_none()
++            .pt(ACTIONS_INSET)
++            .pb(ACTIONS_INSET)
++            .gap(ACTION_GAP)
++            .bg(colors.activity_bar_background)
++            .border_r(px(1.) / window.scale_factor())
++            .border_color(colors.border)
++            .children(items)
++            .child(div().flex_1())
++            .child(
++                PopoverMenu::new("activity-bar-manage")
++                    .trigger_with_tooltip(
++                        ButtonLike::new("activity-bar-manage-button")
++                            .style(ButtonStyle::Transparent)
++                            .height(ACTION_HEIGHT.into())
++                            .width(ACTIVITY_BAR_WIDTH)
++                            .child(
++                                h_flex()
++                                    .group("activity-bar-manage")
++                                    .w(ACTIVITY_BAR_WIDTH)
++                                    .h(ACTION_HEIGHT)
++                                    .relative()
++                                    .justify_center()
++                                    .child(
++                                        div()
++                                            .absolute()
++                                            .size(ACTION_INDICATOR_SIZE)
++                                            .rounded(px(4.))
++                                            .group_hover("activity-bar-manage", move |style| {
++                                                style.bg(hover_background)
++                                            }),
++                                    )
++                                    .child(
++                                        svg()
++                                            .path(IconName::Settings.path())
++                                            .size(ACTION_ICON_SIZE)
++                                            .text_color(colors.activity_bar_inactive_foreground)
++                                            .group_hover("activity-bar-manage", move |style| {
++                                                style.text_color(foreground)
++                                            }),
++                                    ),
++                            ),
++                        Tooltip::text("Manage"),
++                    )
++                    .anchor(Anchor::BottomLeft)
++                    .attach(Anchor::TopRight)
++                    .menu(|window, cx| {
++                        Some(ContextMenu::build(window, cx, |menu, _, _| {
++                            menu.action(
++                                "Command Palette",
++                                zed_actions::command_palette::Toggle.boxed_clone(),
++                            )
++                            .separator()
++                            .action("Settings", zed_actions::OpenSettings.boxed_clone())
++                            .action("Keyboard Shortcuts", zed_actions::OpenKeymap.boxed_clone())
++                            .separator()
++                            .action(
++                                "Themes",
++                                zed_actions::theme_selector::Toggle::default().boxed_clone(),
++                            )
++                            .action(
++                                "Icon Themes",
++                                zed_actions::icon_theme_selector::Toggle::default().boxed_clone(),
++                            )
++                        }))
++                    }),
++            )
++    }
++}
++
+ #[cfg(any(test, feature = "test-support"))]
+ pub mod test {
+     use super::*;
+diff --git a/crates/workspace/src/pane.rs b/crates/workspace/src/pane.rs
+index 2001185..bd85734 100644
+--- a/crates/workspace/src/pane.rs
++++ b/crates/workspace/src/pane.rs
+@@ -23,7 +23,7 @@ use gpui::{
+     DragMoveEvent, Entity, EntityId, EventEmitter, ExternalPaths, FocusHandle, FocusOutEvent,
+     Focusable, KeyContext, MouseButton, NavigationDirection, Pixels, Point, PromptLevel, Render,
+     ScrollHandle, Subscription, Task, TaskExt, WeakEntity, WeakFocusHandle, Window, actions,
+-    anchored, deferred, prelude::*,
++    anchored, deferred, prelude::*, svg,
+ };
+ use itertools::Itertools;
+ use language::{Capability, DiagnosticSeverity};
+@@ -560,12 +560,14 @@ impl Pane {
+             None
+         };
+ 
++        let toolbar = cx.new(|_| Toolbar::new());
+         let subscriptions = vec![
+             cx.on_focus(&focus_handle, window, Pane::focus_in),
+             cx.on_focus_in(&focus_handle, window, Pane::focus_in),
+             cx.on_focus_out(&focus_handle, window, Pane::focus_out),
+             cx.observe_global_in::<SettingsStore>(window, Self::settings_changed),
+             cx.subscribe(&project, Self::project_events),
++            cx.observe(&toolbar, |_, _, cx| cx.notify()),
+         ];
+ 
+         let handle = cx.entity().downgrade();
+@@ -595,7 +597,7 @@ impl Pane {
+                 next_timestamp,
+                 preview_item_id: None,
+             }))),
+-            toolbar: cx.new(|_| Toolbar::new()),
++            toolbar,
+             tab_bar_scroll_handle: ScrollHandle::new(),
+             suppress_scroll: false,
+             drag_split_direction: None,
+@@ -1380,6 +1382,33 @@ impl Pane {
+         )
+     }
+ 
++    /// Inserts a deferred inactive tab during workspace restoration without
++    /// changing the active item or stealing focus.
++    pub fn insert_restored_inactive_item(
++        &mut self,
++        item: Box<dyn ItemHandle>,
++        destination_index: usize,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        let prev_active_id = self.active_item().map(|item| item.item_id());
++        let destination_index = destination_index.min(self.items.len());
++        self.add_item_inner(
++            item,
++            false,
++            false,
++            false,
++            Some(destination_index),
++            window,
++            cx,
++        );
++        if let Some(prev_active_id) = prev_active_id
++            && let Some(new_active_index) = self.index_for_item_id(prev_active_id)
++        {
++            self.active_item_index = new_active_index;
++        }
++    }
++
+     pub fn items_len(&self) -> usize {
+         self.items.len()
+     }
+@@ -2830,9 +2859,10 @@ impl Pane {
+         window: &Window,
+         cx: &App,
+     ) -> Option<AnyElement> {
++        // VS Code's tab icons are 16 px next to its 13 px tab labels.
+         let icon = item
+             .tab_icon(window, cx)?
+-            .size(IconSize::Small)
++            .size(IconSize::Custom(rems_from_vscode_px(16.)))
+             .color(Color::Muted);
+ 
+         let item_diagnostic = item
+@@ -2904,7 +2934,12 @@ impl Pane {
+         let settings = ItemSettings::get_global(cx);
+         let close_side = &settings.close_position;
+         let show_close_button = &settings.show_close_button;
+-        let indicator = render_item_indicator(item.boxed_clone(), cx);
++        // VS Code marks a modified file in the close button's place, so only conflicts keep
++        // the dot before the label.
++        let indicator = item
++            .has_conflict(cx)
++            .then(|| Indicator::dot().color(Color::Warning));
++        let is_dirty = item.is_dirty(cx);
+         let tab_tooltip_content = item.tab_tooltip_content(cx);
+         let item_id = item.item_id();
+         let is_first_item = ix == 0;
+@@ -2943,6 +2978,7 @@ impl Pane {
+         let capability = item.capability(cx);
+         let can_toggle_read_only = item.read_only_toggle_buffer(cx).is_some();
+         let tab = Tab::new(ix)
++            .starts_with_icon(has_file_icon || (can_toggle_read_only && !capability.editable()))
+             .position(if is_first_item {
+                 TabPosition::First
+             } else if is_last_item {
+@@ -3035,11 +3071,22 @@ impl Pane {
+             }))
+             .start_slot::<Indicator>(indicator)
+             .map(|this| {
+-                let end_slot_action: &'static dyn Action;
+-                let end_slot_tooltip_text: &'static str;
++                let end_slot_tooltip = |text: &'static str, action: &'static dyn Action| {
++                    let focus_handle = focus_handle.clone();
++                    move |window: &mut Window, cx: &mut App| {
++                        if is_active {
++                            Tooltip::for_action_in(
++                                text,
++                                action,
++                                &window.focused(cx).unwrap_or_else(|| focus_handle.clone()),
++                                cx,
++                            )
++                        } else {
++                            Tooltip::simple(text, cx)
++                        }
++                    }
++                };
+                 let end_slot = if is_pinned {
+-                    end_slot_action = &TogglePinTab;
+-                    end_slot_tooltip_text = "Unpin Tab";
+                     IconButton::new("unpin tab", IconName::Pin)
+                         .shape(IconButtonShape::Square)
+                         .icon_color(Color::Muted)
+@@ -3048,49 +3095,83 @@ impl Pane {
+                         .on_click(cx.listener(move |pane, _, window, cx| {
+                             pane.unpin_tab_at(ix, window, cx);
+                         }))
++                        .tooltip(end_slot_tooltip("Unpin Tab", &TogglePinTab))
++                        .into_any_element()
+                 } else {
+-                    end_slot_action = &CloseActiveItem {
+-                        save_intent: None,
+-                        close_pinned: false,
+-                    };
+-                    end_slot_tooltip_text = "Close Tab";
+-                    match show_close_button {
+-                        ShowCloseButton::Always => IconButton::new("close tab", IconName::Close),
+-                        ShowCloseButton::Hover => {
+-                            IconButton::new("close tab", IconName::Close).visible_on_hover("")
+-                        }
+-                        ShowCloseButton::Hidden => return this,
++                    if *show_close_button == ShowCloseButton::Hidden && !is_dirty {
++                        return this;
+                     }
+-                    .shape(IconButtonShape::Square)
+-                    .icon_color(Color::Muted)
+-                    .size(ButtonSize::None)
+-                    .icon_size(IconSize::Small)
+-                    .on_click(cx.listener(move |pane, _, window, cx| {
+-                        pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
+-                            .detach_and_log_err(cx);
+-                    }))
+-                }
+-                .map(|this| {
+-                    if is_active {
+-                        let focus_handle = focus_handle.clone();
+-                        this.tooltip(move |window, cx| {
+-                            Tooltip::for_action_in(
+-                                end_slot_tooltip_text,
+-                                end_slot_action,
+-                                &window.focused(cx).unwrap_or_else(|| focus_handle.clone()),
+-                                cx,
+-                            )
+-                        })
++                    let colors = cx.theme().colors();
++                    let glyph_color = if is_active {
++                        colors.text
+                     } else {
+-                        this.tooltip(Tooltip::text(end_slot_tooltip_text))
+-                    }
+-                });
++                        colors.text_muted
++                    };
++                    let button_group = SharedString::from(format!("tab-close-{item_id}"));
++                    let glyph = |icon: IconName| {
++                        svg()
++                            .path(icon.path())
++                            .size(rems_from_vscode_px(16.))
++                            .flex_none()
++                            .text_color(glyph_color)
++                    };
++                    // VS Code's tab action: the close codicon in a 20 px button with a 4 px
++                    // radius, shown on the active tab and on hover, and replaced by a filled
++                    // circle while the file is modified unless the button itself is hovered.
++                    div()
++                        .id("close tab")
++                        .group(button_group.clone())
++                        .relative()
++                        .size(rems_from_vscode_px(20.))
++                        .flex()
++                        .flex_none()
++                        .items_center()
++                        .justify_center()
++                        .rounded(px(4.))
++                        .cursor_pointer()
++                        .hover(|style| style.bg(colors.toolbar_hover_background))
++                        .when(
++                            !is_active && !is_dirty && *show_close_button == ShowCloseButton::Hover,
++                            |this| this.visible_on_hover(""),
++                        )
++                        .map(|this| {
++                            if is_dirty {
++                                this.child(
++                                    glyph(IconName::TabDirty)
++                                        .absolute()
++                                        .group_hover(button_group.clone(), |style| {
++                                            style.invisible()
++                                        }),
++                                )
++                                .child(
++                                    glyph(IconName::TabClose)
++                                        .invisible()
++                                        .group_hover(button_group.clone(), |style| style.visible()),
++                                )
++                            } else {
++                                this.child(glyph(IconName::TabClose))
++                            }
++                        })
++                        .on_click(cx.listener(move |pane, _, window, cx| {
++                            pane.close_item_by_id(item_id, SaveIntent::Close, window, cx)
++                                .detach_and_log_err(cx);
++                        }))
++                        .tooltip(end_slot_tooltip(
++                            "Close Tab",
++                            &CloseActiveItem {
++                                save_intent: None,
++                                close_pinned: false,
++                            },
++                        ))
++                        .into_any_element()
++                };
+                 this.end_slot(end_slot)
+             })
+             .child(
+                 h_flex()
+                     .id(("pane-tab-content", ix))
+-                    .gap_1()
++                    // VS Code's file icons sit 6 px before the label.
++                    .gap(rems_from_vscode_px(6.))
+                     .children(if let Some(icon) = icon {
+                         Some(icon)
+                     } else if can_toggle_read_only && !capability.editable() {
+@@ -3605,6 +3686,17 @@ impl Pane {
+         }
+     }
+ 
++    /// VS Code shows the editor actions in its active group's tab bar only, even while the
++    /// focus is in a side bar.
++    fn shows_editor_actions(&self, window: &mut Window, cx: &mut Context<Pane>) -> bool {
++        self.has_focus(window, cx)
++            || self.context_menu_focused(window, cx)
++            || self
++                .workspace
++                .upgrade()
++                .is_some_and(|workspace| *workspace.read(cx).active_pane() == cx.entity())
++    }
++
+     fn configure_tab_bar_start(
+         &mut self,
+         tab_bar: TabBar,
+@@ -3613,7 +3705,15 @@ impl Pane {
+         window: &mut Window,
+         cx: &mut Context<Pane>,
+     ) -> TabBar {
++        // The toolbar's items on the right are the active editor's actions, which VS Code puts
++        // at the end of the tab bar, before the pane's own.
++        let toolbar_actions = if self.shows_editor_actions(window, cx) {
++            self.toolbar.read(cx).right_item_views()
++        } else {
++            Vec::new()
++        };
+         tab_bar
++            .end_children(toolbar_actions)
+             .when(
+                 self.display_nav_history_buttons.unwrap_or_default(),
+                 |tab_bar| {
+@@ -4351,7 +4451,7 @@ fn default_render_tab_bar_buttons(
+     window: &mut Window,
+     cx: &mut Context<Pane>,
+ ) -> (Option<AnyElement>, Option<AnyElement>) {
+-    if !pane.has_focus(window, cx) && !pane.context_menu_focused(window, cx) {
++    if !pane.shows_editor_actions(window, cx) {
+         return (None, None);
+     }
+     let (can_clone, can_split_move) = match pane.active_item() {
+@@ -4359,22 +4459,49 @@ fn default_render_tab_bar_buttons(
+         Some(_) => (false, pane.items_len() > 1),
+         None => (false, false),
+     };
+-    // Ideally we would return a vec of elements here to pass directly to the [TabBar]'s
+-    // `end_slot`, but due to needing a view here that isn't possible.
++    let split_mode = if can_split_move {
++        SplitMode::MovePane
++    } else {
++        SplitMode::default()
++    };
++    let zoomed = pane.is_zoomed();
++    let focus_handle = pane.focus_handle.clone();
++    // VS Code's editor actions end with Split Editor Right and More Actions. The menu holds what
++    // Zed's tab bar offers besides: new items, the other split directions and zoom.
+     let right_children = h_flex()
+-        // Instead we need to replicate the spacing from the [TabBar]'s `end_slot` here.
+-        .gap(DynamicSpacing::Base04.rems(cx))
++        .gap(rems_from_vscode_px(4.))
++        .child(
++            IconButton::new("split", IconName::EditorActionSplit)
++                .editor_action()
++                .disabled(!can_clone && !can_split_move)
++                .tooltip({
++                    let focus_handle = focus_handle.clone();
++                    move |_window, cx| {
++                        Tooltip::for_action_in(
++                            "Split Right",
++                            &SplitRight { mode: split_mode },
++                            &focus_handle,
++                            cx,
++                        )
++                    }
++                })
++                .on_click(cx.listener(move |pane, _, window, cx| {
++                    pane.split(SplitDirection::Right, split_mode, window, cx)
++                })),
++        )
+         .child(
+             PopoverMenu::new("pane-tab-bar-popover-menu")
+                 .trigger_with_tooltip(
+-                    IconButton::new("plus", IconName::Plus).icon_size(IconSize::Small),
+-                    Tooltip::text("New…"),
++                    IconButton::new("more", IconName::EditorActionMore).editor_action(),
++                    Tooltip::text("More Actions…"),
+                 )
+                 .anchor(Anchor::TopRight)
+                 .with_handle(pane.new_item_context_menu_handle.clone())
+                 .menu(move |window, cx| {
+-                    Some(ContextMenu::build(window, cx, |menu, _, _| {
+-                        menu.action("New File", NewFile.boxed_clone())
++                    let focus_handle = focus_handle.clone();
++                    Some(ContextMenu::build(window, cx, move |menu, _, _| {
++                        let menu = menu
++                            .action("New File", NewFile.boxed_clone())
+                             .action("Open File", ToggleFileFinder::default().boxed_clone())
+                             .separator()
+                             .action("Search Project", DeploySearch::default().boxed_clone())
+@@ -4384,55 +4511,27 @@ fn default_render_tab_bar_buttons(
+                             .action(
+                                 "New Center Terminal",
+                                 NewCenterTerminal::default().boxed_clone(),
+-                            )
+-                    }))
+-                }),
+-        )
+-        .child(
+-            PopoverMenu::new("pane-tab-bar-split")
+-                .trigger_with_tooltip(
+-                    IconButton::new("split", IconName::Split)
+-                        .icon_size(IconSize::Small)
+-                        .disabled(!can_clone && !can_split_move),
+-                    Tooltip::text("Split Pane"),
+-                )
+-                .anchor(Anchor::TopRight)
+-                .with_handle(pane.split_item_context_menu_handle.clone())
+-                .menu(move |window, cx| {
+-                    ContextMenu::build(window, cx, |menu, _, _| {
+-                        let mode = SplitMode::MovePane;
+-                        if can_split_move {
+-                            menu.action("Split Right", SplitRight { mode }.boxed_clone())
++                            );
++                        let menu = if can_clone || can_split_move {
++                            let mode = split_mode;
++                            menu.separator()
++                                .action("Split Right", SplitRight { mode }.boxed_clone())
+                                 .action("Split Left", SplitLeft { mode }.boxed_clone())
+                                 .action("Split Up", SplitUp { mode }.boxed_clone())
+                                 .action("Split Down", SplitDown { mode }.boxed_clone())
+                         } else {
+-                            menu.action("Split Right", SplitRight::default().boxed_clone())
+-                                .action("Split Left", SplitLeft::default().boxed_clone())
+-                                .action("Split Up", SplitUp::default().boxed_clone())
+-                                .action("Split Down", SplitDown::default().boxed_clone())
+-                        }
+-                    })
+-                    .into()
++                            menu
++                        };
++                        menu.separator()
++                            .action(
++                                if zoomed { "Zoom Out" } else { "Zoom In" },
++                                ToggleZoom.boxed_clone(),
++                            )
++                            // The pane may be the active one without having the focus.
++                            .context(focus_handle)
++                    }))
+                 }),
+         )
+-        .child({
+-            let zoomed = pane.is_zoomed();
+-            IconButton::new("toggle_zoom", IconName::Maximize)
+-                .icon_size(IconSize::Small)
+-                .toggle_state(zoomed)
+-                .selected_icon(IconName::Minimize)
+-                .on_click(cx.listener(|pane, _, window, cx| {
+-                    pane.toggle_zoom(&crate::ToggleZoom, window, cx);
+-                }))
+-                .tooltip(move |_window, cx| {
+-                    Tooltip::for_action(
+-                        if zoomed { "Zoom Out" } else { "Zoom In" },
+-                        &ToggleZoom,
+-                        cx,
+-                    )
+-                })
+-        })
+         .into_any_element()
+         .into();
+     (None, right_children)
+@@ -4458,6 +4557,9 @@ impl Render for Pane {
+ 
+         let should_display_tab_bar = self.should_display_tab_bar.clone();
+         let display_tab_bar = should_display_tab_bar(window, cx);
++        self.toolbar.update(cx, |toolbar, cx| {
++            toolbar.set_right_items_in_tab_bar(display_tab_bar, cx)
++        });
+         let Some(project) = self.project.upgrade() else {
+             return div().track_focus(&self.focus_handle(cx));
+         };
+@@ -5138,6 +5240,7 @@ impl Render for DraggedTab {
+                 .tab_icon_element(self.item.as_ref(), self.is_active, window, cx);
+         Tab::new("")
+             .toggle_state(self.is_active)
++            .starts_with_icon(icon.is_some())
+             .children(icon)
+             .child(label)
+             .render(window, cx)
+diff --git a/crates/workspace/src/persistence/model.rs b/crates/workspace/src/persistence/model.rs
+index 9483e5a..8d9b753 100644
+--- a/crates/workspace/src/persistence/model.rs
++++ b/crates/workspace/src/persistence/model.rs
+@@ -252,6 +252,108 @@ impl Default for SerializedPaneGroup {
+     }
+ }
+ 
++pub(crate) struct DeferredPaneRestore {
++    pane: WeakEntity<Pane>,
++    serialized: SerializedPane,
++    active_index: usize,
++    initial_preview_id: Option<gpui::EntityId>,
++}
++
++impl DeferredPaneRestore {
++    pub(crate) async fn finish(
++        self,
++        project: &Entity<Project>,
++        workspace_id: WorkspaceId,
++        workspace: WeakEntity<Workspace>,
++        cx: &mut AsyncWindowContext,
++    ) -> Result<Vec<Option<Box<dyn ItemHandle>>>> {
++        let mut item_tasks = Vec::new();
++        let mut task_indices = Vec::new();
++        let mut preview_item_index = None;
++        for (index, item) in self.serialized.children.iter().enumerate() {
++            if item.preview {
++                preview_item_index = Some(index);
++            }
++            if index == self.active_index {
++                continue;
++            }
++            let project = project.clone();
++            let task = self.pane.update_in(cx, |_, window, cx| {
++                SerializableItemRegistry::deserialize(
++                    &item.kind,
++                    project,
++                    workspace.clone(),
++                    workspace_id,
++                    item.item_id,
++                    window,
++                    cx,
++                )
++            })?;
++            item_tasks.push(task);
++            task_indices.push(index);
++        }
++
++        let results = futures::future::join_all(item_tasks).await;
++        let mut items = Vec::with_capacity(results.len());
++        let mut before_pinned = 0usize;
++        let mut before_inserted = 0usize;
++        let mut preview_item_id = None;
++
++        for (index, item_handle) in task_indices.into_iter().zip(results) {
++            let item_handle = item_handle.log_err();
++            if let Some(item_handle) = &item_handle {
++                let is_pinned = index < self.serialized.pinned_count;
++                let inserted = self.pane.update_in(cx, |pane, window, cx| {
++                    if let Some(restored_path) = item_handle.project_path(cx)
++                        && pane
++                            .items()
++                            .any(|existing| existing.project_path(cx).as_ref() == Some(&restored_path))
++                    {
++                        return false;
++                    }
++                    let dest = if is_pinned {
++                        if index < self.active_index {
++                            let pos = before_pinned.min(pane.pinned_count());
++                            before_pinned = pos + 1;
++                            before_inserted = before_inserted.max(before_pinned);
++                            pos
++                        } else {
++                            pane.pinned_count()
++                        }
++                    } else if index < self.active_index {
++                        let pos = before_inserted.max(pane.pinned_count());
++                        before_inserted = pos + 1;
++                        pos
++                    } else {
++                        pane.items_len()
++                    };
++                    pane.insert_restored_inactive_item(item_handle.clone(), dest, window, cx);
++                    if is_pinned {
++                        pane.set_pinned_count(pane.pinned_count() + 1);
++                    }
++                    true
++                })?;
++                if inserted && preview_item_index == Some(index) {
++                    preview_item_id = Some(item_handle.item_id());
++                }
++            }
++            items.push(item_handle);
++        }
++
++        if let Some(preview_item_id) = preview_item_id {
++            self.pane.update(cx, |pane, cx| {
++                // Only apply the restored inactive preview tab if the user hasn't
++                // changed preview state in the interim.
++                if pane.preview_item_id() == self.initial_preview_id {
++                    pane.set_preview_item_id(Some(preview_item_id), cx);
++                }
++            })?;
++        }
++
++        Ok(items)
++    }
++}
++
+ impl SerializedPaneGroup {
+     #[async_recursion(?Send)]
+     pub(crate) async fn deserialize(
+@@ -259,11 +361,13 @@ impl SerializedPaneGroup {
+         project: &Entity<Project>,
+         workspace_id: WorkspaceId,
+         workspace: WeakEntity<Workspace>,
++        defer_inactive: bool,
+         cx: &mut AsyncWindowContext,
+     ) -> Option<(
+         Member,
+         Option<Entity<Pane>>,
+         Vec<Option<Box<dyn ItemHandle>>>,
++        Vec<DeferredPaneRestore>,
+     )> {
+         match self {
+             SerializedPaneGroup::Group {
+@@ -274,13 +378,22 @@ impl SerializedPaneGroup {
+                 let mut current_active_pane = None;
+                 let mut members = Vec::new();
+                 let mut items = Vec::new();
+-                for child in children {
+-                    if let Some((new_member, active_pane, new_items)) = child
+-                        .deserialize(project, workspace_id, workspace.clone(), cx)
+-                        .await
+-                    {
++                let mut deferred = Vec::new();
++                let child_results = futures::future::join_all(children.into_iter().map(|child| {
++                    let workspace = workspace.clone();
++                    let mut cx = cx.clone();
++                    async move {
++                        child
++                            .deserialize(project, workspace_id, workspace, defer_inactive, &mut cx)
++                            .await
++                    }
++                }))
++                .await;
++                for result in child_results {
++                    if let Some((new_member, active_pane, new_items, new_deferred)) = result {
+                         members.push(new_member);
+                         items.extend(new_items);
++                        deferred.extend(new_deferred);
+                         current_active_pane = current_active_pane.or(active_pane);
+                     }
+                 }
+@@ -290,13 +403,14 @@ impl SerializedPaneGroup {
+                 }
+ 
+                 if members.len() == 1 {
+-                    return Some((members.remove(0), current_active_pane, items));
++                    return Some((members.remove(0), current_active_pane, items, deferred));
+                 }
+ 
+                 Some((
+                     Member::Axis(PaneAxis::load(axis.0, members, flexes)),
+                     current_active_pane,
+                     items,
++                    deferred,
+                 ))
+             }
+             SerializedPaneGroup::Pane(serialized_pane) => {
+@@ -306,11 +420,28 @@ impl SerializedPaneGroup {
+                     })
+                     .log_err()?;
+                 let active = serialized_pane.active;
+-                let new_items = serialized_pane
+-                    .deserialize_to(project, &pane, workspace_id, workspace.clone(), cx)
+-                    .await
+-                    .context("Could not deserialize pane)")
+-                    .log_err()?;
++                let (new_items, deferred_pane) = if defer_inactive
++                    && serialized_pane.children.len() > 1
++                {
++                    serialized_pane
++                        .deserialize_active_first_to(
++                            project,
++                            &pane,
++                            workspace_id,
++                            workspace.clone(),
++                            cx,
++                        )
++                        .await
++                        .context("Could not deserialize pane)")
++                        .log_err()?
++                } else {
++                    let items = serialized_pane
++                        .deserialize_to(project, &pane, workspace_id, workspace.clone(), cx)
++                        .await
++                        .context("Could not deserialize pane)")
++                        .log_err()?;
++                    (items, None)
++                };
+ 
+                 if pane
+                     .read_with(cx, |pane, _| pane.items_len() != 0)
+@@ -321,6 +452,7 @@ impl SerializedPaneGroup {
+                         Member::Pane(pane.clone()),
+                         active.then_some(pane),
+                         new_items,
++                        deferred_pane.into_iter().collect(),
+                     ))
+                 } else {
+                     let pane = pane.upgrade()?;
+@@ -352,6 +484,62 @@ impl SerializedPane {
+         }
+     }
+ 
++    pub(crate) async fn deserialize_active_first_to(
++        &self,
++        project: &Entity<Project>,
++        pane: &WeakEntity<Pane>,
++        workspace_id: WorkspaceId,
++        workspace: WeakEntity<Workspace>,
++        cx: &mut AsyncWindowContext,
++    ) -> Result<(Vec<Option<Box<dyn ItemHandle>>>, Option<DeferredPaneRestore>)> {
++        let active_index = self
++            .children
++            .iter()
++            .position(|item| item.active)
++            .unwrap_or(self.children.len() - 1);
++        let active_serialized = &self.children[active_index];
++        let active_task = pane.update_in(cx, |_, window, cx| {
++            SerializableItemRegistry::deserialize(
++                &active_serialized.kind,
++                project.clone(),
++                workspace.clone(),
++                workspace_id,
++                active_serialized.item_id,
++                window,
++                cx,
++            )
++        })?;
++
++        if let Some(active_handle) = active_task.await.log_err() {
++            pane.update_in(cx, |pane, window, cx| {
++                pane.add_item(active_handle.clone(), true, true, None, window, cx);
++                if active_serialized.preview {
++                    pane.set_preview_item_id(Some(active_handle.item_id()), cx);
++                }
++                if active_index < self.pinned_count {
++                    pane.set_pinned_count(1);
++                }
++            })?;
++            let initial_preview_id = active_serialized.preview.then_some(active_handle.item_id());
++            return Ok((
++                vec![Some(active_handle)],
++                Some(DeferredPaneRestore {
++                    pane: pane.clone(),
++                    serialized: self.clone(),
++                    active_index,
++                    initial_preview_id,
++                }),
++            ));
++        }
++
++        // If the active tab failed to restore (e.g., deleted file), fall back to
++        // eagerly restoring the pane's remaining tabs so the pane isn't dropped empty.
++        let items = self
++            .deserialize_to(project, pane, workspace_id, workspace, cx)
++            .await?;
++        Ok((items, None))
++    }
++
+     pub async fn deserialize_to(
+         &self,
+         project: &Entity<Project>,
+diff --git a/crates/workspace/src/toolbar.rs b/crates/workspace/src/toolbar.rs
+index b14775f..10fec03 100644
+--- a/crates/workspace/src/toolbar.rs
++++ b/crates/workspace/src/toolbar.rs
+@@ -38,6 +38,12 @@ pub trait ToolbarItemView: Render + EventEmitter<ToolbarItemEvent> {
+     }
+ 
+     fn contribute_context(&self, _context: &mut KeyContext, _cx: &App) {}
++
++    /// Whether the item is the breadcrumbs, which VS Code shows in a bar of their own under the
++    /// tabs rather than in a toolbar row.
++    fn is_breadcrumbs(&self) -> bool {
++        false
++    }
+ }
+ 
+ trait ToolbarItemViewHandle: Send {
+@@ -51,6 +57,7 @@ trait ToolbarItemViewHandle: Send {
+     ) -> ToolbarItemLocation;
+     fn focus_changed(&mut self, pane_focused: bool, window: &mut Window, cx: &mut App);
+     fn contribute_context(&self, context: &mut KeyContext, cx: &App);
++    fn is_breadcrumbs(&self, cx: &App) -> bool;
+ }
+ 
+ #[derive(Copy, Clone, Debug, PartialEq)]
+@@ -65,14 +72,17 @@ pub struct Toolbar {
+     active_item: Option<Box<dyn ItemHandle>>,
+     hidden: bool,
+     can_navigate: bool,
++    right_items_in_tab_bar: bool,
+     items: Vec<(Box<dyn ToolbarItemViewHandle>, ToolbarItemLocation)>,
+ }
+ 
+ impl Toolbar {
+     fn has_any_visible_items(&self) -> bool {
+-        self.items
+-            .iter()
+-            .any(|(_item, location)| *location != ToolbarItemLocation::Hidden)
++        self.items.iter().any(|(_item, location)| match location {
++            ToolbarItemLocation::Hidden => false,
++            ToolbarItemLocation::PrimaryRight => !self.right_items_in_tab_bar,
++            ToolbarItemLocation::PrimaryLeft | ToolbarItemLocation::Secondary => true,
++        })
+     }
+ 
+     fn left_items(&self) -> impl Iterator<Item = &dyn ToolbarItemViewHandle> {
+@@ -115,7 +125,36 @@ impl Render for Toolbar {
+         let secondary_items = self.secondary_items().map(|item| item.to_any());
+ 
+         let has_left_items = self.left_items().count() > 0;
+-        let has_right_items = self.right_items().count() > 0;
++        let has_right_items = !self.right_items_in_tab_bar && self.right_items().count() > 0;
++
++        // VS Code's breadcrumbs bar: 22 px, flush with the editor's sides, with no line under it.
++        if has_left_items
++            && !has_right_items
++            && self.left_items().all(|item| item.is_breadcrumbs(cx))
++        {
++            let has_secondary_items = self.secondary_items().next().is_some();
++            return v_flex()
++                .group("toolbar")
++                .relative()
++                .bg(cx.theme().colors().toolbar_background)
++                .child(
++                    h_flex()
++                        .h(rems_from_vscode_px(22.))
++                        .overflow_x_hidden()
++                        .children(self.left_items().map(|item| item.to_any())),
++                )
++                .when(has_secondary_items, |this| {
++                    this.child(
++                        v_flex()
++                            .py(DynamicSpacing::Base06.rems(cx))
++                            .px(DynamicSpacing::Base08.rems(cx))
++                            .gap(DynamicSpacing::Base06.rems(cx))
++                            .border_b_1()
++                            .border_color(cx.theme().colors().border_variant)
++                            .children(secondary_items),
++                    )
++                });
++        }
+ 
+         v_flex()
+             .group("toolbar")
+@@ -173,9 +212,29 @@ impl Toolbar {
+             items: Default::default(),
+             hidden: false,
+             can_navigate: true,
++            right_items_in_tab_bar: false,
+         }
+     }
+ 
++    /// Lets the pane show the items on the right among its tab bar's actions, where VS Code
++    /// puts an editor's actions, while it shows a tab bar.
++    pub fn set_right_items_in_tab_bar(&mut self, in_tab_bar: bool, cx: &mut Context<Self>) {
++        if self.right_items_in_tab_bar != in_tab_bar {
++            self.right_items_in_tab_bar = in_tab_bar;
++            cx.notify();
++        }
++    }
++
++    /// The items on the right, in the order they appear from left to right.
++    pub fn right_item_views(&self) -> Vec<AnyView> {
++        let mut views = self
++            .right_items()
++            .map(|item| item.to_any())
++            .collect::<Vec<_>>();
++        views.reverse();
++        views
++    }
++
+     pub fn set_can_navigate(&mut self, can_navigate: bool, cx: &mut Context<Self>) {
+         self.can_navigate = can_navigate;
+         cx.notify();
+@@ -284,4 +343,8 @@ impl<T: ToolbarItemView> ToolbarItemViewHandle for Entity<T> {
+     fn contribute_context(&self, context: &mut KeyContext, cx: &App) {
+         self.read(cx).contribute_context(context, cx)
+     }
++
++    fn is_breadcrumbs(&self, cx: &App) -> bool {
++        self.read(cx).is_breadcrumbs()
++    }
+ }
+diff --git a/crates/workspace/src/workspace.rs b/crates/workspace/src/workspace.rs
+index 0bddb8a..5ec4d04 100644
+--- a/crates/workspace/src/workspace.rs
++++ b/crates/workspace/src/workspace.rs
+@@ -48,7 +48,15 @@ use client::{
+     proto::{self, ErrorCode, PanelId, PeerId},
+ };
+ use collections::{HashMap, HashSet, TypeIdHashMap, hash_map};
+-use dock::{Dock, DockPosition, PanelButtons, PanelHandle, RESIZE_HANDLE_SIZE};
++use dock::{
++    ACTIVITY_BAR_WIDTH, ActivityBar, Dock, DockPosition, PanelButtons, PanelHandle,
++    RESIZE_HANDLE_SIZE,
++};
++
++/// VS Code's floating panels: 4 px (--vscode-panels-spacing) between the parts and from the
++/// window's sides and the status bar, each part rounded by --vscode-cornerRadius-large.
++const CARD_GAP: Pixels = px(4.);
++const CARD_RADIUS: Pixels = px(8.);
+ use fs::Fs;
+ use futures::{
+     Future, FutureExt, StreamExt,
+@@ -1660,6 +1668,7 @@ pub struct Workspace {
+     maximized_pane: Option<WeakEntity<Pane>>,
+     center: PaneGroup,
+     left_dock: Entity<Dock>,
++    activity_bar: Entity<ActivityBar>,
+     bottom_dock: Entity<Dock>,
+     right_dock: Entity<Dock>,
+     panes: Vec<Entity<Pane>>,
+@@ -2046,7 +2055,7 @@ impl Workspace {
+         let left_dock = Dock::new(DockPosition::Left, modal_layer.clone(), window, cx);
+         let bottom_dock = Dock::new(DockPosition::Bottom, modal_layer.clone(), window, cx);
+         let right_dock = Dock::new(DockPosition::Right, modal_layer.clone(), window, cx);
+-        let left_dock_buttons = cx.new(|cx| PanelButtons::new(left_dock.clone(), cx));
++        let activity_bar = cx.new(|cx| ActivityBar::new(left_dock.clone(), cx));
+         let bottom_dock_buttons = cx.new(|cx| PanelButtons::new(bottom_dock.clone(), cx));
+         let right_dock_buttons = cx.new(|cx| PanelButtons::new(right_dock.clone(), cx));
+         let multi_workspace = window
+@@ -2056,7 +2065,6 @@ impl Workspace {
+         let status_bar = cx.new(|cx| {
+             let mut status_bar =
+                 StatusBar::new(&center_pane.clone(), multi_workspace.clone(), window, cx);
+-            status_bar.add_left_item(left_dock_buttons, window, cx);
+             status_bar.add_right_item(right_dock_buttons, window, cx);
+             status_bar.add_right_item(bottom_dock_buttons, window, cx);
+             status_bar
+@@ -2182,6 +2190,7 @@ impl Workspace {
+             notifications: Notifications::default(),
+             suppressed_notifications: HashSet::default(),
+             left_dock,
++            activity_bar,
+             bottom_dock,
+             right_dock,
+             _panels_task: None,
+@@ -2261,14 +2270,13 @@ impl Workspace {
+         let db = WorkspaceDb::global(cx);
+         let kvp = db::kvp::KeyValueStore::global(cx);
+         cx.spawn(async move |cx| {
+-            let mut paths_to_open = Vec::with_capacity(abs_paths.len());
+-            for path in abs_paths.into_iter() {
+-                if let Some(canonical) = app_state.fs.canonicalize(&path).await.ok() {
+-                    paths_to_open.push(canonical)
+-                } else {
+-                    paths_to_open.push(path)
+-                }
+-            }
++            let mut paths_to_open: Vec<PathBuf> = futures::future::join_all(
++                abs_paths.into_iter().map(|path| {
++                    let fs = app_state.fs.clone();
++                    async move { fs.canonicalize(&path).await.unwrap_or(path) }
++                }),
++            )
++            .await;
+ 
+             let serialized_workspace = db.workspace_for_roots(paths_to_open.as_slice());
+ 
+@@ -2276,23 +2284,29 @@ impl Workspace {
+                 paths_to_open = paths.ordered_paths().cloned().collect();
+             }
+ 
+-            // Get project paths for all of the abs_paths
+-            let mut project_paths: Vec<(PathBuf, Option<ProjectPath>)> =
+-                Vec::with_capacity(paths_to_open.len());
+-
+-            for path in paths_to_open.into_iter() {
+-                if let Some((_, project_entry)) = cx
+-                    .update(|cx| {
+-                        Workspace::project_path_for_path(project_handle.clone(), &path, true, cx)
++            // Get project paths for all of the abs_paths in parallel so multi-root
++            // workspaces do not serialize worktree setup before opening the window.
++            let project_path_tasks = cx.update(|cx| {
++                paths_to_open
++                    .into_iter()
++                    .map(|path| {
++                        let task = Workspace::project_path_for_path(
++                            project_handle.clone(),
++                            &path,
++                            true,
++                            cx,
++                        );
++                        (path, task)
+                     })
+-                    .await
+-                    .log_err()
+-                {
+-                    project_paths.push((path, Some(project_entry)));
+-                } else {
+-                    project_paths.push((path, None));
+-                }
+-            }
++                    .collect::<Vec<_>>()
++            });
++            let project_paths: Vec<(PathBuf, Option<ProjectPath>)> = futures::future::join_all(
++                project_path_tasks.into_iter().map(|(path, task)| async move {
++                    let project_entry = task.await.log_err().map(|(_, entry)| entry);
++                    (path, project_entry)
++                }),
++            )
++            .await;
+ 
+             let workspace_id = if let Some(serialized_workspace) = serialized_workspace.as_ref() {
+                 serialized_workspace.id
+@@ -2300,42 +2314,9 @@ impl Workspace {
+                 db.next_id().await.unwrap_or_else(|_| Default::default())
+             };
+ 
+-            let toolchains = db.toolchains(workspace_id).await?;
+-
+-            for (toolchain, worktree_path, path) in toolchains {
+-                let toolchain_path = PathBuf::from(toolchain.path.clone().to_string());
+-                let Some(worktree_id) = project_handle.read_with(cx, |this, cx| {
+-                    this.find_worktree(&worktree_path, cx)
+-                        .and_then(|(worktree, rel_path)| {
+-                            if rel_path.is_empty() {
+-                                Some(worktree.read(cx).id())
+-                            } else {
+-                                None
+-                            }
+-                        })
+-                }) else {
+-                    // We did not find a worktree with a given path, but that's whatever.
+-                    continue;
+-                };
+-                if !app_state.fs.is_file(toolchain_path.as_path()).await {
+-                    continue;
+-                }
+-
+-                project_handle
+-                    .update(cx, |this, cx| {
+-                        this.activate_toolchain(ProjectPath { worktree_id, path }, toolchain, cx)
+-                    })
+-                    .await;
+-            }
+-            if let Some(workspace) = serialized_workspace.as_ref() {
+-                project_handle.update(cx, |this, cx| {
+-                    for (scope, toolchains) in &workspace.user_toolchains {
+-                        for toolchain in toolchains {
+-                            this.add_toolchain(toolchain.clone(), scope.clone(), cx);
+-                        }
+-                    }
+-                });
+-            }
++            let user_toolchains = serialized_workspace
++                .as_ref()
++                .map(|workspace| workspace.user_toolchains.clone());
+ 
+             let window_to_replace = match open_mode {
+                 OpenMode::NewWindow => None,
+@@ -2441,6 +2422,56 @@ impl Workspace {
+                     (window, workspace)
+                 };
+ 
++            // Load and activate saved toolchains asynchronously after the window has
++            // opened so slow SQLite/filesystem checks never delay first paint.
++            cx.spawn({
++                let db = db.clone();
++                let app_state = app_state.clone();
++                let project_handle = project_handle.clone();
++                async move |cx| {
++                    if let Some(toolchains) = db.toolchains(workspace_id).await.log_err() {
++                        for (toolchain, worktree_path, path) in toolchains {
++                            let toolchain_path = PathBuf::from(toolchain.path.clone().to_string());
++                            let Some(worktree_id) = project_handle.read_with(cx, |this, cx| {
++                                this.find_worktree(&worktree_path, cx).and_then(
++                                    |(worktree, rel_path)| {
++                                        if rel_path.is_empty() {
++                                            Some(worktree.read(cx).id())
++                                        } else {
++                                            None
++                                        }
++                                    },
++                                )
++                            }) else {
++                                continue;
++                            };
++                            if !app_state.fs.is_file(toolchain_path.as_path()).await {
++                                continue;
++                            }
++                            project_handle
++                                .update(cx, |this, cx| {
++                                    this.activate_toolchain(
++                                        ProjectPath { worktree_id, path },
++                                        toolchain,
++                                        cx,
++                                    )
++                                })
++                                .await;
++                        }
++                    }
++                    if let Some(user_toolchains) = user_toolchains {
++                        project_handle.update(cx, |this, cx| {
++                            for (scope, toolchains) in &user_toolchains {
++                                for toolchain in toolchains {
++                                    this.add_toolchain(toolchain.clone(), scope.clone(), cx);
++                                }
++                            }
++                        });
++                    }
++                }
++            })
++            .detach();
++
+             notify_if_database_failed(window, cx);
+             #[cfg(target_os = "windows")]
+             if let Some(wsl_path) = wsl_path {
+@@ -8004,6 +8035,9 @@ impl Workspace {
+     }
+ 
+     fn serialize_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
++        if self.restoring_workspace {
++            return;
++        }
+         if self._schedule_serialize_workspace.is_none() {
+             self._schedule_serialize_workspace =
+                 Some(cx.spawn_in(window, async move |this, cx| {
+@@ -8021,6 +8055,9 @@ impl Workspace {
+     }
+ 
+     fn serialize_workspace_internal(&self, window: &mut Window, cx: &mut App) -> Task<()> {
++        if self.restoring_workspace {
++            return Task::ready(());
++        }
+         let Some(database_id) = self.database_id() else {
+             return Task::ready(());
+         };
+@@ -8218,16 +8255,36 @@ impl Workspace {
+ 
+             let mut center_group = None;
+             let mut center_items = None;
++            let mut deferred_panes = Vec::new();
++            let defer_inactive = !cfg!(test)
++                && cx
++                    .update(|_, cx| {
++                        should_defer_inactive_tabs(&paths_to_open, project.read(cx), cx)
++                    })
++                    .unwrap_or(false);
+ 
+-            // Traverse the splits tree and add to things
+-            if let Some((group, active_pane, items)) = serialized_workspace
++            // Traverse the splits tree in parallel, restoring only the active tab per
++            // pane before Draw 1 when no explicit file paths need deduplication.
++            if let Some((group, active_pane, items, deferred)) = serialized_workspace
+                 .center_group
+-                .deserialize(&project, serialized_workspace.id, workspace.clone(), cx)
++                .deserialize(
++                    &project,
++                    serialized_workspace.id,
++                    workspace.clone(),
++                    defer_inactive,
++                    cx,
++                )
+                 .await
+             {
+                 center_items = Some(items);
+-                center_group = Some((group, active_pane))
++                center_group = Some((group, active_pane));
++                deferred_panes = deferred;
+             }
++            let has_deferred_panes = !deferred_panes.is_empty();
++            log::info!(
++                "workspace restore: defer_inactive={defer_inactive}, deferred_panes={}",
++                deferred_panes.len()
++            );
+ 
+             let mut items_by_project_path = HashMap::default();
+             let mut item_ids_by_kind = HashMap::default();
+@@ -8288,62 +8345,133 @@ impl Workspace {
+                     });
+                 }
+ 
+-                workspace.restoring_workspace = false;
++                if !has_deferred_panes {
++                    workspace.restoring_workspace = false;
++                }
+                 cx.notify();
+             })?;
+ 
+-            project
+-                .update(cx, |project, cx| {
+-                    project.bookmark_store().update(cx, |bookmark_store, cx| {
+-                        bookmark_store.load_serialized_bookmarks(serialized_workspace.bookmarks, cx)
+-                    })
+-                })
+-                .await
+-                .log_err();
++            let workspace_for_finish = workspace.clone();
++            let finish_workspace_restore = async move |mut item_ids_by_kind: HashMap<&'static str, Vec<ItemId>>,
++                                                       mut cx: AsyncWindowContext| -> Result<()> {
++                let workspace = workspace_for_finish;
++                if !deferred_panes.is_empty() {
++                    // Yield one frame so Draw 1 renders the active tab before loading
++                    // inactive tabs in the background. Also fall back to a short timer
++                    // in case the window is launched occluded and doesn't tick vsync.
++                    let (frame_tx, frame_rx) = futures::channel::oneshot::channel::<()>();
++                    let _ = workspace.update_in(&mut cx, |_, window, _| {
++                        window.on_next_frame(|_, _| {
++                            let _ = frame_tx.send(());
++                        });
++                    });
++                    let fallback = cx.background_executor().timer(Duration::from_millis(120));
++                    futures::future::select(frame_rx, fallback).await;
++
++                    let extra_items = futures::future::join_all(deferred_panes.into_iter().map(
++                        |deferred| {
++                            let project = project.clone();
++                            let workspace = workspace.clone();
++                            let mut cx = cx.clone();
++                            async move {
++                                deferred
++                                    .finish(&project, serialized_workspace.id, workspace, &mut cx)
++                                    .await
++                                    .log_err()
++                                    .unwrap_or_default()
++                            }
++                        },
++                    ))
++                    .await;
+ 
+-            let _ = project
+-                .update(cx, |project, cx| {
+-                    project
+-                        .breakpoint_store()
+-                        .update(cx, |breakpoint_store, cx| {
+-                            breakpoint_store
+-                                .with_serialized_breakpoints(serialized_workspace.breakpoints, cx)
++                    cx.update(|_, cx| {
++                        for item in extra_items.into_iter().flatten().flatten() {
++                            if let Some(serializable_item_handle) =
++                                item.to_serializable_item_handle(cx)
++                            {
++                                item_ids_by_kind
++                                    .entry(serializable_item_handle.serialized_item_kind())
++                                    .or_insert(Vec::new())
++                                    .push(item.item_id().as_u64() as ItemId);
++                            }
++                        }
++                    })?;
++                }
++
++                project
++                    .update(&mut cx, |project, cx| {
++                        project.bookmark_store().update(cx, |bookmark_store, cx| {
++                            bookmark_store
++                                .load_serialized_bookmarks(serialized_workspace.bookmarks, cx)
+                         })
+-                })
+-                .await;
++                    })
++                    .await
++                    .log_err();
+ 
+-            // Clean up all the items that have _not_ been loaded. Our ItemIds aren't stable. That means
+-            // after loading the items, we might have different items and in order to avoid
+-            // the database filling up, we delete items that haven't been loaded now.
+-            //
+-            // The items that have been loaded, have been saved after they've been added to the workspace.
+-            let clean_up_tasks = workspace.update_in(cx, |_, window, cx| {
+-                item_ids_by_kind
+-                    .into_iter()
+-                    .map(|(item_kind, loaded_items)| {
+-                        SerializableItemRegistry::cleanup(
+-                            item_kind,
+-                            serialized_workspace.id,
+-                            loaded_items,
+-                            window,
+-                            cx,
+-                        )
+-                        .log_err()
++                let _ = project
++                    .update(&mut cx, |project, cx| {
++                        project
++                            .breakpoint_store()
++                            .update(cx, |breakpoint_store, cx| {
++                                breakpoint_store.with_serialized_breakpoints(
++                                    serialized_workspace.breakpoints,
++                                    cx,
++                                )
++                            })
+                     })
+-                    .collect::<Vec<_>>()
+-            })?;
++                    .await;
+ 
+-            futures::future::join_all(clean_up_tasks).await;
++                // Clean up all the items that have _not_ been loaded. Our ItemIds aren't stable. That means
++                // after loading the items, we might have different items and in order to avoid
++                // the database filling up, we delete items that haven't been loaded now.
++                //
++                // The items that have been loaded, have been saved after they've been added to the workspace.
++                let clean_up_tasks = workspace.update_in(&mut cx, |_, window, cx| {
++                    item_ids_by_kind
++                        .into_iter()
++                        .map(|(item_kind, loaded_items)| {
++                            SerializableItemRegistry::cleanup(
++                                item_kind,
++                                serialized_workspace.id,
++                                loaded_items,
++                                window,
++                                cx,
++                            )
++                            .log_err()
++                        })
++                        .collect::<Vec<_>>()
++                })?;
+ 
+-            workspace
+-                .update_in(cx, |workspace, window, cx| {
+-                    // Serialize ourself to make sure our timestamps and any pane / item changes are replicated
+-                    workspace.serialize_workspace_internal(window, cx).detach();
++                futures::future::join_all(clean_up_tasks).await;
+ 
+-                    // Ensure that we mark the window as edited if we did load dirty items
+-                    workspace.update_window_edited(window, cx);
+-                })
+-                .ok();
++                workspace
++                    .update_in(&mut cx, |workspace, window, cx| {
++                        workspace.restoring_workspace = false;
++
++                        // Serialize ourself to make sure our timestamps and any pane / item changes are replicated
++                        workspace.serialize_workspace_internal(window, cx).detach();
++
++                        // Ensure that we mark the window as edited if we did load dirty items
++                        workspace.update_window_edited(window, cx);
++                    })
++                    .log_err();
++
++                Ok(())
++            };
++
++            if defer_inactive {
++                let _ = workspace.update_in(cx, |_, window, cx| {
++                    window
++                        .spawn(cx, async move |cx| {
++                            finish_workspace_restore(item_ids_by_kind, cx.clone())
++                                .await
++                                .log_err();
++                        })
++                        .detach();
++                });
++            } else {
++                finish_workspace_restore(item_ids_by_kind, cx.clone()).await?;
++            }
+ 
+             Ok(opened_items)
+         })
+@@ -9217,11 +9345,95 @@ impl Workspace {
+     /// focusing it announces "Editor" instead of falling back to the whole
+     /// window. We only make it focusable in that case so it never adds a hitbox
+     /// or intercepts mouse focus for other users.
++    /// A part of VS Code's floating layout: an 8 px radius and an outline one device pixel wide
++    /// (its --modern-ui-floating-card-stroke-width). GPUI only clips to rectangles, so the
++    /// shell's colour is painted over the corners outside the radius (a border as wide as the
++    /// gap around the card), and the outline over that.
++    fn card(content: impl IntoElement, window: &Window, cx: &App) -> Div {
++        let colors = cx.theme().colors();
++        div()
++            .relative()
++            .flex()
++            .child(content)
++            .child(
++                div()
++                    .absolute()
++                    .top(-CARD_GAP)
++                    .bottom(-CARD_GAP)
++                    .left(-CARD_GAP)
++                    .right(-CARD_GAP)
++                    .border(CARD_GAP)
++                    .border_color(colors.background)
++                    .rounded(CARD_RADIUS + CARD_GAP),
++            )
++            .child(
++                div()
++                    .absolute()
++                    .inset_0()
++                    .border(px(1.) / window.scale_factor())
++                    .border_color(colors.border)
++                    .rounded(CARD_RADIUS),
++            )
++    }
++
++    /// The activity bar and the left dock share a card, as VS Code's activity bar and sidebar do.
++    fn render_left_card(&self, window: &mut Window, cx: &mut App) -> impl IntoElement {
++        Self::card(
++            // Not h_flex: centred items would leave the dock without a height.
++            div()
++                .flex()
++                .h_full()
++                .child(self.activity_bar.clone())
++                .children(self.render_dock(DockPosition::Left, &self.left_dock, window, cx)),
++            window,
++            cx,
++        )
++        .h_full()
++        .flex_none()
++        .mr(CARD_GAP)
++    }
++
++    /// A closed dock stays in the tree, unsized, so its focus handle stays mounted; only an
++    /// open one becomes a card.
++    fn render_dock_card(
++        &self,
++        position: DockPosition,
++        dock: &Entity<Dock>,
++        window: &mut Window,
++        cx: &mut App,
++    ) -> Option<AnyElement> {
++        let element = self.render_dock(position, dock, window, cx)?;
++        if dock.read(cx).visible_panel().is_none() {
++            return Some(element.into_any_element());
++        }
++        Some(
++            Self::card(element, window, cx)
++                .map(|card| match position {
++                    DockPosition::Left => card.mr(CARD_GAP),
++                    DockPosition::Right => card.ml(CARD_GAP),
++                    DockPosition::Bottom => card.mt(CARD_GAP),
++                })
++                .into_any_element(),
++        )
++    }
++
+     fn render_center(
+         &self,
+         render_cx: &PaneRenderContext,
+         window: &mut Window,
+         cx: &mut App,
++    ) -> impl IntoElement {
++        let region = self
++            .render_center_region(render_cx, window, cx)
++            .into_any_element();
++        Self::card(region, window, cx).size_full()
++    }
++
++    fn render_center_region(
++        &self,
++        render_cx: &PaneRenderContext,
++        window: &mut Window,
++        cx: &mut App,
+     ) -> impl IntoElement {
+         div()
+             .id("editor-region")
+@@ -9612,6 +9824,19 @@ fn window_bounds_env_override() -> Option<Bounds<Pixels>> {
+         })
+ }
+ 
++fn should_defer_inactive_tabs(
++    paths_to_open: &[Option<ProjectPath>],
++    project: &Project,
++    cx: &App,
++) -> bool {
++    paths_to_open.iter().flatten().all(|path| {
++        path.path.is_empty()
++            && project
++                .worktree_for_id(path.worktree_id, cx)
++                .is_some_and(|worktree| !worktree.read(cx).is_single_file())
++    })
++}
++
+ fn open_items(
+     serialized_workspace: Option<SerializedWorkspace>,
+     mut project_paths_to_open: Vec<(PathBuf, Option<ProjectPath>)>,
+@@ -10034,9 +10259,8 @@ impl Render for Workspace {
+                             .flex()
+                             .flex_col()
+                             .overflow_hidden()
+-                            .border_t_1()
+-                            .border_b_1()
+-                            .border_color(colors.border)
++                            .px(CARD_GAP)
++                            .pb(CARD_GAP)
+                             .child({
+                                 let this = cx.entity();
+                                 canvas(
+@@ -10090,7 +10314,10 @@ impl Render for Workspace {
+                                                 DockPosition::Left => {
+                                                     workspace.resize_left_dock(
+                                                         e.event.position.x
+-                                                            - workspace.bounds.left(),
++                                                            - workspace.bounds.left()
++                                                            - CARD_GAP
++                                                            - ACTIVITY_BAR_WIDTH
++                                                                .to_pixels(window.rem_size()),
+                                                         window,
+                                                         cx,
+                                                     );
+@@ -10098,6 +10325,7 @@ impl Render for Workspace {
+                                                 DockPosition::Right => {
+                                                     workspace.resize_right_dock(
+                                                         workspace.bounds.right()
++                                                            - CARD_GAP
+                                                             - e.event.position.x,
+                                                         window,
+                                                         cx,
+@@ -10106,6 +10334,7 @@ impl Render for Workspace {
+                                                 DockPosition::Bottom => {
+                                                     workspace.resize_bottom_dock(
+                                                         workspace.bounds.bottom()
++                                                            - CARD_GAP
+                                                             - e.event.position.y,
+                                                         window,
+                                                         cx,
+@@ -10129,12 +10358,7 @@ impl Render for Workspace {
+                                                 .flex_row()
+                                                 .flex_1()
+                                                 .overflow_hidden()
+-                                                .children(self.render_dock(
+-                                                    DockPosition::Left,
+-                                                    &self.left_dock,
+-                                                    window,
+-                                                    cx,
+-                                                ))
++                                                .child(self.render_left_card(window, cx))
+                                                 .child(
+                                                     div()
+                                                         .flex()
+@@ -10163,14 +10387,14 @@ impl Render for Workspace {
+                                                                 ),
+                                                         ),
+                                                 )
+-                                                .children(self.render_dock(
++                                                .children(self.render_dock_card(
+                                                     DockPosition::Right,
+                                                     &self.right_dock,
+                                                     window,
+                                                     cx,
+                                                 )),
+                                         )
+-                                        .child(div().w_full().children(self.render_dock(
++                                        .child(div().w_full().children(self.render_dock_card(
+                                             DockPosition::Bottom,
+                                             &self.bottom_dock,
+                                             window,
+@@ -10192,12 +10416,7 @@ impl Render for Workspace {
+                                                         .flex()
+                                                         .flex_row()
+                                                         .flex_1()
+-                                                        .children(self.render_dock(
+-                                                            DockPosition::Left,
+-                                                            &self.left_dock,
+-                                                            window,
+-                                                            cx,
+-                                                        ))
++                                                        .child(self.render_left_card(window, cx))
+                                                         .child(
+                                                             div()
+                                                                 .flex()
+@@ -10231,14 +10450,16 @@ impl Render for Workspace {
+                                                                 ),
+                                                         ),
+                                                 )
+-                                                .child(div().w_full().children(self.render_dock(
+-                                                    DockPosition::Bottom,
+-                                                    &self.bottom_dock,
+-                                                    window,
+-                                                    cx,
+-                                                ))),
++                                                .child(div().w_full().children(
++                                                    self.render_dock_card(
++                                                        DockPosition::Bottom,
++                                                        &self.bottom_dock,
++                                                        window,
++                                                        cx,
++                                                    ),
++                                                )),
+                                         )
+-                                        .children(self.render_dock(
++                                        .children(self.render_dock_card(
+                                             DockPosition::Right,
+                                             &self.right_dock,
+                                             window,
+@@ -10248,12 +10469,7 @@ impl Render for Workspace {
+                                         .flex()
+                                         .flex_row()
+                                         .h_full()
+-                                        .children(self.render_dock(
+-                                            DockPosition::Left,
+-                                            &self.left_dock,
+-                                            window,
+-                                            cx,
+-                                        ))
++                                        .child(self.render_left_card(window, cx))
+                                         .child(
+                                             div()
+                                                 .flex()
+@@ -10297,30 +10513,27 @@ impl Render for Workspace {
+                                                                         ),
+                                                                 ),
+                                                         )
+-                                                        .children(self.render_dock(
++                                                        .children(self.render_dock_card(
+                                                             DockPosition::Right,
+                                                             &self.right_dock,
+                                                             window,
+                                                             cx,
+                                                         )),
+                                                 )
+-                                                .child(div().w_full().children(self.render_dock(
+-                                                    DockPosition::Bottom,
+-                                                    &self.bottom_dock,
+-                                                    window,
+-                                                    cx,
+-                                                ))),
++                                                .child(div().w_full().children(
++                                                    self.render_dock_card(
++                                                        DockPosition::Bottom,
++                                                        &self.bottom_dock,
++                                                        window,
++                                                        cx,
++                                                    ),
++                                                )),
+                                         ),
+                                     BottomDockLayout::Contained => div()
+                                         .flex()
+                                         .flex_row()
+                                         .h_full()
+-                                        .children(self.render_dock(
+-                                            DockPosition::Left,
+-                                            &self.left_dock,
+-                                            window,
+-                                            cx,
+-                                        ))
++                                        .child(self.render_left_card(window, cx))
+                                         .child(
+                                             div()
+                                                 .flex()
+@@ -10344,14 +10557,14 @@ impl Render for Workspace {
+                                                             |this, p| this.child(p.border_l_1()),
+                                                         ),
+                                                 )
+-                                                .children(self.render_dock(
++                                                .children(self.render_dock_card(
+                                                     DockPosition::Bottom,
+                                                     &self.bottom_dock,
+                                                     window,
+                                                     cx,
+                                                 )),
+                                         )
+-                                        .children(self.render_dock(
++                                        .children(self.render_dock_card(
+                                             DockPosition::Right,
+                                             &self.right_dock,
+                                             window,
+@@ -19552,6 +19765,68 @@ mod tests {
+         });
+     }
+ 
++    #[gpui::test]
++    async fn test_should_defer_inactive_tabs_distinguishes_dir_root_and_files(
++        cx: &mut TestAppContext,
++    ) {
++        init_test(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        fs.insert_tree(
++            path!("/project"),
++            json!({
++                "main.rs": "fn main() {}",
++            }),
++        )
++        .await;
++        fs.insert_file(path!("/standalone.txt"), "hello".into())
++            .await;
++
++        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
++        let dir_worktree_id = project.read_with(cx, |project, cx| {
++            project.worktrees(cx).next().unwrap().read(cx).id()
++        });
++        let single_file_worktree_id = project
++            .update(cx, |project, cx| {
++                project.find_or_create_worktree(path!("/standalone.txt"), true, cx)
++            })
++            .await
++            .unwrap()
++            .0
++            .read_with(cx, |wt, _| wt.id());
++
++        project.read_with(cx, |project, cx| {
++            // Empty paths or directory worktree roots allow deferring inactive tabs.
++            assert!(should_defer_inactive_tabs(&[], project, cx));
++            assert!(should_defer_inactive_tabs(
++                &[Some(ProjectPath {
++                    worktree_id: dir_worktree_id,
++                    path: RelPath::empty().into(),
++                })],
++                project,
++                cx,
++            ));
++            // Explicit file inside a directory worktree must not defer.
++            assert!(!should_defer_inactive_tabs(
++                &[Some(ProjectPath {
++                    worktree_id: dir_worktree_id,
++                    path: rel_path("main.rs").into(),
++                })],
++                project,
++                cx,
++            ));
++            // Single-file worktree has empty relative path but represents an explicit file.
++            assert!(!should_defer_inactive_tabs(
++                &[Some(ProjectPath {
++                    worktree_id: single_file_worktree_id,
++                    path: RelPath::empty().into(),
++                })],
++                project,
++                cx,
++            ));
++        });
++    }
++
+     #[gpui::test]
+     async fn test_panel_zoom_preserved_across_workspace_switch(cx: &mut TestAppContext) {
+         init_test(cx);
+diff --git a/crates/zed/src/zed/quick_action_bar.rs b/crates/zed/src/zed/quick_action_bar.rs
+index 42e3d7e..8114a81 100644
+--- a/crates/zed/src/zed/quick_action_bar.rs
++++ b/crates/zed/src/zed/quick_action_bar.rs
+@@ -22,7 +22,7 @@ use project::{
+ use search::{BufferSearchBar, buffer_search};
+ use settings::{GitDiffBaseSetting, Settings, SettingsStore, update_settings_file};
+ use ui::{
+-    ButtonStyle, ContextMenu, ContextMenuEntry, DocumentationSide, IconButton, IconName, IconSize,
++    ButtonStyle, ContextMenu, ContextMenuEntry, DocumentationSide, IconButton, IconName,
+     PopoverMenu, PopoverMenuHandle, Tooltip, prelude::*,
+ };
+ use vim_mode_setting::{HelixModeSetting, VimModeSetting};
+@@ -192,7 +192,7 @@ impl Render for QuickActionBar {
+             v_flex()
+                 .child(
+                     IconButton::new("toggle_code_actions_icon", IconName::BoltOutlined)
+-                        .icon_size(IconSize::Small)
++                        .editor_action()
+                         .style(ButtonStyle::Subtle)
+                         .disabled(!has_available_code_actions)
+                         .toggle_state(is_deployed)
+@@ -258,7 +258,7 @@ impl Render for QuickActionBar {
+             PopoverMenu::new("editor-selections-dropdown")
+                 .trigger_with_tooltip(
+                     IconButton::new("toggle_editor_selections_icon", IconName::CursorIBeam)
+-                        .icon_size(IconSize::Small)
++                        .editor_action()
+                         .style(ButtonStyle::Subtle)
+                         .toggle_state(self.toggle_selections_handle.is_deployed()),
+                     Tooltip::text("Selection Controls"),
+@@ -337,7 +337,7 @@ impl Render for QuickActionBar {
+             PopoverMenu::new("editor-settings")
+                 .trigger_with_tooltip(
+                     IconButton::new("toggle_editor_settings_icon", IconName::Filter)
+-                        .icon_size(IconSize::Small)
++                        .editor_action()
+                         .toggle_state(self.toggle_settings_handle.is_deployed()),
+                     Tooltip::text("Editor Controls"),
+                 )
+@@ -703,9 +703,10 @@ impl Render for QuickActionBar {
+                 })
+         };
+ 
++        // The editor's actions, which sit in the tab bar as VS Code's do: 4 px apart.
+         h_flex()
+             .id("quick action bar")
+-            .gap(DynamicSpacing::Base01.rems(cx))
++            .gap(rems_from_vscode_px(4.))
+             .children(self.render_repl_menu(cx))
+             .children(self.render_preview_button(cx))
+             .children(search_button)
+@@ -760,7 +761,7 @@ impl RenderOnce for QuickActionBarButton {
+         let action = self.action.boxed_clone();
+ 
+         IconButton::new(self.id.clone(), self.icon)
+-            .icon_size(IconSize::Small)
++            .editor_action()
+             .style(ButtonStyle::Subtle)
+             .toggle_state(self.toggled)
+             .tooltip(move |_window, cx| {
+diff --git a/crates/zed/src/zed/quick_action_bar/preview.rs b/crates/zed/src/zed/quick_action_bar/preview.rs
+index 96b38d0..8b57fce 100644
+--- a/crates/zed/src/zed/quick_action_bar/preview.rs
++++ b/crates/zed/src/zed/quick_action_bar/preview.rs
+@@ -62,7 +62,7 @@ impl QuickActionBar {
+         };
+ 
+         let button = IconButton::new(button_id, IconName::Eye)
+-            .icon_size(IconSize::Small)
++            .editor_action()
+             .style(ButtonStyle::Subtle)
+             .tooltip(move |_window, cx| {
+                 Tooltip::with_meta(
+-- 
+2.54.0 (Apple Git-157)
+

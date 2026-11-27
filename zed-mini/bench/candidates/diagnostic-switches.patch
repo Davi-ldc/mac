@@ -1,0 +1,311 @@
+From f9a37ff5c5126d4222a677f6889c3124c40123cb Mon Sep 17 00:00:00 2001
+From: mini <mini@local>
+Date: Sun, 22 Nov 2026 15:00:03 -0300
+Subject: [PATCH 1/2] DIAGNOSTIC (not in the series): env switches for path
+ multisampling and path drawing, and a log line per path batch
+
+---
+ crates/gpui_apple/src/metal_renderer.rs | 33 ++++++++++++++++++++++---
+ 1 file changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/crates/gpui_apple/src/metal_renderer.rs b/crates/gpui_apple/src/metal_renderer.rs
+index 1db6000..7b3e4a6 100644
+--- a/crates/gpui_apple/src/metal_renderer.rs
++++ b/crates/gpui_apple/src/metal_renderer.rs
+@@ -43,6 +43,22 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
+ // Use 4x MSAA, all devices support it.
+ // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
+ const PATH_SAMPLE_COUNT: u32 = 4;
++
++fn diag_path_sample_count() -> u32 {
++    static COUNT: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
++        std::env::var("MINI_DIAG_PATH_SAMPLES")
++            .ok()
++            .and_then(|count| count.parse().ok())
++            .unwrap_or(PATH_SAMPLE_COUNT)
++    });
++    *COUNT
++}
++
++fn diag_no_paths() -> bool {
++    static NO_PATHS: std::sync::LazyLock<bool> =
++        std::sync::LazyLock::new(|| std::env::var_os("MINI_DIAG_NO_PATHS").is_some());
++    *NO_PATHS
++}
+ /// The path textures are as large as the area the frame's paths cover, rounded up to this
+ /// many pixels so that a highlight growing by a few pixels does not reallocate them.
+ const PATH_TEXTURE_GRANULARITY: i32 = 256;
+@@ -340,7 +356,7 @@ impl MetalRenderer {
+             "path_rasterization_vertex",
+             "path_rasterization_fragment",
+             MTLPixelFormat::BGRA8Unorm,
+-            PATH_SAMPLE_COUNT,
++            diag_path_sample_count(),
+         )?;
+         let path_sprites_pipeline_state = build_path_sprite_pipeline_state(
+             &device,
+@@ -442,7 +458,7 @@ impl MetalRenderer {
+             core_video_texture_cache,
+             path_intermediate_texture: None,
+             path_intermediate_msaa_texture: None,
+-            path_sample_count: PATH_SAMPLE_COUNT,
++            path_sample_count: diag_path_sample_count(),
+             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
+             headless_render_target: None,
+         })
+@@ -888,6 +904,17 @@ impl MetalRenderer {
+                     let Some(region) = path_batch_region(paths, viewport_size) else {
+                         continue;
+                     };
++                    if diag_no_paths() {
++                        continue;
++                    }
++                    log::info!(
++                        "DIAG path batch: {} paths, region {}x{} at {},{}",
++                        paths.len(),
++                        region.size.width.0,
++                        region.size.height.0,
++                        region.origin.x.0,
++                        region.origin.y.0
++                    );
+                     command_encoder.endEncoding();
+ 
+                     self.draw_paths_to_intermediate(paths, region, writer, &command_buffer)?;
+@@ -1951,7 +1978,7 @@ fn path_texture_size(
+     scene: &Scene,
+     viewport_size: Size<DevicePixels>,
+ ) -> Option<Size<DevicePixels>> {
+-    if scene.paths.is_empty() {
++    if scene.paths.is_empty() || diag_no_paths() {
+         return None;
+     }
+     let mut largest: Option<(i32, i32)> = None;
+-- 
+2.54.0 (Apple Git-157)
+
+
+From ce697f74d36006f6016c66671916ef4add040d66 Mon Sep 17 00:00:00 2001
+From: mini <mini@local>
+Date: Sun, 22 Nov 2026 15:17:53 -0300
+Subject: [PATCH 2/2] DIAGNOSTIC (not in the series): switches for inline
+ uniforms, write-combined buffers and the command queue size
+
+---
+ crates/gpui_apple/src/metal_renderer.rs | 112 +++++++++++++++++++++---
+ 1 file changed, 98 insertions(+), 14 deletions(-)
+
+diff --git a/crates/gpui_apple/src/metal_renderer.rs b/crates/gpui_apple/src/metal_renderer.rs
+index 7b3e4a6..d73cf19 100644
+--- a/crates/gpui_apple/src/metal_renderer.rs
++++ b/crates/gpui_apple/src/metal_renderer.rs
+@@ -54,6 +54,81 @@ fn diag_path_sample_count() -> u32 {
+     *COUNT
+ }
+ 
++fn diag_flag(name: &str) -> bool {
++    std::env::var_os(name).is_some()
++}
++
++fn diag_no_inline_bytes() -> bool {
++    static FLAG: std::sync::LazyLock<bool> =
++        std::sync::LazyLock::new(|| diag_flag("MINI_DIAG_NO_INLINE_BYTES"));
++    *FLAG
++}
++
++/// Small uniforms normally go through Metal's inline-bytes calls; the switch binds them
++/// from a tiny buffer instead, to see whether those calls own the 8 MB GPU blocks.
++trait DiagInlineBytes {
++    unsafe fn diag_set_vertex_bytes(
++        &self,
++        bytes: ptr::NonNull<std::ffi::c_void>,
++        length: usize,
++        index: usize,
++    );
++    unsafe fn diag_set_fragment_bytes(
++        &self,
++        bytes: ptr::NonNull<std::ffi::c_void>,
++        length: usize,
++        index: usize,
++    );
++}
++
++impl DiagInlineBytes for ProtocolObject<dyn MTLRenderCommandEncoder> {
++    unsafe fn diag_set_vertex_bytes(
++        &self,
++        bytes: ptr::NonNull<std::ffi::c_void>,
++        length: usize,
++        index: usize,
++    ) {
++        unsafe {
++            if diag_no_inline_bytes() {
++                let buffer = self
++                    .device()
++                    .newBufferWithBytes_length_options(
++                        bytes,
++                        length,
++                        MTLResourceOptions::StorageModeShared,
++                    )
++                    .expect("diagnostic uniform buffer");
++                self.setVertexBuffer_offset_atIndex(Some(&buffer), 0, index);
++            } else {
++                self.setVertexBytes_length_atIndex(bytes, length, index);
++            }
++        }
++    }
++
++    unsafe fn diag_set_fragment_bytes(
++        &self,
++        bytes: ptr::NonNull<std::ffi::c_void>,
++        length: usize,
++        index: usize,
++    ) {
++        unsafe {
++            if diag_no_inline_bytes() {
++                let buffer = self
++                    .device()
++                    .newBufferWithBytes_length_options(
++                        bytes,
++                        length,
++                        MTLResourceOptions::StorageModeShared,
++                    )
++                    .expect("diagnostic uniform buffer");
++                self.setFragmentBuffer_offset_atIndex(Some(&buffer), 0, index);
++            } else {
++                self.setFragmentBytes_length_atIndex(bytes, length, index);
++            }
++        }
++    }
++}
++
+ fn diag_no_paths() -> bool {
+     static NO_PATHS: std::sync::LazyLock<bool> =
+         std::sync::LazyLock::new(|| std::env::var_os("MINI_DIAG_NO_PATHS").is_some());
+@@ -113,7 +188,9 @@ impl InstanceBufferPool {
+         if let Some(buffer) = self.buffers.pop() {
+             return Ok(buffer);
+         }
+-        let options = if unified_memory {
++        let options = if unified_memory && diag_flag("MINI_DIAG_NO_WRITE_COMBINED") {
++            MTLResourceOptions::StorageModeShared
++        } else if unified_memory {
+             MTLResourceOptions::StorageModeShared
+                 // Buffers are write only which can benefit from the combined cache
+                 // https://developer.apple.com/documentation/metal/mtlresourceoptions/cpucachemodewritecombined
+@@ -415,7 +492,14 @@ impl MetalRenderer {
+             MTLPixelFormat::BGRA8Unorm,
+         )?;
+ 
+-        let command_queue = device.newCommandQueue().context("creating command queue")?;
++        let command_queue = match std::env::var("MINI_DIAG_QUEUE_MAX")
++            .ok()
++            .and_then(|count| count.parse().ok())
++        {
++            Some(count) => device.newCommandQueueWithMaxCommandBufferCount(count),
++            None => device.newCommandQueue(),
++        }
++        .context("creating command queue")?;
+         let supports_shared_storage = cfg!(target_os = "ios") || is_apple_gpu;
+         #[expect(
+             clippy::arc_with_non_send_sync,
+@@ -1052,7 +1136,7 @@ impl MetalRenderer {
+                 vertex_instance_bindings.offset,
+                 PathRasterizationInputIndex::Vertices as usize,
+             );
+-            command_encoder.setVertexBytes_length_atIndex(
++            command_encoder.diag_set_vertex_bytes(
+                 ptr::NonNull::from(&texture_size).cast(),
+                 mem::size_of_val(&texture_size),
+                 PathRasterizationInputIndex::ViewportSize as usize,
+@@ -1103,7 +1187,7 @@ impl MetalRenderer {
+                 instance_bindings.shadows.offset,
+                 ShadowInputIndex::Shadows as usize,
+             );
+-            command_encoder.setVertexBytes_length_atIndex(
++            command_encoder.diag_set_vertex_bytes(
+                 ptr::NonNull::from(&viewport_size).cast(),
+                 mem::size_of_val(&viewport_size),
+                 ShadowInputIndex::ViewportSize as usize,
+@@ -1148,7 +1232,7 @@ impl MetalRenderer {
+                 instance_bindings.quads.offset,
+                 QuadInputIndex::Quads as usize,
+             );
+-            command_encoder.setVertexBytes_length_atIndex(
++            command_encoder.diag_set_vertex_bytes(
+                 ptr::NonNull::from(&viewport_size).cast(),
+                 mem::size_of_val(&viewport_size),
+                 QuadInputIndex::ViewportSize as usize,
+@@ -1195,12 +1279,12 @@ impl MetalRenderer {
+                 0,
+                 SpriteInputIndex::Vertices as usize,
+             );
+-            command_encoder.setVertexBytes_length_atIndex(
++            command_encoder.diag_set_vertex_bytes(
+                 ptr::NonNull::from(&viewport_size).cast(),
+                 mem::size_of_val(&viewport_size),
+                 SpriteInputIndex::ViewportSize as usize,
+             );
+-            command_encoder.setVertexBytes_length_atIndex(
++            command_encoder.diag_set_vertex_bytes(
+                 ptr::NonNull::from(&texture_size).cast(),
+                 mem::size_of_val(&texture_size),
+                 SpriteInputIndex::AtlasTextureSize as usize,
+@@ -1287,7 +1371,7 @@ impl MetalRenderer {
+                 instance_bindings.underlines.offset,
+                 UnderlineInputIndex::Underlines as usize,
+             );
+-            command_encoder.setVertexBytes_length_atIndex(
++            command_encoder.diag_set_vertex_bytes(
+                 ptr::NonNull::from(&viewport_size).cast(),
+                 mem::size_of_val(&viewport_size),
+                 UnderlineInputIndex::ViewportSize as usize,
+@@ -1335,12 +1419,12 @@ impl MetalRenderer {
+                 instance_bindings.monochrome_sprites.offset,
+                 SpriteInputIndex::Sprites as usize,
+             );
+-            command_encoder.setVertexBytes_length_atIndex(
++            command_encoder.diag_set_vertex_bytes(
+                 ptr::NonNull::from(&viewport_size).cast(),
+                 mem::size_of_val(&viewport_size),
+                 SpriteInputIndex::ViewportSize as usize,
+             );
+-            command_encoder.setVertexBytes_length_atIndex(
++            command_encoder.diag_set_vertex_bytes(
+                 ptr::NonNull::from(&texture_size).cast(),
+                 mem::size_of_val(&texture_size),
+                 SpriteInputIndex::AtlasTextureSize as usize,
+@@ -1397,12 +1481,12 @@ impl MetalRenderer {
+                 instance_bindings.polychrome_sprites.offset,
+                 SpriteInputIndex::Sprites as usize,
+             );
+-            command_encoder.setVertexBytes_length_atIndex(
++            command_encoder.diag_set_vertex_bytes(
+                 ptr::NonNull::from(&viewport_size).cast(),
+                 mem::size_of_val(&viewport_size),
+                 SpriteInputIndex::ViewportSize as usize,
+             );
+-            command_encoder.setVertexBytes_length_atIndex(
++            command_encoder.diag_set_vertex_bytes(
+                 ptr::NonNull::from(&texture_size).cast(),
+                 mem::size_of_val(&texture_size),
+                 SpriteInputIndex::AtlasTextureSize as usize,
+@@ -1453,7 +1537,7 @@ impl MetalRenderer {
+                 instance_bindings.surfaces.offset,
+                 SurfaceInputIndex::Surfaces as usize,
+             );
+-            command_encoder.setVertexBytes_length_atIndex(
++            command_encoder.diag_set_vertex_bytes(
+                 ptr::NonNull::from(&viewport_size).cast(),
+                 mem::size_of_val(&viewport_size),
+                 SurfaceInputIndex::ViewportSize as usize,
+@@ -1510,7 +1594,7 @@ impl MetalRenderer {
+             // SAFETY: The size is copied from a live value, and both planes match their shader texture slots.
+             // The frame completion handler retains the CoreVideo wrappers until GPU reads finish.
+             unsafe {
+-                command_encoder.setVertexBytes_length_atIndex(
++                command_encoder.diag_set_vertex_bytes(
+                     ptr::NonNull::from(&texture_size).cast(),
+                     mem::size_of_val(&texture_size),
+                     SurfaceInputIndex::TextureSize as usize,
+-- 
+2.54.0 (Apple Git-157)
+

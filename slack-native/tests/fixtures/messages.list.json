@@ -1,0 +1,33 @@
+{
+  "ok": true,
+  "messages_data": {
+    "C01GENERAL": {
+      "messages": [
+        {
+          "type": "message",
+          "user": "U02SAM",
+          "ts": "1795100000.000200",
+          "text": "Who has the launch checklist? Asking for the dry run",
+          "blocks": [
+            {
+              "type": "rich_text",
+              "block_id": "kw1",
+              "elements": [
+                {
+                  "type": "rich_text_section",
+                  "elements": [
+                    {
+                      "type": "text",
+                      "text": "Who has the launch checklist? Asking for the dry run"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "latest_updates": {}
+    }
+  }
+}

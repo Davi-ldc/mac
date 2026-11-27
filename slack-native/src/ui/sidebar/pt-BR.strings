@@ -1,0 +1,16 @@
+"sidebar.page.threads" = "Conversas";
+"sidebar.page.huddles" = "Círculos";
+"sidebar.page.drafts" = "Rascunhos e enviados";
+"sidebar.page.directories" = "Diretórios";
+"sidebar.section.stars" = "Favoritos";
+"sidebar.section.channels" = "Canais";
+"sidebar.section.dms" = "Mensagens diretas";
+"sidebar.section.apps" = "Apps";
+"sidebar.section.connect" = "Conexões externas";
+"sidebar.stars.hint" = "Arraste e solte coisas importantes aqui";
+"sidebar.add.channels" = "Adicionar canais";
+"sidebar.filter.placeholder" = "Encontrar uma conversa...";
+"sidebar.filter.empty" = "Nenhuma conversa para mostrar…";
+"sidebar.filter.search" = "Pesquisar %@";
+"sidebar.settings" = "Gerenciar minha barra lateral";
+"sidebar.compose" = "Nova mensagem";

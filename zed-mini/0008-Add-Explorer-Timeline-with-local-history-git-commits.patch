@@ -1,0 +1,1273 @@
+From 604edf56f385b27f1480ad358b01a2e77a6bd200 Mon Sep 17 00:00:00 2001
+From: mini <mini@local>
+Date: Fri, 27 Nov 2026 03:37:38 -0300
+Subject: [PATCH 08/10] Add Explorer Timeline with local history, git commits,
+ and Open Timeline actions
+
+Adds the Explorer's Timeline section showing local-history snapshots and
+git commits of the active file, with debounced O(N) rebuilds, cached
+commit data, rename-following historical diffs, and clean Open Timeline
+entries in the command palette, Explorer context menu, and tab menu.
+---
+ Cargo.lock                                |  25 +
+ Cargo.toml                                |   2 +
+ crates/git_ui_core/src/file_diff_view.rs  |  29 +-
+ crates/project_panel/src/project_panel.rs |  18 +-
+ crates/timeline/Cargo.toml                |  35 ++
+ crates/timeline/LICENSE-GPL               |   1 +
+ crates/timeline/src/local_history.rs      | 305 +++++++++++
+ crates/timeline/src/timeline.rs           | 623 ++++++++++++++++++++++
+ crates/workspace/src/pane.rs              |  17 +
+ crates/zed/Cargo.toml                     |   1 +
+ crates/zed_actions/src/lib.rs             |  21 +
+ 11 files changed, 1074 insertions(+), 3 deletions(-)
+ create mode 100644 crates/timeline/Cargo.toml
+ create mode 120000 crates/timeline/LICENSE-GPL
+ create mode 100644 crates/timeline/src/local_history.rs
+ create mode 100644 crates/timeline/src/timeline.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 5c3e77b..9398572 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -18280,6 +18280,30 @@ dependencies = [
+  "windows 0.62.2",
+ ]
+ 
++[[package]]
++name = "timeline"
++version = "0.1.0"
++dependencies = [
++ "anyhow",
++ "git",
++ "git_ui_core",
++ "gpui",
++ "language",
++ "log",
++ "menu",
++ "paths",
++ "project",
++ "project_panel",
++ "smol",
++ "tempfile",
++ "time",
++ "time_format",
++ "ui",
++ "util",
++ "workspace",
++ "zed_actions",
++]
++
+ [[package]]
+ name = "tiny-keccak"
+ version = "2.0.2"
+@@ -22581,6 +22605,7 @@ dependencies = [
+  "theme_settings",
+  "time",
+  "time_format",
++ "timeline",
+  "title_bar",
+  "toolchain_selector",
+  "tracing",
+diff --git a/Cargo.toml b/Cargo.toml
+index 547a0bf..2a09416 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -225,6 +225,7 @@ members = [
+     "crates/theme_selector",
+     "crates/theme_settings",
+     "crates/time_format",
++    "crates/timeline",
+     "crates/title_bar",
+     "crates/toolchain_selector",
+     "crates/ui",
+@@ -499,6 +500,7 @@ theme_extension = { path = "crates/theme_extension" }
+ theme_selector = { path = "crates/theme_selector" }
+ theme_settings = { path = "crates/theme_settings" }
+ time_format = { path = "crates/time_format" }
++timeline = { path = "crates/timeline" }
+ title_bar = { path = "crates/title_bar" }
+ toolchain_selector = { path = "crates/toolchain_selector" }
+ ui = { path = "crates/ui" }
+diff --git a/crates/git_ui_core/src/file_diff_view.rs b/crates/git_ui_core/src/file_diff_view.rs
+index d5fa761..19423fd 100644
+--- a/crates/git_ui_core/src/file_diff_view.rs
++++ b/crates/git_ui_core/src/file_diff_view.rs
+@@ -34,6 +34,8 @@ pub struct FileDiffView {
+     editor: Entity<SplittableEditor>,
+     old_buffer: Entity<Buffer>,
+     new_buffer: Entity<Buffer>,
++    /// Names the old side when its buffer has no file of its own, like a past version.
++    old_title: Option<SharedString>,
+     buffer_changes_tx: watch::Sender<()>,
+     _recalculate_diff_task: Task<Result<()>>,
+ }
+@@ -182,6 +184,7 @@ impl FileDiffView {
+             buffer_changes_tx,
+             old_buffer,
+             new_buffer,
++            old_title: None,
+             _recalculate_diff_task: cx.spawn(async move |this, cx| {
+                 while buffer_changes_rx.recv().await.is_ok() {
+                     loop {
+@@ -217,6 +220,22 @@ impl FileDiffView {
+             }),
+         }
+     }
++
++    pub fn set_old_title(&mut self, title: impl Into<SharedString>, cx: &mut Context<Self>) {
++        let title = title.into();
++        let new_path = self
++            .new_buffer
++            .read(cx)
++            .snapshot()
++            .resolve_file_path(false, cx)
++            .unwrap_or_else(|| MultiBuffer::DEFAULT_TITLE.to_string());
++        self.editor.update(cx, |editor, cx| {
++            editor.rhs_editor().update(cx, |editor, _| {
++                editor.set_breadcrumb_header(format!("{title} ↔ {new_path}"));
++            });
++        });
++        self.old_title = Some(title);
++    }
+ }
+ 
+ #[ztracing::instrument(skip_all)]
+@@ -282,7 +301,10 @@ impl Item for FileDiffView {
+                 })
+                 .unwrap_or_else(|| MultiBuffer::DEFAULT_TITLE.into())
+         };
+-        let old_filename = title_text(&self.old_buffer);
++        let old_filename = self
++            .old_title
++            .as_ref()
++            .map_or_else(|| title_text(&self.old_buffer), |title| title.to_string());
+         let new_filename = title_text(&self.new_buffer);
+ 
+         format!("{old_filename} ↔ {new_filename}").into()
+@@ -296,7 +318,10 @@ impl Item for FileDiffView {
+                 .map(|file| file.full_path(cx).compact().to_string_lossy().into_owned())
+                 .unwrap_or_else(|| MultiBuffer::DEFAULT_TITLE.into())
+         };
+-        let old_path = path(&self.old_buffer);
++        let old_path = self
++            .old_title
++            .as_ref()
++            .map_or_else(|| path(&self.old_buffer), |title| title.to_string());
+         let new_path = path(&self.new_buffer);
+ 
+         Some(format!("{old_path} ↔ {new_path}").into())
+diff --git a/crates/project_panel/src/project_panel.rs b/crates/project_panel/src/project_panel.rs
+index 1a5fa1c..ee17da4 100644
+--- a/crates/project_panel/src/project_panel.rs
++++ b/crates/project_panel/src/project_panel.rs
+@@ -1435,6 +1435,20 @@ impl ProjectPanel {
+             };
+ 
+             let has_pasteable_content = self.has_pasteable_content(cx);
++            let timeline_path = (!is_dir).then(|| worktree.absolutize(&entry.path));
++            let open_timeline = |menu: ContextMenu| {
++                menu.when_some(timeline_path.clone(), |menu, abs_path| {
++                    menu.separator()
++                        .entry("Open Timeline", None, move |window, cx| {
++                            window.dispatch_action(
++                                Box::new(zed_actions::timeline::OpenTimelineForPath {
++                                    abs_path: abs_path.clone(),
++                                }),
++                                cx,
++                            )
++                        })
++                })
++            };
+             let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
+                 menu.context(self.focus_handle.clone()).map(|menu| {
+                     if is_read_only {
+@@ -1447,6 +1461,7 @@ impl ProjectPanel {
+                         .when(is_dir, |menu| {
+                             menu.action("Search Inside", Box::new(NewSearchInDirectory))
+                         })
++                        .map(&open_timeline)
+                     } else {
+                         menu.action("New File", Box::new(NewFile))
+                             .action("New Folder", Box::new(NewDirectory))
+@@ -1481,7 +1496,8 @@ impl ProjectPanel {
+                                 menu.separator()
+                                     .action("Compare Marked Files", Box::new(CompareMarkedFiles))
+                             })
+-                                .separator()
++                            .map(&open_timeline)
++                            .separator()
+                             .action("Cut", Box::new(Cut))
+                             .action("Copy", Box::new(Copy))
+                             .action("Duplicate", Box::new(Duplicate))
+diff --git a/crates/timeline/Cargo.toml b/crates/timeline/Cargo.toml
+new file mode 100644
+index 0000000..f28271b
+--- /dev/null
++++ b/crates/timeline/Cargo.toml
+@@ -0,0 +1,35 @@
++[package]
++name = "timeline"
++version = "0.1.0"
++edition.workspace = true
++publish.workspace = true
++license = "GPL-3.0-or-later"
++
++[lints]
++workspace = true
++
++[lib]
++path = "src/timeline.rs"
++doctest = false
++
++[dependencies]
++anyhow.workspace = true
++git.workspace = true
++git_ui_core.workspace = true
++gpui.workspace = true
++language.workspace = true
++log.workspace = true
++menu.workspace = true
++paths.workspace = true
++project.workspace = true
++project_panel.workspace = true
++smol.workspace = true
++time.workspace = true
++time_format.workspace = true
++ui.workspace = true
++util.workspace = true
++workspace.workspace = true
++zed_actions.workspace = true
++
++[dev-dependencies]
++tempfile.workspace = true
+diff --git a/crates/timeline/LICENSE-GPL b/crates/timeline/LICENSE-GPL
+new file mode 120000
+index 0000000..89e542f
+--- /dev/null
++++ b/crates/timeline/LICENSE-GPL
+@@ -0,0 +1 @@
++../../LICENSE-GPL
+\ No newline at end of file
+diff --git a/crates/timeline/src/local_history.rs b/crates/timeline/src/local_history.rs
+new file mode 100644
+index 0000000..dff7a64
+--- /dev/null
++++ b/crates/timeline/src/local_history.rs
+@@ -0,0 +1,305 @@
++//! A copy of every saved version of a local file, as VS Code's local history keeps, so the
++//! timeline can show and diff versions that were never committed.
++//!
++//! Each file gets a folder under `<data dir>/local_history`, named by a hash of its path,
++//! holding a `path` file with the original path and one snapshot per save, named by the save
++//! time in milliseconds.
++
++use anyhow::{Context as _, Result};
++use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Task};
++use language::{Buffer, BufferEvent};
++use project::{Project, buffer_store::BufferStoreEvent};
++use std::{
++    fs,
++    path::{Path, PathBuf},
++    time::{SystemTime, UNIX_EPOCH},
++};
++use util::ResultExt as _;
++
++/// VS Code's defaults for `workbench.localHistory.maxFileEntries` and `maxFileSize`.
++const MAX_ENTRIES_PER_FILE: usize = 50;
++const MAX_FILE_SIZE: u64 = 256 * 1024;
++/// VS Code has no limit on the whole history; this one keeps it bounded however many files
++/// get saved. Past it, the oldest snapshots of any file go first.
++const MAX_TOTAL_SIZE: u64 = 32 * 1024 * 1024;
++const PATH_FILE_NAME: &str = "path";
++
++pub struct LocalHistory {
++    root: PathBuf,
++    requests: smol::channel::Sender<PathBuf>,
++    _tasks: [Task<()>; 2],
++}
++
++/// Emitted once the snapshot of a save is on disk.
++pub struct SnapshotSaved(pub PathBuf);
++
++impl EventEmitter<SnapshotSaved> for LocalHistory {}
++
++struct GlobalLocalHistory(Entity<LocalHistory>);
++
++impl Global for GlobalLocalHistory {}
++
++/// A saved version of a file.
++#[derive(Clone)]
++pub struct LocalHistoryEntry {
++    /// Milliseconds since the Unix epoch.
++    pub saved_at: i64,
++    pub snapshot: PathBuf,
++}
++
++pub fn init(cx: &mut App) {
++    let history = cx.new(|cx| LocalHistory::new(paths::data_dir().join("local_history"), cx));
++    cx.set_global(GlobalLocalHistory(history));
++    // Buffers are created through entity reservations, which `observe_new` doesn't see, so
++    // saves are found through each project's buffer store.
++    cx.observe_new(|project: &mut Project, _, cx| {
++        cx.subscribe(project.buffer_store(), |_, _, event, cx| {
++            if let BufferStoreEvent::BufferAdded(buffer) = event {
++                cx.subscribe(buffer, |_, buffer, event, cx| {
++                    if matches!(event, BufferEvent::Saved) {
++                        record_save(&buffer, cx);
++                    }
++                })
++                .detach();
++            }
++        })
++        .detach();
++    })
++    .detach();
++}
++
++fn record_save(buffer: &Entity<Buffer>, cx: &App) {
++    let Some(file) = buffer.read(cx).file().and_then(|file| file.as_local()) else {
++        return;
++    };
++    if let Some(history) = LocalHistory::global(cx) {
++        history.read(cx).record(file.abs_path(cx));
++    }
++}
++
++impl LocalHistory {
++    pub fn global(cx: &App) -> Option<Entity<Self>> {
++        cx.try_global::<GlobalLocalHistory>()
++            .map(|history| history.0.clone())
++    }
++
++    fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
++        let (requests, request_rx) = smol::channel::unbounded::<PathBuf>();
++        let (saved_tx, saved_rx) = smol::channel::unbounded::<PathBuf>();
++        // One worker takes the saves in order, so two saves never race on the same folder
++        // or on the running total.
++        let worker = cx.background_spawn({
++            let mut store = Store {
++                root: root.clone(),
++                total_size: None,
++            };
++            async move {
++                while let Ok(path) = request_rx.recv().await {
++                    match store.snapshot(&path) {
++                        Ok(true) => {
++                            if saved_tx.send(path).await.is_err() {
++                                break;
++                            }
++                        }
++                        Ok(false) => {}
++                        Err(error) => {
++                            log::error!("local history of {}: {error:#}", path.display())
++                        }
++                    }
++                }
++            }
++        });
++        let notifier = cx.spawn(async move |this, cx| {
++            while let Ok(path) = saved_rx.recv().await {
++                if this
++                    .update(cx, |_, cx| cx.emit(SnapshotSaved(path)))
++                    .is_err()
++                {
++                    break;
++                }
++            }
++        });
++        Self {
++            root,
++            requests,
++            _tasks: [worker, notifier],
++        }
++    }
++
++    fn record(&self, path: PathBuf) {
++        self.requests.try_send(path).log_err();
++    }
++
++    /// The saved versions of `path`, newest first.
++    pub fn entries(&self, path: &Path, cx: &App) -> Task<Vec<LocalHistoryEntry>> {
++        let folder = self.root.join(folder_name(path));
++        cx.background_spawn(async move {
++            let mut entries = read_entries(&folder)
++                .into_iter()
++                .map(|(saved_at, snapshot, _)| LocalHistoryEntry { saved_at, snapshot })
++                .collect::<Vec<_>>();
++            entries.reverse();
++            entries
++        })
++    }
++}
++
++struct Store {
++    root: PathBuf,
++    /// Bytes of all snapshots, counted on the first save of the session.
++    total_size: Option<u64>,
++}
++
++impl Store {
++    /// Keeps the saved contents of `path`. Returns whether a snapshot was added: files over
++    /// the size limit, or saved unchanged, add none.
++    fn snapshot(&mut self, path: &Path) -> Result<bool> {
++        let metadata = fs::metadata(path).context("reading the saved file")?;
++        if !metadata.is_file() || metadata.len() > MAX_FILE_SIZE {
++            return Ok(false);
++        }
++        let content = fs::read(path).context("reading the saved file")?;
++        let folder = self.root.join(folder_name(path));
++        let mut entries = read_entries(&folder);
++        if let Some((_, latest, _)) = entries.last()
++            && fs::read(latest).ok().as_deref() == Some(content.as_slice())
++        {
++            return Ok(false);
++        }
++        if entries.is_empty() {
++            fs::create_dir_all(&folder).context("creating the history folder")?;
++            fs::write(
++                folder.join(PATH_FILE_NAME),
++                path.to_string_lossy().as_bytes(),
++            )
++            .context("writing the history folder's path")?;
++        }
++
++        let now = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .map_or(0, |since_epoch| since_epoch.as_millis() as i64);
++        // Two saves within a millisecond must not overwrite each other.
++        let saved_at = entries
++            .last()
++            .map_or(now, |(latest, _, _)| now.max(latest + 1));
++        fs::write(folder.join(saved_at.to_string()), &content).context("writing the snapshot")?;
++        let mut total_size = self.total_size(content.len() as u64);
++
++        let excess = (entries.len() + 1).saturating_sub(MAX_ENTRIES_PER_FILE);
++        for (_, snapshot, size) in entries.drain(..excess) {
++            if fs::remove_file(&snapshot).log_err().is_some() {
++                total_size = total_size.saturating_sub(size);
++            }
++        }
++        self.total_size = Some(total_size);
++        if total_size > MAX_TOTAL_SIZE {
++            self.trim();
++        }
++        Ok(true)
++    }
++
++    /// The running total after adding `added` bytes, counting what is already on disk the
++    /// first time.
++    fn total_size(&mut self, added: u64) -> u64 {
++        match self.total_size {
++            Some(total) => total + added,
++            None => self.all_entries().iter().map(|(_, _, size)| size).sum(),
++        }
++    }
++
++    /// Deletes the oldest snapshots, of any file, until the history is well under its limit,
++    /// so the next saves don't each trigger another pass.
++    fn trim(&mut self) {
++        let mut entries = self.all_entries();
++        entries.sort_by_key(|(saved_at, _, _)| *saved_at);
++        let mut total: u64 = entries.iter().map(|(_, _, size)| size).sum();
++        for (_, snapshot, size) in entries {
++            if total <= MAX_TOTAL_SIZE / 10 * 9 {
++                break;
++            }
++            if fs::remove_file(&snapshot).log_err().is_some() {
++                total = total.saturating_sub(size);
++                if let Some(folder) = snapshot.parent()
++                    && read_entries(folder).is_empty()
++                {
++                    fs::remove_dir_all(folder).log_err();
++                }
++            }
++        }
++        self.total_size = Some(total);
++    }
++
++    fn all_entries(&self) -> Vec<(i64, PathBuf, u64)> {
++        let Ok(folders) = fs::read_dir(&self.root) else {
++            return Vec::new();
++        };
++        folders
++            .flatten()
++            .flat_map(|folder| read_entries(&folder.path()))
++            .collect()
++    }
++}
++
++/// The snapshots in a file's history folder, oldest first, with their sizes.
++fn read_entries(folder: &Path) -> Vec<(i64, PathBuf, u64)> {
++    let Ok(children) = fs::read_dir(folder) else {
++        return Vec::new();
++    };
++    let mut entries = children
++        .flatten()
++        .filter_map(|child| {
++            let saved_at = child.file_name().to_str()?.parse::<i64>().ok()?;
++            let size = child.metadata().ok()?.len();
++            Some((saved_at, child.path(), size))
++        })
++        .collect::<Vec<_>>();
++    entries.sort_by_key(|(saved_at, _, _)| *saved_at);
++    entries
++}
++
++/// FNV-1a of the path: unlike std's hasher it is stable across Rust releases, so a file
++/// keeps its folder after an update.
++fn folder_name(path: &Path) -> String {
++    let hash = path
++        .to_string_lossy()
++        .bytes()
++        .fold(0xcbf29ce484222325_u64, |hash, byte| {
++            (hash ^ byte as u64).wrapping_mul(0x100000001b3)
++        });
++    format!("{hash:016x}")
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn test_snapshots_are_bounded_and_deduplicated() {
++        let temp = tempfile::tempdir().unwrap();
++        let file = temp.path().join("file.txt");
++        let mut store = Store {
++            root: temp.path().join("history"),
++            total_size: None,
++        };
++
++        fs::write(&file, "one").unwrap();
++        assert!(store.snapshot(&file).unwrap());
++        assert!(
++            !store.snapshot(&file).unwrap(),
++            "unchanged saves add nothing"
++        );
++
++        for version in 0..MAX_ENTRIES_PER_FILE + 5 {
++            fs::write(&file, format!("version {version}")).unwrap();
++            assert!(store.snapshot(&file).unwrap());
++        }
++        let entries = read_entries(&store.root.join(folder_name(&file)));
++        assert_eq!(entries.len(), MAX_ENTRIES_PER_FILE);
++        assert_eq!(
++            fs::read_to_string(&entries.last().unwrap().1).unwrap(),
++            format!("version {}", MAX_ENTRIES_PER_FILE + 4)
++        );
++        let on_disk: u64 = entries.iter().map(|(_, _, size)| size).sum();
++        assert_eq!(store.total_size, Some(on_disk));
++    }
++}
+diff --git a/crates/timeline/src/timeline.rs b/crates/timeline/src/timeline.rs
+new file mode 100644
+index 0000000..b512224
+--- /dev/null
++++ b/crates/timeline/src/timeline.rs
+@@ -0,0 +1,623 @@
++//! The Timeline section of the Explorer, as in VS Code: the saved versions and the commits of
++//! the active file, newest first. Choosing one opens its diff against the file as it is now.
++
++mod local_history;
++
++use anyhow::{Context as _, Result, anyhow};
++use std::collections::HashMap;
++use git::repository::{CommitData, LogOrder, LogSource, RepoPath};
++use git_ui_core::file_diff_view::{FileDiffView, build_buffer_diff};
++use gpui::{
++    App, AppContext as _, Context, Entity, FocusHandle, Focusable, ScrollStrategy, Subscription,
++    Task, UniformListScrollHandle, WeakEntity, Window, uniform_list,
++};
++use language::{Buffer, Capability};
++use local_history::{LocalHistory, LocalHistoryEntry, SnapshotSaved};
++use project::{
++    Project, ProjectPath,
++    git_store::{
++        CommitDataState, GitStoreEvent, LocalRepositoryState, Repository, RepositoryEvent,
++        RepositoryState,
++    },
++};
++use project_panel::{ExplorerSection, ProjectPanel};
++use std::{cmp::Reverse, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
++use time::OffsetDateTime;
++use time_format::TimestampFormat;
++use ui::{ListItem, ListItemSpacing, prelude::*};
++use workspace::{Workspace, notifications::DetachAndPromptErr as _};
++use zed_actions::timeline::{OpenTimeline, OpenTimelineForPath};
++
++const TITLE: &str = "Timeline";
++/// The timeline lists a file's most recent commits only, like the first page of VS Code's.
++const MAX_COMMITS: usize = 100;
++
++pub fn init(cx: &mut App) {
++    local_history::init(cx);
++}
++
++/// Adds the Timeline section to the workspace's project panel.
++pub fn add_to_explorer(
++    workspace: &mut Workspace,
++    project_panel: &Entity<ProjectPanel>,
++    window: &mut Window,
++    cx: &mut Context<Workspace>,
++) {
++    let timeline = cx.new(|cx| TimelineView::new(workspace, cx));
++    let focus_handle = timeline.focus_handle(cx);
++    let set_visible = {
++        let timeline = timeline.downgrade();
++        move |visible: bool, _: &mut Window, cx: &mut App| {
++            timeline
++                .update(cx, |timeline, cx| timeline.set_visible(visible, cx))
++                .ok();
++        }
++    };
++    workspace.register_action(|workspace, _: &OpenTimeline, window, cx| {
++        project_panel::focus_section(workspace, TITLE, window, cx);
++    });
++    workspace.register_action({
++        let timeline = timeline.downgrade();
++        move |workspace, action: &OpenTimelineForPath, window, cx| {
++            project_panel::focus_section(workspace, TITLE, window, cx);
++            let abs_path = action.abs_path.clone();
++            timeline
++                .update(cx, |timeline, cx| timeline.show_path(abs_path, cx))
++                .ok();
++        }
++    });
++    project_panel.update(cx, |project_panel, cx| {
++        project_panel.add_section(
++            ExplorerSection {
++                title: TITLE.into(),
++                view: timeline.into(),
++                focus_handle,
++                set_visible: Rc::new(set_visible),
++                expanded: false,
++            },
++            window,
++            cx,
++        )
++    });
++}
++
++struct ActiveFile {
++    project_path: ProjectPath,
++    abs_path: PathBuf,
++    name: SharedString,
++}
++
++enum TimelineEntry {
++    Saved(LocalHistoryEntry),
++    Commit(Arc<CommitData>),
++}
++
++impl TimelineEntry {
++    fn unix_seconds(&self) -> i64 {
++        match self {
++            TimelineEntry::Saved(entry) => entry.saved_at / 1000,
++            TimelineEntry::Commit(commit) => commit.commit_timestamp,
++        }
++    }
++}
++
++pub struct TimelineView {
++    workspace: WeakEntity<Workspace>,
++    project: Entity<Project>,
++    focus_handle: FocusHandle,
++    scroll_handle: UniformListScrollHandle,
++    visible: bool,
++    file: Option<ActiveFile>,
++    repository: Option<(Entity<Repository>, RepoPath)>,
++    saved: Vec<LocalHistoryEntry>,
++    loaded_commits: HashMap<git::Oid, Arc<CommitData>>,
++    entries: Vec<TimelineEntry>,
++    selected: Option<usize>,
++    // Held only while the section is on screen: a hidden timeline tracks nothing.
++    subscriptions: Vec<Subscription>,
++    repository_subscriptions: Vec<Subscription>,
++    load_saved: Task<()>,
++    rebuild_task: Option<Task<()>>,
++}
++
++impl TimelineView {
++    fn new(workspace: &Workspace, cx: &mut Context<Self>) -> Self {
++        Self {
++            workspace: workspace.weak_handle(),
++            project: workspace.project().clone(),
++            focus_handle: cx.focus_handle(),
++            scroll_handle: UniformListScrollHandle::new(),
++            visible: false,
++            file: None,
++            repository: None,
++            saved: Vec::new(),
++            loaded_commits: HashMap::default(),
++            entries: Vec::new(),
++            selected: None,
++            subscriptions: Vec::new(),
++            repository_subscriptions: Vec::new(),
++            load_saved: Task::ready(()),
++            rebuild_task: None,
++        }
++    }
++
++    fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
++        if self.visible == visible {
++            return;
++        }
++        self.visible = visible;
++        if visible {
++            if let Some(workspace) = self.workspace.upgrade() {
++                self.subscriptions.push(cx.subscribe(
++                    &workspace,
++                    |this, _, event: &workspace::Event, cx| {
++                        if matches!(event, workspace::Event::ActiveItemChanged) {
++                            this.update_active_file(cx);
++                        }
++                    },
++                ));
++            }
++            if let Some(history) = LocalHistory::global(cx) {
++                self.subscriptions.push(cx.subscribe(
++                    &history,
++                    |this, _, SnapshotSaved(path), cx| {
++                        if this
++                            .file
++                            .as_ref()
++                            .is_some_and(|file| &file.abs_path == path)
++                        {
++                            this.load_saved(cx);
++                        }
++                    },
++                ));
++            }
++            let git_store = self.project.read(cx).git_store().clone();
++            self.subscriptions.push(cx.subscribe(
++                &git_store,
++                |this, _, event: &GitStoreEvent, cx| {
++                    if matches!(
++                        event,
++                        GitStoreEvent::RepositoryAdded | GitStoreEvent::RepositoryRemoved(_)
++                    ) {
++                        this.refresh_repository(cx);
++                    }
++                },
++            ));
++            // The section can be shown from inside an update of the workspace (the project panel
++            // restoring it at startup), which update_active_file reads.
++            let this = cx.weak_entity();
++            cx.defer(move |cx| {
++                this.update(cx, |this, cx| this.update_active_file(cx)).ok();
++            });
++        } else {
++            self.subscriptions.clear();
++            self.repository_subscriptions.clear();
++            self.load_saved = Task::ready(());
++            self.rebuild_task = None;
++            self.file = None;
++            self.repository = None;
++            self.saved = Vec::new();
++            self.loaded_commits.clear();
++            self.entries = Vec::new();
++            self.selected = None;
++        }
++        cx.notify();
++    }
++
++    fn update_active_file(&mut self, cx: &mut Context<Self>) {
++        if !self.visible {
++            return;
++        }
++        let Some(workspace) = self.workspace.upgrade() else {
++            return;
++        };
++        // Items without a file, like the diffs this view opens, keep the last file's timeline.
++        let Some(project_path) = workspace
++            .read(cx)
++            .active_item(cx)
++            .and_then(|item| item.project_path(cx))
++        else {
++            return;
++        };
++        self.set_file(project_path, cx);
++    }
++
++    /// Shows the timeline of `abs_path` until the active editor changes, as VS Code's Open
++    /// Timeline does.
++    fn show_path(&mut self, abs_path: PathBuf, cx: &mut Context<Self>) {
++        // After the section's own deferred look at the active editor, which would replace it.
++        let this = cx.weak_entity();
++        cx.defer(move |cx| {
++            this.update(cx, |this, cx| {
++                if !this.visible {
++                    return;
++                }
++                if let Some(project_path) = this.project.read(cx).find_project_path(&abs_path, cx) {
++                    this.set_file(project_path, cx);
++                }
++            })
++            .ok();
++        });
++    }
++
++    fn set_file(&mut self, project_path: ProjectPath, cx: &mut Context<Self>) {
++        if self
++            .file
++            .as_ref()
++            .is_some_and(|file| file.project_path == project_path)
++        {
++            return;
++        }
++        let project = self.project.read(cx);
++        let Some(abs_path) = project.absolute_path(&project_path, cx) else {
++            return;
++        };
++        let name = project_path
++            .path
++            .file_name()
++            .unwrap_or_default()
++            .to_string()
++            .into();
++        self.bind_repository(&project_path, cx);
++        self.file = Some(ActiveFile {
++            project_path,
++            abs_path,
++            name,
++        });
++        self.saved = Vec::new();
++        self.loaded_commits.clear();
++        self.rebuild_task = None;
++        self.selected = None;
++        self.load_saved(cx);
++        self.rebuild(cx);
++    }
++
++    fn bind_repository(&mut self, project_path: &ProjectPath, cx: &mut Context<Self>) {
++        let next_repo = self
++            .project
++            .read(cx)
++            .git_store()
++            .read(cx)
++            .repository_and_path_for_project_path(project_path, cx);
++        self.repository_subscriptions = match &next_repo {
++            Some((repository, _)) => vec![
++                // Commit details arrive one by one, each notifying the repository; coalesce
++                // bursts so loading N commits does not trigger O(N^2) rebuilds.
++                cx.observe(repository, |this, _, cx| this.schedule_rebuild(cx)),
++                cx.subscribe(repository, |this, _, event: &RepositoryEvent, cx| {
++                    if matches!(
++                        event,
++                        RepositoryEvent::GraphEvent(..) | RepositoryEvent::HeadChanged
++                    ) {
++                        this.schedule_rebuild(cx);
++                    }
++                }),
++            ],
++            None => Vec::new(),
++        };
++        self.repository = next_repo;
++    }
++
++    fn refresh_repository(&mut self, cx: &mut Context<Self>) {
++        if !self.visible {
++            return;
++        }
++        let Some(project_path) = self.file.as_ref().map(|file| file.project_path.clone()) else {
++            return;
++        };
++        let next_repo = self
++            .project
++            .read(cx)
++            .git_store()
++            .read(cx)
++            .repository_and_path_for_project_path(&project_path, cx);
++        let unchanged = match (&self.repository, &next_repo) {
++            (Some((a, ap)), Some((b, bp))) => a.entity_id() == b.entity_id() && ap == bp,
++            (None, None) => true,
++            _ => false,
++        };
++        if unchanged {
++            return;
++        }
++        self.bind_repository(&project_path, cx);
++        self.loaded_commits.clear();
++        self.rebuild_task = None;
++        self.rebuild(cx);
++    }
++
++    fn schedule_rebuild(&mut self, cx: &mut Context<Self>) {
++        if self.rebuild_task.is_some() {
++            return;
++        }
++        self.rebuild_task = Some(cx.spawn(async move |this, cx| {
++            cx.background_executor()
++                .timer(Duration::from_millis(16))
++                .await;
++            this.update(cx, |this, cx| {
++                this.rebuild_task = None;
++                this.rebuild(cx);
++            })
++            .ok();
++        }));
++    }
++
++    fn load_saved(&mut self, cx: &mut Context<Self>) {
++        let (Some(file), Some(history)) = (&self.file, LocalHistory::global(cx)) else {
++            return;
++        };
++        let entries = history.read(cx).entries(&file.abs_path, cx);
++        self.load_saved = cx.spawn(async move |this, cx| {
++            let saved = entries.await;
++            this.update(cx, |this, cx| {
++                this.saved = saved;
++                this.rebuild(cx);
++            })
++            .ok();
++        });
++    }
++
++    /// Merges the saved versions with the commits whose details have arrived, newest first.
++    fn rebuild(&mut self, cx: &mut Context<Self>) {
++        let mut entries = self
++            .saved
++            .iter()
++            .cloned()
++            .map(TimelineEntry::Saved)
++            .collect::<Vec<_>>();
++        if let Some((repository, repo_path)) = &self.repository {
++            let log_source = LogSource::Path(repo_path.clone());
++            repository.update(cx, |repository, cx| {
++                let shas = repository
++                    .graph_data(log_source, LogOrder::DateOrder, 0..MAX_COMMITS, cx)
++                    .commits
++                    .iter()
++                    .map(|commit| commit.sha)
++                    .collect::<Vec<_>>();
++                for sha in shas {
++                    if let Some(commit) = self.loaded_commits.get(&sha) {
++                        entries.push(TimelineEntry::Commit(commit.clone()));
++                    } else if let CommitDataState::Loaded(commit) =
++                        repository.fetch_commit_data(sha, false, cx)
++                    {
++                        self.loaded_commits.insert(sha, commit.clone());
++                        entries.push(TimelineEntry::Commit(commit.clone()));
++                    }
++                }
++            });
++        }
++        entries.sort_by_key(|entry| Reverse(entry.unix_seconds()));
++        self.entries = entries;
++        cx.notify();
++    }
++
++    fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
++        let next = self.selected.map_or(0, |selected| selected + 1);
++        if next < self.entries.len() {
++            self.select(next, cx);
++        }
++    }
++
++    fn select_previous(
++        &mut self,
++        _: &menu::SelectPrevious,
++        _: &mut Window,
++        cx: &mut Context<Self>,
++    ) {
++        if let Some(previous) = self.selected.and_then(|selected| selected.checked_sub(1)) {
++            self.select(previous, cx);
++        }
++    }
++
++    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
++        if let Some(selected) = self.selected {
++            self.open_entry(selected, window, cx);
++        }
++    }
++
++    fn select(&mut self, index: usize, cx: &mut Context<Self>) {
++        self.selected = Some(index);
++        self.scroll_handle
++            .scroll_to_item(index, ScrollStrategy::Nearest);
++        cx.notify();
++    }
++
++    fn open_entry(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
++        let (Some(entry), Some(file)) = (self.entries.get(index), self.file.as_ref()) else {
++            return;
++        };
++        let old_text: Task<Result<String>> = match entry {
++            TimelineEntry::Saved(saved) => {
++                let snapshot = saved.snapshot.clone();
++                cx.background_spawn(async move {
++                    let contents = std::fs::read(&snapshot).context("reading the saved version")?;
++                    Ok(String::from_utf8_lossy(&contents).into_owned())
++                })
++            }
++            TimelineEntry::Commit(commit) => {
++                let Some((repository, repo_path)) = self.repository.as_ref() else {
++                    return;
++                };
++                let commit_sha = commit.sha.to_string();
++                let repo_path = repo_path.clone();
++                let contents = repository.update(cx, |repository, _| {
++                    repository.send_job("timeline", None, move |state, _| async move {
++                        match state {
++                            RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
++                                let direct = format!("{commit_sha}:{}", repo_path.as_unix_str());
++                                let loaded = backend
++                                    .load_revisions(vec![direct])
++                                    .await?
++                                    .into_iter()
++                                    .next()
++                                    .flatten();
++                                if loaded.is_some() {
++                                    return Ok(loaded);
++                                }
++                                // `git log --follow` includes commits from before the file was
++                                // renamed; resolve its historical path at `commit_sha`.
++                                if let Some(historical_path) =
++                                    backend.file_path_at_commit(&commit_sha, &repo_path).await?
++                                {
++                                    let historical = format!("{commit_sha}:{historical_path}");
++                                    return Ok(backend
++                                        .load_revisions(vec![historical])
++                                        .await?
++                                        .into_iter()
++                                        .next()
++                                        .flatten());
++                                }
++                                Ok(None)
++                            }
++                            RepositoryState::Remote(_) => Err(anyhow!(
++                                "the timeline can't read commits of remote projects"
++                            )),
++                        }
++                    })
++                });
++                cx.background_spawn(async move {
++                    let contents = contents.await??.context(
++                        "the file had another name, or did not exist, in that commit",
++                    )?;
++                    Ok(String::from_utf8_lossy(&contents).into_owned())
++                })
++            }
++        };
++        let title: SharedString = format!("{} ({})", file.name, relative_time(entry)).into();
++        let project_path = file.project_path.clone();
++        let project = self.project.clone();
++        let workspace = self.workspace.clone();
++        cx.spawn_in(window, async move |_, cx| {
++            let old_text = old_text.await?;
++            let new_buffer = project
++                .update(cx, |project, cx| project.open_buffer(project_path, cx))
++                .await?;
++            let old_buffer = cx.new(|cx| {
++                let mut buffer = Buffer::local(old_text, cx);
++                let new = new_buffer.read(cx);
++                if let Some(language_registry) = new.language_registry() {
++                    buffer.set_language_registry(language_registry);
++                }
++                buffer.set_language(new.language().cloned(), cx);
++                buffer.set_capability(Capability::ReadOnly, cx);
++                buffer
++            });
++            let diff = build_buffer_diff(&old_buffer, &new_buffer, cx).await?;
++            workspace.update_in(cx, |workspace, window, cx| {
++                let workspace_entity = cx.entity();
++                let diff_view = cx.new(|cx| {
++                    let mut diff_view = FileDiffView::new(
++                        old_buffer,
++                        new_buffer,
++                        diff,
++                        project,
++                        workspace_entity,
++                        window,
++                        cx,
++                    );
++                    diff_view.set_old_title(title, cx);
++                    diff_view
++                });
++                workspace.add_item_to_active_pane(Box::new(diff_view), None, true, window, cx);
++            })
++        })
++        .detach_and_prompt_err(
++            "Failed to open the timeline entry",
++            window,
++            cx,
++            |_, _, _| None,
++        );
++    }
++
++    fn render_entry(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
++        let Some(entry) = self.entries.get(index) else {
++            return div().into_any_element();
++        };
++        let (icon, label, description) = match entry {
++            TimelineEntry::Saved(_) => (IconName::Circle, SharedString::from("File Saved"), None),
++            TimelineEntry::Commit(commit) => (
++                IconName::GitCommit,
++                commit.subject.clone(),
++                Some(commit.author_name.clone()),
++            ),
++        };
++        ListItem::new(index)
++            .spacing(ListItemSpacing::ExtraDense)
++            .toggle_state(self.selected == Some(index))
++            .start_slot(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
++            .child(
++                h_flex()
++                    .min_w_0()
++                    .gap_1p5()
++                    .child(Label::new(label).single_line().truncate())
++                    .children(description.map(|description| {
++                        Label::new(description)
++                            .size(LabelSize::Small)
++                            .color(Color::Muted)
++                            .single_line()
++                    })),
++            )
++            .end_slot(
++                Label::new(relative_time(entry))
++                    .size(LabelSize::Small)
++                    .color(Color::Muted)
++                    .single_line(),
++            )
++            .on_click(cx.listener(move |this, _, window, cx| {
++                this.select(index, cx);
++                this.open_entry(index, window, cx);
++            }))
++            .into_any_element()
++    }
++}
++
++fn relative_time(entry: &TimelineEntry) -> String {
++    let now = OffsetDateTime::now_utc();
++    let time = OffsetDateTime::from_unix_timestamp(entry.unix_seconds()).unwrap_or(now);
++    time_format::format_local_timestamp(time, now, TimestampFormat::Relative)
++}
++
++impl Focusable for TimelineView {
++    fn focus_handle(&self, _: &App) -> FocusHandle {
++        self.focus_handle.clone()
++    }
++}
++
++impl Render for TimelineView {
++    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        let message = if self.file.is_none() {
++            Some("The active editor cannot provide timeline information.")
++        } else if self.entries.is_empty() {
++            Some("No timeline information was provided.")
++        } else {
++            None
++        };
++        v_flex()
++            .id("timeline")
++            .key_context("Timeline")
++            .track_focus(&self.focus_handle)
++            .size_full()
++            .on_action(cx.listener(Self::select_next))
++            .on_action(cx.listener(Self::select_previous))
++            .on_action(cx.listener(Self::confirm))
++            .map(|this| match message {
++                Some(message) => this.child(
++                    div().px_3().py_1().child(
++                        Label::new(message)
++                            .color(Color::Muted)
++                            .size(LabelSize::Small),
++                    ),
++                ),
++                None => this.child(
++                    uniform_list(
++                        "timeline-entries",
++                        self.entries.len(),
++                        cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
++                            range.map(|index| this.render_entry(index, cx)).collect()
++                        }),
++                    )
++                    .track_scroll(&self.scroll_handle)
++                    .size_full(),
++                ),
++            })
++    }
++}
+diff --git a/crates/workspace/src/pane.rs b/crates/workspace/src/pane.rs
+index bd85734..85494bf 100644
+--- a/crates/workspace/src/pane.rs
++++ b/crates/workspace/src/pane.rs
+@@ -3406,6 +3406,7 @@ impl Pane {
+ 
+                             let entry_abs_path = pane.read(cx).entry_abs_path(entry, cx);
+                             let reveal_path = entry_abs_path.clone();
++                            let timeline_path = entry_abs_path.clone();
+                             let parent_abs_path = entry_abs_path
+                                 .as_deref()
+                                 .and_then(|abs_path| Some(abs_path.parent()?.to_path_buf()));
+@@ -3549,6 +3550,22 @@ impl Pane {
+                                         }),
+                                     )
+                                 })
++                                .when_some(timeline_path, |menu, abs_path| {
++                                    menu.entry(
++                                        "Open Timeline",
++                                        None,
++                                        window.handler_for(&pane, move |_, window, cx| {
++                                            window.dispatch_action(
++                                                Box::new(
++                                                    zed_actions::timeline::OpenTimelineForPath {
++                                                        abs_path: abs_path.clone(),
++                                                    },
++                                                ),
++                                                cx,
++                                            )
++                                        }),
++                                    )
++                                })
+                                 .when_some(parent_abs_path, |menu, parent_abs_path| {
+                                     menu.entry(
+                                         "Open in Terminal",
+diff --git a/crates/zed/Cargo.toml b/crates/zed/Cargo.toml
+index 7b059ba..05d8fdf 100644
+--- a/crates/zed/Cargo.toml
++++ b/crates/zed/Cargo.toml
+@@ -214,6 +214,7 @@ theme_selector.workspace = true
+ theme_settings.workspace = true
+ time.workspace = true
+ time_format.workspace = true
++timeline.workspace = true
+ title_bar.workspace = true
+ toolchain_selector.workspace = true
+ tracing.workspace = true
+diff --git a/crates/zed_actions/src/lib.rs b/crates/zed_actions/src/lib.rs
+index 149991a..4e80fac 100644
+--- a/crates/zed_actions/src/lib.rs
++++ b/crates/zed_actions/src/lib.rs
+@@ -451,6 +451,27 @@ pub mod theme {
+     actions!(theme, [ToggleMode]);
+ }
+ 
++pub mod timeline {
++    use gpui::{Action, actions};
++    use std::path::PathBuf;
++
++    actions!(
++        timeline,
++        [
++            /// Opens the Timeline of the active file: its saved versions and the commits that
++            /// changed it.
++            OpenTimeline,
++        ]
++    );
++
++    /// Opens the Timeline of the given file, from the project panel's or a tab's context menu.
++    #[derive(Clone, Debug, Default, PartialEq, Action)]
++    #[action(namespace = timeline, no_json, no_register)]
++    pub struct OpenTimelineForPath {
++        pub abs_path: PathBuf,
++    }
++}
++
+ pub mod theme_selector {
+     use gpui::Action;
+     use schemars::JsonSchema;
+-- 
+2.54.0 (Apple Git-157)
+

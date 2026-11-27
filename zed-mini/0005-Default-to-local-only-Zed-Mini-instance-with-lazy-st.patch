@@ -1,0 +1,556 @@
+From 57aef9f19f41028f63bb934965a4fd0c2709f3ca Mon Sep 17 00:00:00 2001
+From: mini <mini@local>
+Date: Fri, 27 Nov 2026 03:37:37 -0300
+Subject: [PATCH 05/10] Default to local-only Zed Mini instance with lazy
+ stores and fast config read
+
+Isolates Zed Mini's single-instance port and data/state/cache/log paths,
+defaults to local-only settings (no AI, telemetry, auto-update, collab,
+or package-version-server), reads config files before arming FSEvents
+watchers, pre-parses default settings, opens PromptStore's LMDB lazily,
+and skips reliability hang/memory pollers when telemetry is disabled.
+---
+ assets/settings/default.json                  | 37 ++++++++---------
+ .../configure_context_server_modal.rs         | 14 ++++---
+ crates/paths/src/paths.rs                     | 13 ++++--
+ crates/prompt_store/src/prompt_store.rs       | 40 ++++++++++++-------
+ crates/recent_projects/src/remote_servers.rs  |  5 ++-
+ crates/settings/src/settings.rs               | 28 +++++++++++++
+ crates/settings/src/settings_file.rs          | 13 +++++-
+ crates/settings/src/settings_store.rs         | 39 ++++++++++++++++--
+ .../settings_ui/src/pages/mcp_servers_page.rs | 12 +++---
+ crates/zed/src/reliability.rs                 |  5 +++
+ crates/zed/src/zed/mac_only_instance.rs       |  8 +++-
+ 11 files changed, 159 insertions(+), 55 deletions(-)
+
+diff --git a/assets/settings/default.json b/assets/settings/default.json
+index eb13c39..928a9aa 100644
+--- a/assets/settings/default.json
++++ b/assets/settings/default.json
+@@ -627,13 +627,13 @@
+     // Whether to show the project host and name in the titlebar.
+     "show_project_items": true,
+     // Whether to show onboarding banners in the titlebar.
+-    "show_onboarding_banner": true,
++    "show_onboarding_banner": false,
+     // Whether to show user picture in the titlebar.
+-    "show_user_picture": true,
++    "show_user_picture": false,
+     // Whether to show the user menu in the titlebar.
+-    "show_user_menu": true,
++    "show_user_menu": false,
+     // Whether to show the sign in button in the titlebar.
+-    "show_sign_in": true,
++    "show_sign_in": false,
+     // Whether to show the menus in the titlebar.
+     "show_menus": false,
+     // Whether to open the menus in the titlebar on hover.
+@@ -715,7 +715,7 @@
+     //    "hover"
+     // 2. Always show the minimap thumb:
+     //    "always" (default)
+-    "thumb": "always",
++    "thumb": "hover",
+     // How the minimap thumb border should look.
+     // This setting can take five values:
+     // 1. Display a border on all sides of the thumb:
+@@ -728,7 +728,7 @@
+     //    "thumb_border": "left_only"
+     // 5. Display the thumb without any border:
+     //    "thumb_border": "none"
+-    "thumb_border": "left_open",
++    "thumb_border": "none",
+     // How to highlight the current line in the minimap.
+     // This setting can take the following values:
+     //
+@@ -887,7 +887,7 @@
+     // Default width of the project panel.
+     "default_width": 240,
+     // Where to dock the project panel. Can be 'left' or 'right'.
+-    "dock": "right",
++    "dock": "left",
+     // Spacing between worktree entries in the project panel. Can be 'comfortable' or 'standard'.
+     "entry_spacing": "comfortable",
+     // Whether to show file icons in the project panel.
+@@ -900,11 +900,11 @@
+     //   "chevron"
+     // 3. A disclosure chevron followed by a folder icon:
+     //   "both"
+-    "folder_indicator": "icon",
++    "folder_indicator": "both",
+     // Whether to show the git status in the project panel.
+     "git_status": true,
+     // Amount of indentation for nested items.
+-    "indent_size": 20,
++    "indent_size": 8,
+     // Whether to reveal it in the project panel automatically,
+     // when a corresponding project entry becomes active.
+     // Gitignored entries are never auto revealed.
+@@ -1077,7 +1077,7 @@
+   },
+   "collaboration_panel": {
+     // Whether to show the collaboration panel button in the status bar.
+-    "button": true,
++    "button": false,
+     // Where to dock the collaboration panel. Can be 'left' or 'right'.
+     "dock": "right",
+     // Default width of the collaboration panel.
+@@ -1093,7 +1093,7 @@
+     // Whether to show the git panel button in the status bar.
+     "button": true,
+     // Where to dock the git panel. Can be 'left' or 'right'.
+-    "dock": "right",
++    "dock": "left",
+     // Default width of the git panel.
+     "default_width": 360,
+     // Style of the git status indicator in the panel.
+@@ -1434,7 +1434,7 @@
+     "auto_generate_thread_titles": true,
+   },
+   // Whether the screen sharing icon is shown in the os status bar.
+-  "show_call_status_icon": true,
++  "show_call_status_icon": false,
+   // Whether to use language servers to provide code intelligence.
+   "enable_language_server": true,
+   // Whether to perform linked edits of associated ranges, if the language server supports it.
+@@ -1488,7 +1488,7 @@
+     // Whether or not to show the tab bar in the editor
+     "show": true,
+     // Whether or not to show the navigation history buttons.
+-    "show_nav_history_buttons": true,
++    "show_nav_history_buttons": false,
+     // Whether or not to show the tab bar buttons.
+     "show_tab_bar_buttons": true,
+     // Whether or not to show pinned tabs in a separate row.
+@@ -1511,7 +1511,7 @@
+     // One of: ["right", "left"]
+     "close_position": "right",
+     // Whether to show the file icon for a tab.
+-    "file_icons": false,
++    "file_icons": true,
+     // Controls the appearance behavior of the tab's close button.
+     //
+     // 1. Show it just upon hovering the tab. (default)
+@@ -1730,9 +1730,9 @@
+   // Control what info is collected by Zed.
+   "telemetry": {
+     // Send debug info like crash reports.
+-    "diagnostics": true,
++    "diagnostics": false,
+     // Send anonymized usage data like what languages you're using Zed with.
+-    "metrics": true,
++    "metrics": false,
+     // Allow sending requests to Anthropic models that cannot be offered with
+     // Zero Data Retention
+     "anthropic_retention": false,
+@@ -1740,10 +1740,10 @@
+   // Whether to disable all AI features in Zed.
+   //
+   // Default: false
+-  "disable_ai": false,
++  "disable_ai": true,
+   // Automatically update Zed. This setting may be ignored on Linux if
+   // installed through a package manager.
+-  "auto_update": true,
++  "auto_update": false,
+   // How to render LSP `textDocument/documentColor` colors in the editor.
+   //
+   // Possible values:
+@@ -2565,6 +2565,7 @@
+       },
+     },
+     "JSON": {
++      "language_servers": ["!package-version-server", "..."],
+       "prettier": {
+         "allowed": true,
+       },
+diff --git a/crates/agent_ui/src/agent_configuration/configure_context_server_modal.rs b/crates/agent_ui/src/agent_configuration/configure_context_server_modal.rs
+index 1ae1ab1..7a55317 100644
+--- a/crates/agent_ui/src/agent_configuration/configure_context_server_modal.rs
++++ b/crates/agent_ui/src/agent_configuration/configure_context_server_modal.rs
+@@ -378,12 +378,14 @@ fn resolve_context_server_extension(
+         return Task::ready(None);
+     };
+ 
+-    let extension = ExtensionStore::global(cx)
+-        .read(cx)
+-        .installed_extensions()
+-        .iter()
+-        .find(|(_, entry)| entry.manifest.context_servers.contains_key(&id.0))
+-        .map(|(id, entry)| (id.clone(), entry.manifest.clone()));
++    let extension = ExtensionStore::try_global(cx).and_then(|store| {
++        store
++            .read(cx)
++            .installed_extensions()
++            .iter()
++            .find(|(_, entry)| entry.manifest.context_servers.contains_key(&id.0))
++            .map(|(id, entry)| (id.clone(), entry.manifest.clone()))
++    });
+     cx.spawn(async move |cx| {
+         let installation = descriptor
+             .configuration(worktree_store, cx)
+diff --git a/crates/paths/src/paths.rs b/crates/paths/src/paths.rs
+index 9c16f1d..4421580 100644
+--- a/crates/paths/src/paths.rs
++++ b/crates/paths/src/paths.rs
+@@ -17,6 +17,11 @@ pub const EDITORCONFIG_NAME: &str = ".editorconfig";
+ /// Forks should change this to avoid colliding with Zed's user data.
+ pub const APP_NAME: &str = "Zed";
+ 
++/// Zed Mini shares `~/.config/zed` (settings, keymap) with the official Zed, but keeps its
++/// own data, state, caches and logs so both can run side by side without touching each
++/// other's database or log.
++pub const MINI_NAME: &str = "Zed Mini";
++
+ /// Lowercased form of [`APP_NAME`], for use in XDG-style paths on
+ /// Linux/FreeBSD and the macOS `~/.config` fallback.
+ pub const APP_NAME_LOWERCASE: &str = {
+@@ -148,7 +153,7 @@ pub fn data_dir() -> &'static PathBuf {
+         } else if cfg!(target_os = "macos") {
+             home_dir()
+                 .join("Library/Application Support")
+-                .join(APP_NAME)
++                .join(MINI_NAME)
+         } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+             if let Ok(flatpak_xdg_data) = std::env::var("FLATPAK_XDG_DATA_HOME") {
+                 flatpak_xdg_data.into()
+@@ -170,7 +175,7 @@ pub fn state_dir() -> &'static PathBuf {
+     static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
+     STATE_DIR.get_or_init(|| {
+         if cfg!(target_os = "macos") {
+-            return home_dir().join(".local").join("state").join(APP_NAME);
++            return home_dir().join(".local").join("state").join(MINI_NAME);
+         }
+ 
+         if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+@@ -196,7 +201,7 @@ pub fn temp_dir() -> &'static PathBuf {
+         if cfg!(target_os = "macos") {
+             return dirs::cache_dir()
+                 .expect("failed to determine cachesDirectory directory")
+-                .join(APP_NAME);
++                .join(MINI_NAME);
+         }
+ 
+         if cfg!(target_os = "windows") {
+@@ -229,7 +234,7 @@ pub fn logs_dir() -> &'static PathBuf {
+     static LOGS_DIR: OnceLock<PathBuf> = OnceLock::new();
+     LOGS_DIR.get_or_init(|| {
+         if cfg!(target_os = "macos") {
+-            home_dir().join("Library/Logs").join(APP_NAME)
++            home_dir().join("Library/Logs").join(MINI_NAME)
+         } else {
+             data_dir().join("logs")
+         }
+diff --git a/crates/prompt_store/src/prompt_store.rs b/crates/prompt_store/src/prompt_store.rs
+index df270bb..9e5bc87 100644
+--- a/crates/prompt_store/src/prompt_store.rs
++++ b/crates/prompt_store/src/prompt_store.rs
+@@ -22,20 +22,14 @@ use text::LineEnding;
+ use util::ResultExt;
+ use uuid::Uuid;
+ 
+-/// Init starts loading the PromptStore in the background and assigns
+-/// a shared future to a global.
++/// Registers the global PromptStore path; the underlying LMDB database is
++/// opened lazily on the first [`PromptStore::global`] access.
+ pub fn init(cx: &mut App) {
+     let db_path = paths::prompts_dir().join("prompts-library-db.0.mdb");
+-    let prompt_store_task = PromptStore::new(db_path, cx);
+-    let prompt_store_entity_task = cx
+-        .spawn(async move |cx| {
+-            prompt_store_task
+-                .await
+-                .map(|prompt_store| cx.new(|_cx| prompt_store))
+-                .map_err(Arc::new)
+-        })
+-        .shared();
+-    cx.set_global(GlobalPromptStore(prompt_store_entity_task))
++    cx.set_global(GlobalPromptStore {
++        db_path,
++        task: parking_lot::Mutex::new(None),
++    });
+ }
+ 
+ #[derive(Clone, Debug, Serialize, Deserialize)]
+@@ -210,7 +204,22 @@ impl MetadataCache {
+ 
+ impl PromptStore {
+     pub fn global(cx: &App) -> impl Future<Output = Result<Entity<Self>>> + use<> {
+-        let store = GlobalPromptStore::global(cx).0.clone();
++        let global = GlobalPromptStore::global(cx);
++        let store = {
++            let mut guard = global.task.lock();
++            guard
++                .get_or_insert_with(|| {
++                    let prompt_store_task = PromptStore::new(global.db_path.clone(), cx);
++                    cx.spawn(async move |cx| {
++                        prompt_store_task
++                            .await
++                            .map(|prompt_store| cx.new(|_cx| prompt_store))
++                            .map_err(Arc::new)
++                    })
++                    .shared()
++                })
++                .clone()
++        };
+         async move { store.await.map_err(|err| anyhow!(err)) }
+     }
+ 
+@@ -348,7 +357,10 @@ struct PromptMetadataV1 {
+ }
+ 
+ /// Wraps a shared future to a prompt store so it can be assigned as a context global.
+-pub struct GlobalPromptStore(Shared<Task<Result<Entity<PromptStore>, Arc<anyhow::Error>>>>);
++pub struct GlobalPromptStore {
++    db_path: PathBuf,
++    task: parking_lot::Mutex<Option<Shared<Task<Result<Entity<PromptStore>, Arc<anyhow::Error>>>>>>,
++}
+ 
+ impl Global for GlobalPromptStore {}
+ 
+diff --git a/crates/recent_projects/src/remote_servers.rs b/crates/recent_projects/src/remote_servers.rs
+index d0a010e..95f9be4 100644
+--- a/crates/recent_projects/src/remote_servers.rs
++++ b/crates/recent_projects/src/remote_servers.rs
+@@ -2279,7 +2279,10 @@ impl RemoteServerProjects {
+                     }
+                 };
+             cx.update(|_, cx| {
+-                ExtensionStore::global(cx).update(cx, |this, cx| {
++                let Some(extension_store) = ExtensionStore::try_global(cx) else {
++                    return;
++                };
++                extension_store.update(cx, |this, cx| {
+                     for extension in &dev_container_connection.extension_ids {
+                         log::info!("Installing extension {extension} from devcontainer");
+                         this.install_latest_extension(Arc::from(extension.clone()), cx);
+diff --git a/crates/settings/src/settings.rs b/crates/settings/src/settings.rs
+index ce7731f..a5d84ae 100644
+--- a/crates/settings/src/settings.rs
++++ b/crates/settings/src/settings.rs
+@@ -143,12 +143,40 @@ util::fs_embed! {
+     exclude = ["*.DS_Store"],
+ }
+ 
++pub struct PreloadedDefaultSettings {
++    default_settings: SettingsContent,
++    semantic_token_rules: SemanticTokenRules,
++}
++
++pub fn preload_default_settings() -> PreloadedDefaultSettings {
++    let default_settings = SettingsStore::parse_default_settings(&default_settings())
++        .expect("failed to parse bundled default settings");
++    let semantic_token_rules =
++        crate::parse_json_with_comments::<SemanticTokenRules>(&default_semantic_token_rules())
++            .unwrap_or_default();
++    PreloadedDefaultSettings {
++        default_settings,
++        semantic_token_rules,
++    }
++}
++
+ pub fn init(cx: &mut App) {
+     let settings = SettingsStore::new(cx, &default_settings());
+     cx.set_global(settings);
+     SettingsStore::observe_active_settings_profile_name(cx).detach();
+ }
+ 
++pub fn init_with_preloaded(preloaded: PreloadedDefaultSettings, cx: &mut App) {
++    if !cx.has_global::<DefaultSemanticTokenRules>() {
++        cx.set_global::<DefaultSemanticTokenRules>(DefaultSemanticTokenRules(
++            preloaded.semantic_token_rules,
++        ));
++    }
++    let settings = SettingsStore::from_preloaded_default_settings(cx, preloaded.default_settings);
++    cx.set_global(settings);
++    SettingsStore::observe_active_settings_profile_name(cx).detach();
++}
++
+ pub fn default_settings() -> Cow<'static, str> {
+     asset_str::<SettingsAssets>("settings/default.json")
+ }
+diff --git a/crates/settings/src/settings_file.rs b/crates/settings/src/settings_file.rs
+index f1c190c..3bd9313 100644
+--- a/crates/settings/src/settings_file.rs
++++ b/crates/settings/src/settings_file.rs
+@@ -176,11 +176,20 @@ pub fn watch_config_file(
+     let (tx, rx) = mpsc::unbounded();
+     let task = executor.spawn(async move {
+         let path = fs.canonicalize(&path).await.unwrap_or_else(|_| path);
++        let initial_contents = fs.load(&path).await.unwrap_or_default();
++        if tx.unbounded_send(initial_contents.clone()).is_err() {
++            return;
++        }
++
+         let (events, _) = fs.watch(&path, Duration::from_millis(100)).await;
+         futures::pin_mut!(events);
+ 
+-        let contents = fs.load(&path).await.unwrap_or_default();
+-        if tx.unbounded_send(contents).is_err() {
++        // Re-check once after arming the watcher so writes between the initial read
++        // and watcher setup are never missed.
++        if let Ok(contents) = fs.load(&path).await
++            && contents != initial_contents
++            && tx.unbounded_send(contents).is_err()
++        {
+             return;
+         }
+ 
+diff --git a/crates/settings/src/settings_store.rs b/crates/settings/src/settings_store.rs
+index dd0ec9f..28cec1e 100644
+--- a/crates/settings/src/settings_store.rs
++++ b/crates/settings/src/settings_store.rs
+@@ -303,6 +303,21 @@ impl SettingsStore {
+         Self::from_settings_content(cx, default_settings)
+     }
+ 
++    pub(crate) fn from_preloaded_default_settings(
++        cx: &mut App,
++        default_settings: SettingsContent,
++    ) -> Self {
++        Self::from_settings_content(cx, default_settings)
++    }
++
++    pub fn terminal_font_family(&self) -> Option<&str> {
++        self.merged_settings
++            .terminal
++            .as_ref()
++            .and_then(|terminal| terminal.font_family.as_ref())
++            .map(|family| family.0.as_ref())
++    }
++
+     fn from_settings_content(cx: &mut App, default_settings: SettingsContent) -> Self {
+         let (setting_file_updates_tx, mut setting_file_updates_rx) = mpsc::unbounded();
+         if !cx.has_global::<DefaultSemanticTokenRules>() {
+@@ -365,17 +380,35 @@ impl SettingsStore {
+         cx: &mut App,
+         settings_changed: impl 'static + Fn(SettingsFile, SettingsParseResult, &mut App),
+     ) {
+-        let (mut user_settings_file_rx, user_settings_watcher) = crate::watch_config_file(
++        let (user_settings_file_rx, user_settings_watcher) = crate::watch_config_file(
+             cx.background_executor(),
+             fs.clone(),
+             paths::settings_file().clone(),
+         );
+-        let (mut global_settings_file_rx, global_settings_watcher) = crate::watch_config_file(
++        let (global_settings_file_rx, global_settings_watcher) = crate::watch_config_file(
+             cx.background_executor(),
+             fs,
+             paths::global_settings_file().clone(),
+         );
++        self.watch_settings_files_with_receivers(
++            user_settings_file_rx,
++            user_settings_watcher,
++            global_settings_file_rx,
++            global_settings_watcher,
++            cx,
++            settings_changed,
++        );
++    }
+ 
++    pub fn watch_settings_files_with_receivers(
++        &mut self,
++        mut user_settings_file_rx: mpsc::UnboundedReceiver<String>,
++        user_settings_watcher: gpui::Task<()>,
++        mut global_settings_file_rx: mpsc::UnboundedReceiver<String>,
++        global_settings_watcher: gpui::Task<()>,
++        cx: &mut App,
++        settings_changed: impl 'static + Fn(SettingsFile, SettingsParseResult, &mut App),
++    ) {
+         let global_content = cx
+             .foreground_executor()
+             .block_on(global_settings_file_rx.next())
+@@ -955,7 +988,7 @@ impl SettingsStore {
+     ///
+     /// Unlike user settings, default settings are used directly as the base for all
+     /// merges, so overrides must be resolved up front.
+-    fn parse_default_settings(default_settings: &str) -> Result<SettingsContent> {
++    pub(crate) fn parse_default_settings(default_settings: &str) -> Result<SettingsContent> {
+         let parsed = UserSettingsContent::parse_json_with_comments(default_settings)?;
+         let mut merged = (*parsed.content).clone();
+         merged.merge_from_option(parsed.for_release_channel());
+diff --git a/crates/settings_ui/src/pages/mcp_servers_page.rs b/crates/settings_ui/src/pages/mcp_servers_page.rs
+index 92cee7f..b62751e 100644
+--- a/crates/settings_ui/src/pages/mcp_servers_page.rs
++++ b/crates/settings_ui/src/pages/mcp_servers_page.rs
+@@ -252,7 +252,7 @@ fn map_server_status(status: &ContextServerStatus) -> AiSettingItemStatus {
+ }
+ 
+ fn resolve_extension_display_name(id: &ContextServerId, cx: &App) -> Option<SharedString> {
+-    ExtensionStore::global(cx)
++    ExtensionStore::try_global(cx)?
+         .read(cx)
+         .installed_extensions()
+         .iter()
+@@ -635,9 +635,11 @@ fn uninstall_server(
+             resolve_extension_for_context_server(context_server_id, cx)
+         {
+             if extension_only_provides_context_server(&manifest) {
+-                ExtensionStore::global(cx)
+-                    .update(cx, |store, cx| store.uninstall_extension(ext_id, cx))
+-                    .detach_and_log_err(cx);
++                if let Some(store) = ExtensionStore::try_global(cx) {
++                    store
++                        .update(cx, |store, cx| store.uninstall_extension(ext_id, cx))
++                        .detach_and_log_err(cx);
++                }
+             }
+         }
+     }
+@@ -656,7 +658,7 @@ fn resolve_extension_for_context_server(
+     id: &ContextServerId,
+     cx: &App,
+ ) -> Option<(Arc<str>, Arc<extension::ExtensionManifest>)> {
+-    ExtensionStore::global(cx)
++    ExtensionStore::try_global(cx)?
+         .read(cx)
+         .installed_extensions()
+         .iter()
+diff --git a/crates/zed/src/reliability.rs b/crates/zed/src/reliability.rs
+index 17b6979..1d3aefb 100644
+--- a/crates/zed/src/reliability.rs
++++ b/crates/zed/src/reliability.rs
+@@ -30,6 +30,11 @@ mod hang_detection;
+ type ProjectRegistry = Rc<RefCell<Vec<WeakEntity<Project>>>>;
+ 
+ pub fn init(client: Arc<Client>, workspace_store: Entity<WorkspaceStore>, cx: &mut App) {
++    let telemetry = client.telemetry();
++    if !telemetry.diagnostics_enabled() && !telemetry.metrics_enabled() {
++        return;
++    }
++
+     hang_detection::start(client.clone(), cx);
+     let projects = ProjectRegistry::default();
+     start_memory_usage_logging(workspace_store, projects.clone(), cx);
+diff --git a/crates/zed/src/zed/mac_only_instance.rs b/crates/zed/src/zed/mac_only_instance.rs
+index eec89de..68267b0 100644
+--- a/crates/zed/src/zed/mac_only_instance.rs
++++ b/crates/zed/src/zed/mac_only_instance.rs
+@@ -27,10 +27,14 @@ fn address() -> SocketAddr {
+     // 44338, 44438, and 44538 for the preview, stable, and nightly channels,
+     // respectively. User 502 will use ports 44339, 44439, and 44539 for the preview,
+     // stable, and nightly channels, respectively.
++    //
++    // Zed Mini is a stable-channel build too, so it takes the unused block above nightly
++    // (44137 for user 501) to run alongside the official Zed instead of exiting as a
++    // second instance of it.
+     let port = match *release_channel::RELEASE_CHANNEL {
+         ReleaseChannel::Dev => 43737,
+         ReleaseChannel::Preview => 43737 + USER_BLOCK,
+-        ReleaseChannel::Stable => 43737 + (2 * USER_BLOCK),
++        ReleaseChannel::Stable => 43737 + (4 * USER_BLOCK),
+         ReleaseChannel::Nightly => 43737 + (3 * USER_BLOCK),
+     };
+     let uid = getuid().as_raw();
+@@ -49,7 +53,7 @@ fn instance_handshake() -> &'static str {
+         ReleaseChannel::Dev => "Zed Editor Dev Instance Running",
+         ReleaseChannel::Nightly => "Zed Editor Nightly Instance Running",
+         ReleaseChannel::Preview => "Zed Editor Preview Instance Running",
+-        ReleaseChannel::Stable => "Zed Editor Stable Instance Running",
++        ReleaseChannel::Stable => "Zed Mini Instance Running",
+     }
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,43 @@
+From 9c634c07cbe7346c7bd0599bee26c806cbac33d8 Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Mon, 23 Nov 2026 11:15:28 -0300
+Subject: [PATCH 6/6] Draw the repeat button as the shuffle button, grey while
+ off
+
+---
+ Spotifly/Views/NowPlayingBarView.swift | 15 +++++++++------
+ 1 file changed, 9 insertions(+), 6 deletions(-)
+
+diff --git a/Spotifly/Views/NowPlayingBarView.swift b/Spotifly/Views/NowPlayingBarView.swift
+index 2fb4258..e331d72 100644
+--- a/Spotifly/Views/NowPlayingBarView.swift
++++ b/Spotifly/Views/NowPlayingBarView.swift
+@@ -294,16 +294,19 @@ struct NowPlayingBarView: View {
+         .help(playbackViewModel.canShuffle ? shuffleName : "shuffle.unavailable")
+     }
+ 
+-    /// Three states, so a button that steps through them rather than a toggle: off, the
+-    /// context, the track, as on Spotify's clients.
++    /// Three states, off, the context, the track, as on Spotify's clients, which a click steps
++    /// through. A toggle in the button style all the same, on in either repeat, so it is drawn
++    /// as shuffle is: grey while off and in the accent once on. A button in the primary colour
++    /// would stand out white beside its grey neighbours.
+     private var repeatButton: some View {
+         let mode = playbackViewModel.repeatMode
+-        return Button {
+-            playbackViewModel.cycleRepeat()
+-        } label: {
++        return Toggle(isOn: Binding(
++            get: { mode != .off },
++            set: { _ in playbackViewModel.cycleRepeat() },
++        )) {
+             Image(systemName: mode == .track ? "repeat.1" : "repeat")
+-                .foregroundStyle(mode == .off ? Color.primary : Color.accentColor)
+         }
++        .toggleStyle(.button)
+         // Greyed out only where it would switch repeat on and cannot: a radio. Once on, as
+         // repeat-one carried into a radio, its next step leads back to off, which is allowed.
+         .disabled(!hasPlayback || (mode == .off && !playbackViewModel.canRepeat))
+-- 
+2.54.0 (Apple Git-157)
+

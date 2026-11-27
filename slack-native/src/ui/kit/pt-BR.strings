@@ -1,0 +1,8 @@
+/* The dialogs' form controls, in the pt-BR web client's words (sk_calendar, date pickers). */
+"forms.date.today" = "Hoje";
+"forms.date.tomorrow" = "Amanhã";
+"forms.calendar.previousYear" = "Ano anterior";
+"forms.calendar.previousMonth" = "Mês anterior";
+"forms.calendar.nextMonth" = "Próximo mês";
+"forms.calendar.nextYear" = "Próximo ano";
+"forms.calendar.weekdays" = "Do,2ª,3ª,4ª,5ª,6ª,Sá";

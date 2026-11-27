@@ -1,0 +1,164 @@
+From 282eb9fd6bf2aa6cfef3d46c546b584313d78fcf Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Thu, 26 Nov 2026 22:27:00 -0300
+Subject: [PATCH 12/19] Read the keychain off the main thread, so the window
+ opens while it asks
+
+---
+ Spotifly/Auth/KeymasterSession.swift    |  6 ++-
+ Spotifly/Soloist/SoloistEngine.swift    | 58 ++++++++++++++++++++-----
+ Spotifly/ViewModels/AuthViewModel.swift | 19 ++++++--
+ 3 files changed, 68 insertions(+), 15 deletions(-)
+
+diff --git a/Spotifly/Auth/KeymasterSession.swift b/Spotifly/Auth/KeymasterSession.swift
+index e3b94a2..e74784f 100644
+--- a/Spotifly/Auth/KeymasterSession.swift
++++ b/Spotifly/Auth/KeymasterSession.swift
+@@ -46,7 +46,10 @@ actor KeymasterSession {
+ 
+     private let store: KeymasterTokenStoring
+     private let refresher: Refresher
+-    private var tokens: KeymasterTokens?
++    /// Read at the first use, on the actor rather than wherever `shared` is first touched, which
++    /// is the main thread in `SpotiflyApp.init`: a build signed anew is not on the keychain
++    /// item's list, and the keychain's prompt holds the thread that asked until it is answered.
++    private lazy var tokens: KeymasterTokens? = store.load()
+     private var refreshInFlight: Task<KeymasterTokens, Error>?
+     /// Advanced by `supersedeRefresh()`. A refresh that was in flight when the grant was
+     /// cleared or replaced must not write what it eventually returns — that would put the
+@@ -59,7 +62,6 @@ actor KeymasterSession {
+     ) {
+         self.store = store
+         self.refresher = refresher
+-        tokens = store.load()
+     }
+ 
+     /// Whether a grant has been completed on this machine.
+diff --git a/Spotifly/Soloist/SoloistEngine.swift b/Spotifly/Soloist/SoloistEngine.swift
+index cf088b1..3996da9 100644
+--- a/Spotifly/Soloist/SoloistEngine.swift
++++ b/Spotifly/Soloist/SoloistEngine.swift
+@@ -152,20 +152,36 @@ final class SoloistEngine {
+     /// Starts Soloist if it is set up and not running: installs or renews the build first.
+     func start() async {
+         guard Self.isSetUp, process == nil, !isStarting else { return }
+-        guard let key = KeychainManager.loadSoloistKey(), !key.isEmpty else {
++        isStarting = true
++        defer { isStarting = false }
++
++        // Read the key and verify the installed binary in parallel off the main thread: hashing
++        // the 26 MB binary takes 50–80 ms and overlaps with the keychain read.
++        async let savedKey = Self.savedKey()
++        let ready = Self.readyBuild()
++        async let readyVerified = Self.verify(ready?.executable)
++
++        guard let key = await savedKey, !key.isEmpty else {
+             status = .failed(String(localized: "soloist.error.no_key"))
+             return
+         }
+-        isStarting = true
+-        defer { isStarting = false }
+ 
+         do {
+             try Self.makePrivateDirectories()
+-            let build = try await currentBuild()
+-            self.build = build
+-            let executable = SoloistInstaller.executable(of: build, in: Self.root)
+-            guard await SoloistInstaller.isSpotifys(executable) else {
+-                throw SoloistInstaller.Failure.notSpotifys
++            let executable: URL
++            if let ready {
++                build = ready.build
++                guard await readyVerified else {
++                    throw SoloistInstaller.Failure.notSpotifys
++                }
++                executable = ready.executable
++            } else {
++                let build = try await currentBuild()
++                self.build = build
++                executable = SoloistInstaller.executable(of: build, in: Self.root)
++                guard await SoloistInstaller.isSpotifys(executable) else {
++                    throw SoloistInstaller.Failure.notSpotifys
++                }
+             }
+             status = .starting
+             await stopLeftoverChild()
+@@ -178,6 +194,28 @@ final class SoloistEngine {
+         }
+     }
+ 
++    /// Off the main thread: a build signed anew is not on the keychain item's list, and the
++    /// keychain's prompt holds the thread that asked until it is answered.
++    @concurrent private nonisolated static func savedKey() async -> String? {
++        KeychainManager.loadSoloistKey()
++    }
++
++    private nonisolated static func verify(_ executable: URL?) async -> Bool {
++        guard let executable else { return false }
++        return await SoloistInstaller.isSpotifys(executable)
++    }
++
++    /// The installed build if it is already usable and not due for renewal, with its binary on disk.
++    private static func readyBuild(at now: Date = Date()) -> (build: SoloistBuild, executable: URL)? {
++        guard let build = SoloistInstaller.current(in: root),
++              build.isUsable(at: now),
++              !build.isDue(at: now)
++        else { return nil }
++        let executable = SoloistInstaller.executable(of: build, in: root)
++        guard FileManager.default.fileExists(atPath: executable.path) else { return nil }
++        return (build, executable)
++    }
++
+     /// The build to run: the recorded one while it is usable, renewed in its last 30 days.
+     private func currentBuild() async throws -> SoloistBuild {
+         let now = Date()
+@@ -336,14 +374,14 @@ final class SoloistEngine {
+     private func connectSocket() async throws {
+         let portFile = Self.data.appending(path: "ws.port")
+         var port: Int?
+-        for _ in 0 ..< 100 where process != nil {
++        for _ in 0 ..< 500 where process != nil {
+             if let text = try? String(contentsOf: portFile, encoding: .utf8) {
+                 port = Int(text.trimmingCharacters(in: .whitespacesAndNewlines))
+                 if port != nil {
+                     break
+                 }
+             }
+-            try await Task.sleep(for: .milliseconds(100))
++            try await Task.sleep(for: .milliseconds(20))
+         }
+         guard let port, let url = URL(string: "ws://127.0.0.1:\(port)") else {
+             throw SoloistInstaller.Failure.unpack
+diff --git a/Spotifly/ViewModels/AuthViewModel.swift b/Spotifly/ViewModels/AuthViewModel.swift
+index 6d5830c..6803659 100644
+--- a/Spotifly/ViewModels/AuthViewModel.swift
++++ b/Spotifly/ViewModels/AuthViewModel.swift
+@@ -96,9 +96,22 @@ final class AuthViewModel {
+ 
+     func loadFromKeychain() {
+         isLoading = true
+-        Task {
+-            isSignedIn = await KeymasterSession.shared.hasGrant
+-            isLoading = false
++        // Detached from the main actor: `SpotiflyApp.init` calls this before AppKit finishes
++        // starting up, and a main-actor task waits until the first run-loop turn to start and
++        // until after window restoration to resume. Starting off the main actor reads the
++        // keychain while AppKit initializes, so `startSession()` runs before window restoration
++        // instead of after the first frame; on a rebuild's prompt, the window still opens.
++        Task.detached(priority: .userInitiated) { [weak self] in
++            let signedIn = await KeymasterSession.shared.hasGrant
++            if signedIn {
++                Task.detached(priority: .userInitiated) { _ = try? await KeymasterSession.shared.accessToken() }
++                Task.detached(priority: .userInitiated) { _ = try? await ClientTokenProvider.shared.token() }
++            }
++            await MainActor.run {
++                guard let self else { return }
++                self.isSignedIn = signedIn
++                self.isLoading = false
++            }
+         }
+     }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

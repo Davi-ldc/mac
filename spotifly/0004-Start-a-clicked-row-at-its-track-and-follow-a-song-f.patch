@@ -1,0 +1,255 @@
+From b2a8868059a97855e2f08b8b5f27fe4e45a9efb9 Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Sun, 22 Nov 2026 22:59:09 -0300
+Subject: [PATCH 4/7] Start a clicked row at its track, and follow a song from
+ search with its recommendations
+
+---
+ Spotifly/PartnerAPI/SpclientAPI.swift       | 12 ++---
+ Spotifly/Store/Entities.swift               |  6 +++
+ Spotifly/ViewModels/PlaybackViewModel.swift | 49 ++++++++++++++++++++-
+ Spotifly/Views/SearchResultsView.swift      |  5 ++-
+ Spotifly/Views/TrackRow.swift               |  2 +-
+ SpotiflyTests/SearchResultsTests.swift      | 28 ++++++++++++
+ SpotiflyTests/SpclientContextTests.swift    | 14 ++++++
+ 7 files changed, 106 insertions(+), 10 deletions(-)
+
+diff --git a/Spotifly/PartnerAPI/SpclientAPI.swift b/Spotifly/PartnerAPI/SpclientAPI.swift
+index 1f0572e..316b5a4 100644
+--- a/Spotifly/PartnerAPI/SpclientAPI.swift
++++ b/Spotifly/PartnerAPI/SpclientAPI.swift
+@@ -309,7 +309,7 @@ nonisolated struct SpclientAPI: Sendable {
+ 
+     /// How many of a context's pages are fetched at most. An album or a playlist comes whole
+     /// well within it: a 150-track playlist came in one page.
+-    private static let pageLimit = 10
++    static let pageLimit = 10
+ 
+     /// An ordered track list resolved from a context uri.
+     struct ResolvedContext: Sendable {
+@@ -321,14 +321,14 @@ nonisolated struct SpclientAPI: Sendable {
+     /// Resolves an album or playlist uri into its tracks, via spclient's context resolver — the
+     /// same source Spotify's own clients use, and one that handles every context shape uniformly.
+     ///
+-    /// Its next pages are followed, up to `pageLimit` pages in all, and the page after them named
+-    /// as `nextPageUrl`. A later page that fails leaves the pages before it; only the first
+-    /// failing fails the resolve.
+-    func resolveContext(_ contextUri: String, deviceId: String) async throws -> ResolvedContext {
++    /// Its next pages are followed, up to `pages` in all, and the page after them named as
++    /// `nextPageUrl`. A later page that fails leaves the pages before it; only the first failing
++    /// fails the resolve. A station names pages without end, so its caller asks for few.
++    func resolveContext(_ contextUri: String, deviceId: String, pages: Int = pageLimit) async throws -> ResolvedContext {
+         let encodedUri = contextUri.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? contextUri
+ 
+         var context = try await contextPage("/context-resolve/v1/\(encodedUri)?device_id=\(deviceId)")
+-        for _ in 1 ..< Self.pageLimit {
++        for _ in 1 ..< max(1, pages) {
+             guard let next = context.nextPageUrl else { break }
+             do {
+                 let page = try await contextPage(Self.nextPagePath(next))
+diff --git a/Spotifly/Store/Entities.swift b/Spotifly/Store/Entities.swift
+index 7d2c4f5..63d2672 100644
+--- a/Spotifly/Store/Entities.swift
++++ b/Spotifly/Store/Entities.swift
+@@ -430,6 +430,12 @@ struct SearchResults: Encodable {
+         ids[kind] ?? []
+     }
+ 
++    /// A song and those found after it, past the few "Alle" shows: what a click on it plays when
++    /// Spotify's recommendations for it cannot be had (`playWithRecommendations`).
++    func trackIds(playedFrom trackId: String) -> [String] {
++        [trackId] + trackIds.drop { $0 != trackId }.dropFirst()
++    }
++
+     /// Adds a page of one kind: its ids, leaving out those already listed, and how many results
+     /// Spotify sent for it, which a page short of `pageSize` marks as the last.
+     mutating func append(_ newIds: [String], to kind: SearchKind, sent: Int, pageSize: Int) {
+diff --git a/Spotifly/ViewModels/PlaybackViewModel.swift b/Spotifly/ViewModels/PlaybackViewModel.swift
+index 7759b92..69f6f32 100644
+--- a/Spotifly/ViewModels/PlaybackViewModel.swift
++++ b/Spotifly/ViewModels/PlaybackViewModel.swift
+@@ -231,6 +231,10 @@ final class PlaybackViewModel {
+     /// to finish would reopen the door while the other was still tearing down.
+     private var logoutTask: Task<Void, Never>?
+ 
++    /// Counts the plays asked for, so one that waits on a request first can tell whether a
++    /// later one came meanwhile (`playWithRecommendations`).
++    private var playsAsked = 0
++
+     private init() {
+         observePlayer()
+         setupVolumeSubscription()
+@@ -445,9 +449,16 @@ final class PlaybackViewModel {
+ 
+     /// Plays a track or a context, wherever `playbackDevice` says. A row in a list passes its
+     /// index and its track, which the device starts at.
++    ///
++    /// The index goes only without a track. It counts the app's list, which can disagree with the
++    /// context the device resolves: Favorites drops relinked duplicates and rows it cannot read,
++    /// a playlist drops items that are not tracks, and Spotify's generated playlists change under
++    /// a list already loaded. A device that goes by the index then, or falls back to it for a uri
++    /// the context does not list, plays another song. Named by its uri alone, the clicked track
++    /// plays; Soloist plays it first when an album or playlist does not list it.
+     func play(uri: String, trackIndex: Int? = nil, startingAtUri: String? = nil) async {
+         // A track or a context alike: `ConnectCommand.Context` tells them apart.
+-        await start(.play(uri: uri, trackIndex: trackIndex, trackUri: startingAtUri))
++        await start(.play(uri: uri, trackIndex: startingAtUri == nil ? trackIndex : nil, trackUri: startingAtUri))
+     }
+ 
+     /// Plays a context shuffled, as the pages' Zufällig buttons do: shuffle on, then the context
+@@ -463,11 +474,42 @@ final class PlaybackViewModel {
+     }
+ 
+     func playTracks(_ trackUris: [String]) async {
+-        // The one caller disables its button on an empty list, so this only guards `[0]`.
+         guard !trackUris.isEmpty else { return }
+         await start(.play(trackUris: trackUris))
+     }
+ 
++    /// Plays a song that has no list to go on in, as a search result: the song, then Spotify's
++    /// recommendations for it, its radio's tracks, as Spotify's app goes on after a song from
++    /// search. Without them, as when the radio cannot be had, `otherwise` follows.
++    ///
++    /// The radio goes as tracks after the song in one list, not as the station itself: played as
++    /// a context, a station need not start with its song, and Soloist starts nothing for a
++    /// skip_to it cannot find in one. Its first page, one request of 50 tracks, is fetched
++    /// before the play.
++    func playWithRecommendations(trackUri: String, otherwise: [String]) async {
++        playsAsked &+= 1
++        let asked = playsAsked
++        await initializeIfNeeded()
++        var radio: [String] = []
++        if let trackId = SpotifyURI.trackId(from: trackUri), let from = commandSource {
++            do {
++                radio = try await SpclientAPI().resolveContext("spotify:station:track:\(trackId)", deviceId: from, pages: 1).tracks
++            } catch {
++                debugLog("PlaybackViewModel", "No radio for \(trackUri), the search's songs follow: \(error)")
++            }
++        }
++        // Another play asked for while the radio loaded is the one wanted now.
++        guard playsAsked == asked else { return }
++        await playTracks(Self.track(trackUri, thenRecommendations: radio, otherwise: otherwise))
++    }
++
++    /// The song first, then the recommendations without it, as its radio can list it, or
++    /// `otherwise` where there are none.
++    nonisolated static func track(_ trackUri: String, thenRecommendations radio: [String], otherwise: [String]) -> [String] {
++        let after = radio.filter { $0 != trackUri }
++        return [trackUri] + (after.isEmpty ? otherwise.filter { $0 != trackUri } : after)
++    }
++
+     /// Starts song radio: the track's station, a context like any other, played wherever `play`
+     /// plays. Spotify's Soloist took it over connect-state on 2026-11-19.
+     func playRadio(trackUri: String) async {
+@@ -478,6 +520,8 @@ final class PlaybackViewModel {
+             return
+         }
+         guard let trackId = SpotifyURI.trackId(from: trackUri) else { return }
++        // The station alone, not started at the track: a station need not list its own, and
++        // Soloist starts nothing for a skip_to it cannot find in one.
+         await play(uri: "spotify:station:track:\(trackId)")
+     }
+ 
+@@ -485,6 +529,7 @@ final class PlaybackViewModel {
+     /// cluster reports what it plays, and the bar and the queue follow it through the player
+     /// model.
+     private func start(_ command: ConnectCommand) async {
++        playsAsked &+= 1
+         await initializeIfNeeded()
+ 
+         guard let deviceId = playbackDevice(activeDeviceId: player.activeDeviceId) else { return }
+diff --git a/Spotifly/Views/SearchResultsView.swift b/Spotifly/Views/SearchResultsView.swift
+index b92f714..2729786 100644
+--- a/Spotifly/Views/SearchResultsView.swift
++++ b/Spotifly/Views/SearchResultsView.swift
+@@ -78,8 +78,11 @@ struct SearchResultsView: View {
+                             index: index,
+                             currentlyPlayingURI: playbackViewModel.currentTrackUri,
+                             currentSection: .searchResults,
++                            // The song, then Spotify's recommendations for it, or else the songs
++                            // found after it.
+                             onDoubleTap: {
+-                                await playbackViewModel.playRadio(trackUri: track.uri)
++                                let after = searchResults.trackIds(playedFrom: track.id).dropFirst().compactMap { store.tracks[$0]?.uri }
++                                await playbackViewModel.playWithRecommendations(trackUri: track.uri, otherwise: after)
+                             },
+                         )
+                         .padding(.horizontal, 12)
+diff --git a/Spotifly/Views/TrackRow.swift b/Spotifly/Views/TrackRow.swift
+index 2cbbe3a..6ad1b90 100644
+--- a/Spotifly/Views/TrackRow.swift
++++ b/Spotifly/Views/TrackRow.swift
+@@ -168,7 +168,7 @@ struct TrackRow: View {
+     }
+ 
+     /// Plays the row's track. One Spotify will not play starts nothing: played, it would only
+-    /// fail with the same message, and search's double-click starts radio, which is refused too.
++    /// fail with the same message.
+     private func play() {
+         if let message = track.unplayableMessage {
+             playbackViewModel.errorMessage = message
+diff --git a/SpotiflyTests/SearchResultsTests.swift b/SpotiflyTests/SearchResultsTests.swift
+index 3329d41..b349b6e 100644
+--- a/SpotiflyTests/SearchResultsTests.swift
++++ b/SpotiflyTests/SearchResultsTests.swift
+@@ -48,4 +48,32 @@ struct SearchResultsTests {
+         #expect(results.playlistIds == ["p"])
+         #expect(results.trackIds == ["t", "u"])
+     }
++
++    /// The clicked song is the list's first, so it is the one that plays, whatever Spotify would
++    /// have put first in a context of its own.
++    @Test func `a clicked song plays first, then the songs found after it`() {
++        let results = SearchResults(albums: [], artists: [], playlists: [], tracks: ["a", "b", "c", "d"].map(track(id:)))
++
++        #expect(results.trackIds(playedFrom: "b") == ["b", "c", "d"])
++        #expect(results.trackIds(playedFrom: "d") == ["d"])
++    }
++
++    /// As Spotify's app goes on after a song from search. The radio can list the song itself,
++    /// which would play it twice.
++    @Test func `a clicked song plays first, then its recommendations without it`() {
++        let list = PlaybackViewModel.track(
++            "spotify:track:b",
++            thenRecommendations: ["spotify:track:r1", "spotify:track:b", "spotify:track:r2"],
++            otherwise: ["spotify:track:c"],
++        )
++
++        #expect(list == ["spotify:track:b", "spotify:track:r1", "spotify:track:r2"])
++    }
++
++    /// Something always follows the song, never nothing.
++    @Test func `without recommendations, the songs found after it follow`() {
++        let list = PlaybackViewModel.track("spotify:track:b", thenRecommendations: [], otherwise: ["spotify:track:c", "spotify:track:d"])
++
++        #expect(list == ["spotify:track:b", "spotify:track:c", "spotify:track:d"])
++    }
+ }
+diff --git a/SpotiflyTests/SpclientContextTests.swift b/SpotiflyTests/SpclientContextTests.swift
+index c2a073e..12e1def 100644
+--- a/SpotiflyTests/SpclientContextTests.swift
++++ b/SpotiflyTests/SpclientContextTests.swift
+@@ -123,6 +123,20 @@ struct SpclientContextTests {
+         #expect(SpclientAPI.nextPagePath("spotify:album:x?page=2") == "/context-resolve/v1/spotify:album:x?page=2")
+     }
+ 
++    /// A station names a next page on every page; a click waits on its first, one request.
++    @Test func `a resolve held to one page asks once, and names the next`() async throws {
++        let sent = Recorder<URLRequest>()
++        let page = Data(#"{"pages":[{"tracks":[{"uri":"spotify:track:a","uid":"u1"}],"next_page_url":"hm://radio-apollo/v3/tracks/x"}]}"#.utf8)
++        let client = spclient([200], body: page, sent: sent)
++
++        let context = try await client.resolveContext("spotify:station:track:x", deviceId: "device", pages: 1)
++
++        #expect(context.tracks == ["spotify:track:a"])
++        #expect(context.nextPageUrl == "hm://radio-apollo/v3/tracks/x")
++        #expect(sent.values.count == 1)
++        #expect(sent.values.first?.url?.path == "/context-resolve/v1/spotify:station:track:x")
++    }
++
+     /// A track queues as itself, a link as its uri, and neither asks the resolver.
+     @Test func `a track is queued without resolving anything`() async throws {
+         let sent = Recorder<URLRequest>()
+-- 
+2.54.0 (Apple Git-157)
+

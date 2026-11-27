@@ -1,0 +1,77 @@
+{
+  "ok": true,
+  "channel_sections": [
+    {
+      "channel_section_id": "L03CHANNELS",
+      "name": "",
+      "type": "channels",
+      "emoji": "",
+      "next_channel_section_id": "L04DMS",
+      "last_updated": 1763000000,
+      "channel_ids_page": {
+        "channel_ids": [
+          "C01GENERAL",
+          "C02RANDOM",
+          "G04ENG"
+        ],
+        "count": 3,
+        "cursor": null
+      },
+      "is_redacted": false
+    },
+    {
+      "channel_section_id": "L01STARS",
+      "name": "",
+      "type": "stars",
+      "emoji": "",
+      "next_channel_section_id": "L02PROJECTS",
+      "last_updated": 1763000000,
+      "channel_ids_page": {
+        "channel_ids": [
+          "C03DESIGN"
+        ],
+        "count": 1,
+        "cursor": null
+      },
+      "is_redacted": false
+    },
+    {
+      "channel_section_id": "L04DMS",
+      "name": "",
+      "type": "direct_messages",
+      "emoji": "",
+      "next_channel_section_id": "",
+      "last_updated": 1763000000,
+      "channel_ids_page": {
+        "channel_ids": [
+          "D05SAM",
+          "D06PRIYA",
+          "G07MPDM"
+        ],
+        "count": 3,
+        "cursor": null
+      },
+      "is_redacted": false
+    },
+    {
+      "channel_section_id": "L02PROJECTS",
+      "name": "Projects",
+      "type": "standard",
+      "emoji": "rocket",
+      "next_channel_section_id": "L03CHANNELS",
+      "last_updated": 1763000000,
+      "channel_ids_page": {
+        "channel_ids": [
+          "C03DESIGN"
+        ],
+        "count": 1,
+        "cursor": null
+      },
+      "is_redacted": false
+    }
+  ],
+  "last_updated": 1763000000,
+  "count": 4,
+  "cursor": "",
+  "entities": []
+}

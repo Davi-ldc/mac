@@ -1,0 +1,208 @@
+From ac627a91dcb4be061b57bb45d19e17cce824b661 Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Thu, 26 Nov 2026 22:27:01 -0300
+Subject: [PATCH 17/19] Show the bar'\''s cover in Now Playing instead of
+ downloading it again
+
+---
+ Spotifly/Store/Entities.swift               |  7 --
+ Spotifly/ViewModels/PlaybackViewModel.swift | 81 +++++++++++----------
+ Spotifly/Views/Components/SharedImage.swift | 15 +++-
+ Spotifly/Views/NowPlayingBarView.swift      |  5 +-
+ 4 files changed, 57 insertions(+), 51 deletions(-)
+
+diff --git a/Spotifly/Store/Entities.swift b/Spotifly/Store/Entities.swift
+index 63d2672..6f76a18 100644
+--- a/Spotifly/Store/Entities.swift
++++ b/Spotifly/Store/Entities.swift
+@@ -43,13 +43,6 @@ struct ImageSet: Hashable, Encodable {
+         return (best ?? variants.first)?.url
+     }
+ 
+-    /// The medium image URL (~300px), suitable for Now Playing metadata
+-    /// and general-purpose use where display size is unknown.
+-    var mediumURL: URL? {
+-        let medium = variants.first(where: { $0.size <= 400 && $0.size >= 100 })
+-        return (medium ?? variants.first)?.url
+-    }
+-
+     var isEmpty: Bool {
+         variants.isEmpty
+     }
+diff --git a/Spotifly/ViewModels/PlaybackViewModel.swift b/Spotifly/ViewModels/PlaybackViewModel.swift
+index 69f6f32..6c42c4f 100644
+--- a/Spotifly/ViewModels/PlaybackViewModel.swift
++++ b/Spotifly/ViewModels/PlaybackViewModel.swift
+@@ -202,7 +202,9 @@ final class PlaybackViewModel {
+         isPlaying && isConnectionReady
+     }
+ 
+-    private var lastAlbumArtURL: String?
++    /// The cover Now Playing shows: the bar's image, held here for Control Center, which shows it
++    /// with the window closed too.
++    private var nowPlayingCover: SharedImage?
+     /// The active device's volume changes, debounced on their way to it
+     private let volumeSubject = PassthroughSubject<Double, Never>()
+     /// Subscription for the debounced volume
+@@ -1040,23 +1042,27 @@ final class PlaybackViewModel {
+         } else {
+             nowPlayingInfo[MPMediaItemPropertyTitle] = Self.unresolvedTrackTitle
+             nowPlayingInfo.removeValue(forKey: MPMediaItemPropertyArtist)
+-            // Drop the cover unconditionally rather than leaving it to the URL
+-            // comparison below. `lastAlbumArtURL` is not a reliable witness for what is
+-            // installed: a failed download clears it without uninstalling artwork that an
+-            // earlier, overlapping download for the same URL may have published. When the
+-            // two disagree here nothing else would ever clear the cover, and it would sit
+-            // beside the placeholder title indefinitely.
++            // Drop the cover unconditionally rather than leaving it to the comparison below.
++            // `nowPlayingCover` is not a reliable witness for what is installed: a failed load
++            // clears it without uninstalling artwork that an earlier, overlapping load of the
++            // same image may have published. When the two disagree here nothing else would ever
++            // clear the cover, and it would sit beside the placeholder title indefinitely.
+             nowPlayingInfo.removeValue(forKey: MPMediaItemPropertyArtwork)
+-            lastAlbumArtURL = nil
++            nowPlayingCover = nil
+         }
+ 
+         applyNowPlayingTiming(to: &nowPlayingInfo)
+ 
+-        // Artwork arrives late — it has to be downloaded — so a changed cover is dropped
+-        // from the entry we publish now and reinstated by the download below. A missing
+-        // URL counts as a change: it drops the previous track's cover and downloads none.
+-        let artworkURL = track?.images.mediumURL
+-        let artworkChanged = artworkURL?.absoluteString != lastAlbumArtURL
++        // Artwork arrives late — it has to load — so a changed cover is dropped from the entry
++        // we publish now and reinstated once it has loaded. A missing one counts as a change: it
++        // drops the previous track's cover and loads none. The bar's image, at the bar's size, so
++        // the cover is fetched and decoded once for both.
++        let scale = NSScreen.main?.backingScaleFactor ?? 2
++        let size = NowPlayingBarView.artworkSize
++        let cover = track?.images.url(for: size, scale: scale).map {
++            SharedImage.of(SharedImage.Key(url: $0, points: size, scale: scale))
++        }
++        let artworkChanged = cover?.key != nowPlayingCover?.key
+         if artworkChanged {
+             nowPlayingInfo.removeValue(forKey: MPMediaItemPropertyArtwork)
+         }
+@@ -1064,39 +1070,34 @@ final class PlaybackViewModel {
+         MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
+ 
+         guard artworkChanged else { return }
+-        lastAlbumArtURL = artworkURL?.absoluteString
+-        if let artworkURL {
+-            downloadAlbumArt(from: artworkURL)
++        nowPlayingCover = cover
++        if let cover {
++            publishArtwork(of: cover)
+         }
+     }
+ 
+-    /// Downloads `url` and publishes it as the Now Playing artwork.
+-    private func downloadAlbumArt(from url: URL) {
++    /// Publishes `cover` as the Now Playing artwork once it has loaded.
++    private func publishArtwork(of cover: SharedImage) {
+         Task {
+-            do {
+-                let (data, _) = try await URLSession.shared.data(from: url)
+-                guard let image = NSImage(data: data) else { return }
+-
+-                // Update Now Playing on main actor
+-                await MainActor.run {
+-                    // The track may have moved on while this was downloading; publishing
+-                    // now would put the old cover next to the new title.
+-                    guard self.currentTrack?.images.mediumURL == url else { return }
+-                    var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+-                    // Mark closure as @Sendable to fix crash - MPNowPlayingInfoCenter executes
+-                    // the closure on an internal dispatch queue, not on MainActor
+-                    info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { @Sendable _ in
+-                        image
+-                    }
+-                    MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+-                }
+-            } catch {
+-                // Forget the URL so the next update retries instead of treating the
+-                // failed download as the cover already on screen.
+-                if self.lastAlbumArtURL == url.absoluteString {
+-                    self.lastAlbumArtURL = nil
++            guard let image = await cover.loaded() else {
++                // Forgotten, so the next update asks again instead of treating the failed load
++                // as the cover already on screen.
++                if nowPlayingCover === cover {
++                    nowPlayingCover = nil
+                 }
++                return
++            }
++            // The track may have moved on while it loaded; publishing now would put the old
++            // cover next to the new title.
++            guard nowPlayingCover === cover else { return }
++            let artwork = NSImage(cgImage: image, size: .zero)
++            var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
++            // @Sendable: MPNowPlayingInfoCenter calls it on an internal dispatch queue, not on the
++            // main actor, and a main-actor closure traps there.
++            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: artwork.size) { @Sendable _ in
++                artwork
+             }
++            MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+         }
+     }
+ 
+diff --git a/Spotifly/Views/Components/SharedImage.swift b/Spotifly/Views/Components/SharedImage.swift
+index b8fff79..8d5b25c 100644
+--- a/Spotifly/Views/Components/SharedImage.swift
++++ b/Spotifly/Views/Components/SharedImage.swift
+@@ -8,10 +8,10 @@
+ import ImageIO
+ import SwiftUI
+ 
+-/// An image decoded at the size it is drawn, shared by every view showing it.
++/// An image decoded at the size it is drawn, shared by every view showing it and by Now Playing.
+ ///
+-/// Not a cache: the registry holds it weakly, so it lives exactly as long as a view on screen
+-/// holds it. The next to ask after that fetches it again, usually from the system's
++/// Not a cache: the registry holds it weakly, so it lives exactly as long as a view on screen, or
++/// Now Playing, holds it. The next to ask after that fetches it again, usually from the system's
+ /// HTTP cache.
+ @Observable
+ final class SharedImage {
+@@ -90,6 +90,15 @@ final class SharedImage {
+         }
+     }
+ 
++    /// The image once the load running, or one started now, has ended.
++    func loaded() async -> CGImage? {
++        loadIfNeeded()
++        while image == nil, let task = load {
++            await task.value
++        }
++        return image
++    }
++
+     /// Asks again at once, once per return of the network however many views show it.
+     func networkReturned() {
+         let returns = NetworkMonitor.shared.returns
+diff --git a/Spotifly/Views/NowPlayingBarView.swift b/Spotifly/Views/NowPlayingBarView.swift
+index 5b1e1fe..a451ca0 100644
+--- a/Spotifly/Views/NowPlayingBarView.swift
++++ b/Spotifly/Views/NowPlayingBarView.swift
+@@ -82,7 +82,7 @@ struct NowPlayingBarView: View {
+             playbackControls
+ 
+             HStack(spacing: 10) {
+-                albumArt(size: 40)
++                albumArt(size: Self.artworkSize)
+ 
+                 TrackProgress(showsTime: fit != .noTime, info: trackInfo)
+             }
+@@ -136,6 +136,9 @@ struct NowPlayingBarView: View {
+ 
+     // MARK: - Shared Components
+ 
++    /// The cover's side, which Now Playing publishes the same image at (`PlaybackViewModel`).
++    static let artworkSize: CGFloat = 40
++
+     @ViewBuilder
+     private func albumArt(size: CGFloat) -> some View {
+         if let url = playbackViewModel.currentTrack?.images.url(for: size, scale: displayScale) {
+-- 
+2.54.0 (Apple Git-157)
+

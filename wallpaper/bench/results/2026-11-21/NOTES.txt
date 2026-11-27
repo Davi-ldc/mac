@@ -1,0 +1,30 @@
+Campaign of 2026-11-21, MacBook Pro Mac17,10 (M5 Max), macOS 27.2.1, on battery,
+display at 1497x977 pt, 120 Hz, brightness 42%, a maximized opaque terminal in front.
+The wallpaper was visible only behind the Dock (60 pt strip) and the menu bar (39 pt).
+
+The livewall scenarios were measured with an earlier Rust build of the same design
+(same window, same video layer, AVAssetReader instead of a sample cursor).
+
+What to keep in mind when reading these numbers:
+
+- Blocks were 8 s after a 2 s settle. System power lags a state change by several
+  seconds, so the paired differences are biased low by roughly 8%. The harness now
+  defaults to 10 s after 6 s.
+
+- From about 18:07 something else was animating on screen (paused WindowServer near
+  33% instead of 19%), most likely the terminal UI of the agent that launched the
+  campaign. A second animator already pays part of the cost of running the display
+  pipeline, so every difference measured after that is a lower bound: full60, full30,
+  edge120 and full120-4k. The floors after the first one and the brightness sweep are
+  inflated for the same reason and are not comparable with each other.
+
+- phosphene: after SIGCONT it took about 10 s to return to full rate, so its paired
+  mean (3.75 W) understates it. Blocks measured 12 to 20 s after resume average 8.69 W
+  against 4.65 W paused.
+
+- The display-mode scenarios (native resolution, panel fixed at 60 Hz) were removed:
+  the mode switch did not outlive the tool that made it, so they had run in the home
+  mode. The tool is fixed; the scenarios were not run again.
+
+Solid: floor (3.9 W), full120 (+3.2 W paired, +3.5 W steady), dot120, dock120, and the
+display rail reading 2.88 to 2.89 W for any 120 Hz update against 1.98 W static.

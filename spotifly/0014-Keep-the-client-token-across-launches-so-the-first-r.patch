@@ -1,0 +1,263 @@
+From 76e282dffec8a59bc1878d5e1971348d18a2aebf Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Thu, 26 Nov 2026 22:27:00 -0300
+Subject: [PATCH 14/19] Keep the client token across launches, so the first
+ requests do not wait for one
+
+---
+ Spotifly/Auth/ClientTokenProvider.swift  | 40 ++++++++++++------
+ Spotifly/Auth/SpotifyCredentials.swift   |  6 ++-
+ Spotifly/PartnerAPI/PathfinderHome.swift |  2 +-
+ SpotiflyTests/ClientTokenTests.swift     | 53 +++++++++++++++++++-----
+ 4 files changed, 75 insertions(+), 26 deletions(-)
+
+diff --git a/Spotifly/Auth/ClientTokenProvider.swift b/Spotifly/Auth/ClientTokenProvider.swift
+index c878c4e..cb4cb27 100644
+--- a/Spotifly/Auth/ClientTokenProvider.swift
++++ b/Spotifly/Auth/ClientTokenProvider.swift
+@@ -8,7 +8,7 @@
+ import Foundation
+ 
+ /// A client token and how long it is good for.
+-nonisolated struct GrantedClientToken: Sendable, Equatable {
++nonisolated struct GrantedClientToken: Sendable, Equatable, Codable {
+     var token: String
+     var expiresAt: Date
+ }
+@@ -45,15 +45,17 @@ actor ClientTokenProvider {
+     typealias Fetcher = @Sendable (_ deviceId: String) async throws -> GrantedClientToken
+ 
+     private let fetcher: Fetcher
+-    private let deviceIdStore: DeviceIdStoring
+-    private var cached: GrantedClientToken?
++    private let store: ClientTokenStoring
++    /// From the start, the token an earlier launch was granted: it lasts a fortnight, and a
++    /// launch that asked for a new one held its first requests for that round trip.
++    private lazy var cached: GrantedClientToken? = store.token()
+     private var inFlight: Task<GrantedClientToken, Error>?
+ 
+     init(
+-        deviceIdStore: DeviceIdStoring = UserDefaultsDeviceIdStore(),
++        store: ClientTokenStoring = UserDefaultsClientTokenStore(),
+         fetcher: @escaping Fetcher = { try await ClientTokenRequest.send(deviceId: $0) },
+     ) {
+-        self.deviceIdStore = deviceIdStore
++        self.store = store
+         self.fetcher = fetcher
+     }
+ 
+@@ -69,13 +71,14 @@ actor ClientTokenProvider {
+             return try await inFlight.value.token
+         }
+ 
+-        let deviceId = deviceIdStore.deviceId()
++        let deviceId = store.deviceId()
+         let task = Task { [fetcher] in try await fetcher(deviceId) }
+         inFlight = task
+         defer { inFlight = nil }
+ 
+         let granted = try await task.value
+         cached = granted
++        store.save(granted)
+         return granted.token
+     }
+ 
+@@ -90,19 +93,24 @@ actor ClientTokenProvider {
+     func invalidate(rejected: String) {
+         guard cached?.token == rejected else { return }
+         cached = nil
++        store.save(nil)
+     }
+ }
+ 
+-/// Where the device id lives. Stable across launches on purpose: it identifies this
+-/// installation to Spotify, and a new one on every launch looks like a new device each time.
+-nonisolated protocol DeviceIdStoring: Sendable {
++/// Where the device id and the token granted for it live. The id is stable across launches on
++/// purpose: it identifies this installation to Spotify, and a new one on every launch looks like
++/// a new device each time.
++nonisolated protocol ClientTokenStoring: Sendable {
+     func deviceId() -> String
++    func token() -> GrantedClientToken?
++    func save(_ token: GrantedClientToken?)
+ }
+ 
+-/// Not a keychain item: it is an identifier, not a secret, and losing it costs nothing beyond
+-/// looking like a fresh install.
+-nonisolated struct UserDefaultsDeviceIdStore: DeviceIdStoring {
++/// Not the keychain: both name the installation, not the user, and losing them costs nothing
++/// beyond looking like a fresh install and one request, where a keychain read can wait on a prompt.
++nonisolated struct UserDefaultsClientTokenStore: ClientTokenStoring {
+     private static let key = "keymasterDeviceId"
++    private static let tokenKey = "clientToken"
+ 
+     func deviceId() -> String {
+         if let existing = UserDefaults.standard.string(forKey: Self.key),
+@@ -117,6 +125,14 @@ nonisolated struct UserDefaultsDeviceIdStore: DeviceIdStoring {
+         return generated
+     }
+ 
++    func token() -> GrantedClientToken? {
++        UserDefaults.standard.data(forKey: Self.tokenKey).flatMap { try? PropertyListDecoder().decode(GrantedClientToken.self, from: $0) }
++    }
++
++    func save(_ token: GrantedClientToken?) {
++        UserDefaults.standard.set(token.flatMap { try? PropertyListEncoder().encode($0) }, forKey: Self.tokenKey)
++    }
++
+     /// 40 hex characters, matching what the desktop client sends.
+     static func generate() -> String {
+         var bytes = [UInt8](repeating: 0, count: 20)
+diff --git a/Spotifly/Auth/SpotifyCredentials.swift b/Spotifly/Auth/SpotifyCredentials.swift
+index e5996c1..56b84ba 100644
+--- a/Spotifly/Auth/SpotifyCredentials.swift
++++ b/Spotifly/Auth/SpotifyCredentials.swift
+@@ -55,8 +55,10 @@ nonisolated struct SpotifyCredentials: Sendable {
+         request.setValue(Self.appPlatform, forHTTPHeaderField: "App-Platform")
+         request.setValue(Self.origin, forHTTPHeaderField: "Origin")
+         request.setValue(Self.origin, forHTTPHeaderField: "Referer")
+-        try await request.setValue("Bearer \(accessToken())", forHTTPHeaderField: "Authorization")
+-        try await request.setValue(clientToken(), forHTTPHeaderField: "Client-Token")
++        async let bearer = accessToken()
++        async let client = clientToken()
++        try await request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
++        try await request.setValue(client, forHTTPHeaderField: "Client-Token")
+     }
+ 
+     /// The app's own: the signed-in account's bearer and the shared client token, over the
+diff --git a/Spotifly/PartnerAPI/PathfinderHome.swift b/Spotifly/PartnerAPI/PathfinderHome.swift
+index 1d64e75..19c9795 100644
+--- a/Spotifly/PartnerAPI/PathfinderHome.swift
++++ b/Spotifly/PartnerAPI/PathfinderHome.swift
+@@ -296,7 +296,7 @@ nonisolated struct PathfinderHomeVariables: Encodable, Sendable {
+ 
+     init(
+         timeZone: String = TimeZone.current.identifier,
+-        deviceId: String = UserDefaultsDeviceIdStore().deviceId(),
++        deviceId: String = UserDefaultsClientTokenStore().deviceId(),
+     ) {
+         self.timeZone = timeZone
+         self.deviceId = deviceId
+diff --git a/SpotiflyTests/ClientTokenTests.swift b/SpotiflyTests/ClientTokenTests.swift
+index 58d94dc..88888c5 100644
+--- a/SpotiflyTests/ClientTokenTests.swift
++++ b/SpotiflyTests/ClientTokenTests.swift
+@@ -150,10 +150,25 @@ struct ClientTokenRequestTests {
+     }
+ }
+ 
+-private struct FixedDeviceIdStore: DeviceIdStoring {
+-    let id: String
++/// A fixed device id, and the token as a launch would leave it for the next.
++private final class MemoryStore: ClientTokenStoring, @unchecked Sendable {
++    private let lock = NSLock()
++    private var saved: GrantedClientToken?
++
++    init(saved: GrantedClientToken? = nil) {
++        self.saved = saved
++    }
++
+     func deviceId() -> String {
+-        id
++        "0123456789abcdef0123456789abcdef01234567"
++    }
++
++    func token() -> GrantedClientToken? {
++        lock.withLock { saved }
++    }
++
++    func save(_ token: GrantedClientToken?) {
++        lock.withLock { saved = token }
+     }
+ }
+ 
+@@ -173,12 +188,12 @@ private final class FetchCounter: @unchecked Sendable {
+ 
+ struct ClientTokenProviderTests {
+     private let now = Date(timeIntervalSince1970: 1_000_000)
+-    private let store = FixedDeviceIdStore(id: "0123456789abcdef0123456789abcdef01234567")
++    private let store = MemoryStore()
+ 
+     @Test func `a cached token is reused until it expires`() async throws {
+         let counter = FetchCounter()
+         let expiry = now.addingTimeInterval(3600)
+-        let provider = ClientTokenProvider(deviceIdStore: store, fetcher: { _ in counter.fetch(expiresAt: expiry) })
++        let provider = ClientTokenProvider(store: store, fetcher: { _ in counter.fetch(expiresAt: expiry) })
+ 
+         #expect(try await provider.token(now: now) == "ct-1")
+         #expect(try await provider.token(now: now.addingTimeInterval(60)) == "ct-1")
+@@ -188,7 +203,7 @@ struct ClientTokenProviderTests {
+     @Test func `an expired token is replaced`() async throws {
+         let counter = FetchCounter()
+         let provider = ClientTokenProvider(
+-            deviceIdStore: store,
++            store: store,
+             fetcher: { _ in counter.fetch(expiresAt: Date(timeIntervalSince1970: 1_000_100)) },
+         )
+ 
+@@ -201,7 +216,7 @@ struct ClientTokenProviderTests {
+         // What a refusal means: the token is dead before its stated expiry.
+         let counter = FetchCounter()
+         let expiry = now.addingTimeInterval(3600)
+-        let provider = ClientTokenProvider(deviceIdStore: store, fetcher: { _ in counter.fetch(expiresAt: expiry) })
++        let provider = ClientTokenProvider(store: store, fetcher: { _ in counter.fetch(expiresAt: expiry) })
+ 
+         #expect(try await provider.token(now: now) == "ct-1")
+         await provider.invalidate(rejected: "ct-1")
+@@ -215,7 +230,7 @@ struct ClientTokenProviderTests {
+     @Test func `a refusal naming an already-replaced token changes nothing`() async throws {
+         let counter = FetchCounter()
+         let expiry = now.addingTimeInterval(3600)
+-        let provider = ClientTokenProvider(deviceIdStore: store, fetcher: { _ in counter.fetch(expiresAt: expiry) })
++        let provider = ClientTokenProvider(store: store, fetcher: { _ in counter.fetch(expiresAt: expiry) })
+ 
+         #expect(try await provider.token(now: now) == "ct-1")
+         await provider.invalidate(rejected: "ct-1")
+@@ -228,10 +243,26 @@ struct ClientTokenProviderTests {
+         #expect(counter.calls == 2)
+     }
+ 
++    /// The token an earlier launch was granted serves the first requests, which no longer wait
++    /// for a new one; once refused, the next launch does not start with it either.
++    @Test func `a token from an earlier launch is used while it lasts, and forgotten once refused`() async throws {
++        let counter = FetchCounter()
++        let store = MemoryStore(saved: GrantedClientToken(token: "earlier", expiresAt: now.addingTimeInterval(3600)))
++        let provider = ClientTokenProvider(store: store, fetcher: { _ in counter.fetch(expiresAt: .distantFuture) })
++
++        #expect(try await provider.token(now: now) == "earlier")
++        #expect(counter.calls == 0)
++
++        await provider.invalidate(rejected: "earlier")
++        #expect(store.token() == nil)
++        #expect(try await provider.token(now: now) == "ct-1")
++        #expect(store.token()?.token == "ct-1")
++    }
++
+     @Test func `concurrent callers share one fetch`() async throws {
+         let counter = FetchCounter()
+         let expiry = now.addingTimeInterval(3600)
+-        let provider = ClientTokenProvider(deviceIdStore: store, fetcher: { _ in counter.fetch(expiresAt: expiry) })
++        let provider = ClientTokenProvider(store: store, fetcher: { _ in counter.fetch(expiresAt: expiry) })
+         let asOf = now
+ 
+         let tokens = try await withThrowingTaskGroup(of: String.self) { group in
+@@ -250,7 +281,7 @@ struct ClientTokenProviderTests {
+     }
+ 
+     @Test func `the device id is 40 hex characters, as the desktop client sends`() {
+-        let generated = UserDefaultsDeviceIdStore.generate()
++        let generated = UserDefaultsClientTokenStore.generate()
+ 
+         // Computed outside the macro on purpose: swiftformat rewrites the closure to a key
+         // path, and a key path as a function reference reads as throwing inside #expect.
+@@ -258,6 +289,6 @@ struct ClientTokenProviderTests {
+ 
+         #expect(generated.count == 40)
+         #expect(isAllHex)
+-        #expect(generated != UserDefaultsDeviceIdStore.generate())
++        #expect(generated != UserDefaultsClientTokenStore.generate())
+     }
+ }
+-- 
+2.54.0 (Apple Git-157)
+

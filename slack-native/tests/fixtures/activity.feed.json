@@ -1,0 +1,45 @@
+{
+  "ok": true,
+  "items": [
+    {
+      "is_unread": true,
+      "feed_ts": "1795300600.000000",
+      "key": "at_user-C03DESIGN-1795300444.000012",
+      "item": {
+        "type": "at_user",
+        "message": {"ts": "1795300444.000012", "channel": "C03DESIGN", "is_broadcast": false, "author_user_id": "U02SAM"}
+      }
+    },
+    {
+      "is_unread": false,
+      "feed_ts": "1795300500.000000",
+      "key": "message_reaction-C01GENERAL-1795192800.000103-tada-U03PRIYA",
+      "item": {
+        "type": "message_reaction",
+        "message": {"ts": "1795192800.000103", "channel": "C01GENERAL", "is_broadcast": false, "author_user_id": "U01ALEX"},
+        "reaction": {"user": "U03PRIYA", "name": "tada"}
+      }
+    },
+    {
+      "is_unread": true,
+      "feed_ts": "1795194600.000107",
+      "key": "thread_v2-C01GENERAL-1795192800.000103",
+      "item": {
+        "type": "thread_v2",
+        "bundle_info": {
+          "payload": {
+            "thread_entry": {"channel_id": "C01GENERAL", "thread_ts": "1795192800.000103", "latest_ts": "1795194600.000107",
+                             "min_unread_ts": "1795194600.000107", "unread_msg_count": 1}
+          }
+        }
+      }
+    },
+    {
+      "is_unread": false,
+      "feed_ts": "1795100000.000000",
+      "key": "list_record_edited-F0LIST-Rec1",
+      "item": {"type": "list_record_edited", "linked_item_id": "F0LIST"}
+    }
+  ],
+  "response_metadata": {"next_cursor": "page2"}
+}

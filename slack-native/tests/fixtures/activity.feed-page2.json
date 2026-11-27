@@ -1,0 +1,22 @@
+{
+  "ok": true,
+  "items": [
+    {
+      "is_unread": false,
+      "feed_ts": "1795100100.000000",
+      "key": "keyword-C01GENERAL-1795100000.000200",
+      "item": {
+        "type": "keyword",
+        "message": {
+          "ts": "1795100000.000200",
+          "channel": "C01GENERAL",
+          "is_broadcast": false,
+          "author_user_id": "U02SAM"
+        }
+      }
+    }
+  ],
+  "response_metadata": {
+    "next_cursor": ""
+  }
+}

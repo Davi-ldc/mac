@@ -1,0 +1,118 @@
+From c7986637cca5bc37b55e7ccfc7e3cf1deb8839a2 Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Thu, 26 Nov 2026 10:42:15 -0300
+Subject: [PATCH 10/10] Name this Mac's Soloist after the Mac, as Spotify's
+ desktop app names its device
+
+---
+ Spotifly/Soloist/SoloistEngine.swift  |  9 +++++++--
+ Spotifly/Views/PreferencesView.swift  |  2 +-
+ Spotifly/de.lproj/Localizable.strings |  2 +-
+ Spotifly/en.lproj/Localizable.strings |  2 +-
+ Spotifly/fr.lproj/Localizable.strings |  2 +-
+ SpotiflyTests/SoloistTests.swift      | 10 ++++++++++
+ 6 files changed, 21 insertions(+), 6 deletions(-)
+
+diff --git a/Spotifly/Soloist/SoloistEngine.swift b/Spotifly/Soloist/SoloistEngine.swift
+index cba8028..62ff787 100644
+--- a/Spotifly/Soloist/SoloistEngine.swift
++++ b/Spotifly/Soloist/SoloistEngine.swift
+@@ -8,6 +8,7 @@
+ import AppKit
+ import Darwin
+ import Foundation
++import SystemConfiguration
+ 
+ /// Spotify's Soloist, run as a child process, is this Mac's player, once the user has set it up
+ /// with a key. There is no other: nothing plays on this Mac without it.
+@@ -47,8 +48,12 @@ final class SoloistEngine {
+     private(set) var isReinstalling = false
+     private(set) var reinstallError: String?
+ 
+-    /// The name the account's device lists show for this Mac.
+-    static let deviceName = "Spotifly"
++    /// The name the account's device lists show for this Mac: the Mac's own, from System Settings
++    /// → General → Sharing, which Spotify's desktop app registers under too. Soloist takes no
++    /// device type (1.4.0.3 has no option for one), so it is listed as the speaker it says it is.
++    static var deviceName: String {
++        SCDynamicStoreCopyComputerName(nil, nil) as String? ?? "Spotifly"
++    }
+ 
+     /// The `UserDefaults` key that records whether the user set Soloist up. Its stored name stays
+     /// as it is, so a Mac set up under it stays set up.
+diff --git a/Spotifly/Views/PreferencesView.swift b/Spotifly/Views/PreferencesView.swift
+index 7b86009..d34c5ce 100644
+--- a/Spotifly/Views/PreferencesView.swift
++++ b/Spotifly/Views/PreferencesView.swift
+@@ -189,7 +189,7 @@ private struct SoloistSection: View {
+         case .off: String(localized: "soloist.status.off")
+         case .installing: String(localized: "soloist.status.installing")
+         case .starting: String(localized: "soloist.status.starting")
+-        case .waitingForPairing: String(localized: "soloist.status.pairing")
++        case .waitingForPairing: String(localized: "soloist.status.pairing \(SoloistEngine.deviceName)")
+         case .ready where PlayerModel.shared.isPlayingHere: String(localized: "soloist.status.playing")
+         case .ready: String(localized: "soloist.status.ready")
+         case let .failed(message): message
+diff --git a/Spotifly/de.lproj/Localizable.strings b/Spotifly/de.lproj/Localizable.strings
+index cac9c10..6bea3d0 100644
+--- a/Spotifly/de.lproj/Localizable.strings
++++ b/Spotifly/de.lproj/Localizable.strings
+@@ -320,7 +320,7 @@
+ "soloist.status.off" = "Aus";
+ "soloist.status.installing" = "Wird von Spotify geladen …";
+ "soloist.status.starting" = "Startet …";
+-"soloist.status.pairing" = "Wähle „Spotifly“ einmal in der Spotify-App auf deinem Handy, im selben Netzwerk.";
++"soloist.status.pairing %@" = "Wähle „%@“ einmal in der Spotify-App auf deinem Handy, im selben Netzwerk.";
+ "soloist.status.ready" = "Bereit";
+ "soloist.status.playing" = "Spielt";
+ "soloist.key" = "Soloist-Key";
+diff --git a/Spotifly/en.lproj/Localizable.strings b/Spotifly/en.lproj/Localizable.strings
+index ae46d25..f3abeda 100644
+--- a/Spotifly/en.lproj/Localizable.strings
++++ b/Spotifly/en.lproj/Localizable.strings
+@@ -320,7 +320,7 @@
+ "soloist.status.off" = "Off";
+ "soloist.status.installing" = "Downloading from Spotify…";
+ "soloist.status.starting" = "Starting…";
+-"soloist.status.pairing" = "Choose “Spotifly” once in the Spotify app on your phone, on the same network.";
++"soloist.status.pairing %@" = "Choose “%@” once in the Spotify app on your phone, on the same network.";
+ "soloist.status.ready" = "Ready";
+ "soloist.status.playing" = "Playing";
+ "soloist.key" = "Soloist Key";
+diff --git a/Spotifly/fr.lproj/Localizable.strings b/Spotifly/fr.lproj/Localizable.strings
+index 4806a34..5a0b480 100644
+--- a/Spotifly/fr.lproj/Localizable.strings
++++ b/Spotifly/fr.lproj/Localizable.strings
+@@ -320,7 +320,7 @@
+ "soloist.status.off" = "Désactivé";
+ "soloist.status.installing" = "Téléchargement depuis Spotify…";
+ "soloist.status.starting" = "Démarrage…";
+-"soloist.status.pairing" = "Choisissez « Spotifly » une fois dans l'app Spotify de votre téléphone, sur le même réseau.";
++"soloist.status.pairing %@" = "Choisissez « %@ » une fois dans l'app Spotify de votre téléphone, sur le même réseau.";
+ "soloist.status.ready" = "Prêt";
+ "soloist.status.playing" = "Lecture";
+ "soloist.key" = "Clé Soloist";
+diff --git a/SpotiflyTests/SoloistTests.swift b/SpotiflyTests/SoloistTests.swift
+index 81a1946..4b22199 100644
+--- a/SpotiflyTests/SoloistTests.swift
++++ b/SpotiflyTests/SoloistTests.swift
+@@ -86,6 +86,16 @@ struct SoloistEventTests {
+         #expect(!SoloistEngine.startsAgain(status: .waitingForPairing, isRunning: false, networkReturned: true))
+         #expect(!SoloistEngine.startsAgain(status: .failed("key"), isRunning: true, networkReturned: true))
+     }
++
++    /// Soloist goes by this Mac's name, as Spotify's desktop app does, and the pairing hint names
++    /// what to pick.
++    @MainActor
++    @Test func `Soloist is named after this Mac`() {
++        let name = SoloistEngine.deviceName
++        #expect(!name.isEmpty)
++        #expect(name != "Spotifly")
++        #expect(String(localized: "soloist.status.pairing \(name)").contains(name))
++    }
+ }
+ 
+ @MainActor
+-- 
+2.54.0 (Apple Git-157)
+

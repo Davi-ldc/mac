@@ -1,0 +1,951 @@
+From 29b7a8cb74382586e75eb4b90d602be106e0bc36 Mon Sep 17 00:00:00 2001
+From: mini <mini@local>
+Date: Fri, 27 Nov 2026 03:37:37 -0300
+Subject: [PATCH 02/10] Bundle Objective-C, defer WasmStore creation, and
+ pre-parse language configs
+
+Adds tree-sitter-objc grammar and queries served by clangd, avoids
+allocating a 16 GB WasmStore per tree-sitter parser when no WASM
+grammars are registered, and exposes preload_builtin_configs() so
+startup parses built-in TOML configs off the main thread.
+---
+ Cargo.lock                               |  10 +
+ Cargo.toml                               |   1 +
+ crates/grammars/Cargo.toml               |   2 +
+ crates/grammars/src/grammars.rs          |   1 +
+ crates/grammars/src/objc/brackets.scm    |  28 ++
+ crates/grammars/src/objc/config.toml     |  20 ++
+ crates/grammars/src/objc/folds.scm       |  18 ++
+ crates/grammars/src/objc/highlights.scm  | 372 +++++++++++++++++++++++
+ crates/grammars/src/objc/imports.scm     |  30 ++
+ crates/grammars/src/objc/indents.scm     |  42 +++
+ crates/grammars/src/objc/injections.scm  |  34 +++
+ crates/grammars/src/objc/runnables.scm   |  33 ++
+ crates/grammars/src/objc/textobjects.scm |  48 +++
+ crates/language/src/language.rs          |  19 +-
+ crates/language/src/language_registry.rs |   1 +
+ crates/languages/src/lib.rs              |  58 +++-
+ 16 files changed, 710 insertions(+), 7 deletions(-)
+ create mode 100644 crates/grammars/src/objc/brackets.scm
+ create mode 100644 crates/grammars/src/objc/config.toml
+ create mode 100644 crates/grammars/src/objc/folds.scm
+ create mode 100644 crates/grammars/src/objc/highlights.scm
+ create mode 100644 crates/grammars/src/objc/imports.scm
+ create mode 100644 crates/grammars/src/objc/indents.scm
+ create mode 100644 crates/grammars/src/objc/injections.scm
+ create mode 100644 crates/grammars/src/objc/runnables.scm
+ create mode 100644 crates/grammars/src/objc/textobjects.scm
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 2ecb089..5ec53b3 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -7738,6 +7738,7 @@ dependencies = [
+  "tree-sitter-jsdoc",
+  "tree-sitter-json",
+  "tree-sitter-md",
++ "tree-sitter-objc",
+  "tree-sitter-python",
+  "tree-sitter-regex",
+  "tree-sitter-rust",
+@@ -19031,6 +19032,15 @@ dependencies = [
+  "tree-sitter-language",
+ ]
+ 
++[[package]]
++name = "tree-sitter-objc"
++version = "3.0.2"
++source = "git+https://github.com/tree-sitter-grammars/tree-sitter-objc?rev=181a81b8f23a2d593e7ab4259981f50122909fda#181a81b8f23a2d593e7ab4259981f50122909fda"
++dependencies = [
++ "cc",
++ "tree-sitter-language",
++]
++
+ [[package]]
+ name = "tree-sitter-python"
+ version = "0.25.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index c4063a2..547a0bf 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -961,6 +961,7 @@ tree-sitter-heex = { git = "https://github.com/zed-industries/tree-sitter-heex",
+ tree-sitter-html = "0.23"
+ tree-sitter-jsdoc = "0.23"
+ tree-sitter-json = "0.24"
++tree-sitter-objc = { git = "https://github.com/tree-sitter-grammars/tree-sitter-objc", rev = "181a81b8f23a2d593e7ab4259981f50122909fda" }
+ tree-sitter-md = { git = "https://github.com/zed-industries/tree-sitter-markdown", rev = "b596e737286780d7bfa9fcddceaeeb754574b352" } # fork of 9a23c1a with serialize() buffer-overflow fix; https://github.com/tree-sitter-grammars/tree-sitter-markdown/issues/243
+ tree-sitter-python = "0.25"
+ tree-sitter-regex = "0.24"
+diff --git a/crates/grammars/Cargo.toml b/crates/grammars/Cargo.toml
+index ef83bb7..e480c8e 100644
+--- a/crates/grammars/Cargo.toml
++++ b/crates/grammars/Cargo.toml
+@@ -31,6 +31,7 @@ tree-sitter-gowork = { workspace = true, optional = true }
+ tree-sitter-jsdoc = { workspace = true, optional = true }
+ tree-sitter-json = { workspace = true, optional = true }
+ tree-sitter-md = { workspace = true, optional = true }
++tree-sitter-objc = { workspace = true, optional = true }
+ tree-sitter-python = { workspace = true, optional = true }
+ tree-sitter-regex = { workspace = true, optional = true }
+ tree-sitter-rust = { workspace = true, optional = true }
+@@ -52,6 +53,7 @@ load-grammars = [
+     "tree-sitter-jsdoc",
+     "tree-sitter-json",
+     "tree-sitter-md",
++    "tree-sitter-objc",
+     "tree-sitter-python",
+     "tree-sitter-regex",
+     "tree-sitter-rust",
+diff --git a/crates/grammars/src/grammars.rs b/crates/grammars/src/grammars.rs
+index fa7b226..bf3eb02 100644
+--- a/crates/grammars/src/grammars.rs
++++ b/crates/grammars/src/grammars.rs
+@@ -32,6 +32,7 @@ pub fn native_grammars() -> Vec<(&'static str, tree_sitter::Language)> {
+         ("jsonc", tree_sitter_json::LANGUAGE.into()),
+         ("markdown", tree_sitter_md::LANGUAGE.into()),
+         ("markdown-inline", tree_sitter_md::INLINE_LANGUAGE.into()),
++        ("objc", tree_sitter_objc::LANGUAGE.into()),
+         ("python", tree_sitter_python::LANGUAGE.into()),
+         ("regex", tree_sitter_regex::LANGUAGE.into()),
+         ("rust", tree_sitter_rust::LANGUAGE.into()),
+diff --git a/crates/grammars/src/objc/brackets.scm b/crates/grammars/src/objc/brackets.scm
+new file mode 100644
+index 0000000..de1930a
+--- /dev/null
++++ b/crates/grammars/src/objc/brackets.scm
+@@ -0,0 +1,28 @@
++; The original Source/Author https://github.com/blacktop/zed-objc
++; MIT License
++
++; Copyright (c) 2025 blacktop
++
++; Permission is hereby granted, free of charge, to any person obtaining a copy
++; of this software and associated documentation files (the "Software"), to deal
++; in the Software without restriction, including without limitation the rights
++; to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++; copies of the Software, and to permit persons to whom the Software is
++; furnished to do so, subject to the following conditions:
++
++; The above copyright notice and this permission notice shall be included in all
++; copies or substantial portions of the Software.
++
++; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++; IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++; FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++; AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++; LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++; SOFTWARE.
++
++("(" @open ")" @close)
++("[" @open "]" @close)
++("{" @open "}" @close)
++("\"" @open "\"" @close)
++("'" @open "'" @close)
+diff --git a/crates/grammars/src/objc/config.toml b/crates/grammars/src/objc/config.toml
+new file mode 100644
+index 0000000..c2aa7c9
+--- /dev/null
++++ b/crates/grammars/src/objc/config.toml
+@@ -0,0 +1,20 @@
++name = "Objective-C"
++grammar = "objc"
++path_suffixes = ["mm", "m", "hh", "h"]
++line_comments = ["// "]
++brackets = [
++    { start = "{", end = "}", close = true, newline = true },
++    { start = "[", end = "]", close = true, newline = true },
++    { start = "(", end = ")", close = true, newline = false },
++    { start = "\"", end = "\"", close = true, newline = false, not_in = [
++        "string",
++    ] },
++    { start = "'", end = "'", close = true, newline = false, not_in = [
++        "string",
++        "comment",
++    ] },
++    { start = "/*", end = "*/", close = true, newline = false, not_in = [
++        "string",
++        "comment",
++    ] },
++]
+diff --git a/crates/grammars/src/objc/folds.scm b/crates/grammars/src/objc/folds.scm
+new file mode 100644
+index 0000000..573d194
+--- /dev/null
++++ b/crates/grammars/src/objc/folds.scm
+@@ -0,0 +1,18 @@
++[
++  (class_declaration)
++  (class_interface)
++  (class_implementation)
++  (protocol_declaration)
++  (property_declaration)
++  (method_declaration)
++  (struct_declaration)
++  (struct_declarator)
++  (try_statement)
++  (catch_clause)
++  (finally_clause)
++  (throw_statement)
++  (block_literal)
++  (ms_asm_block)
++  (dictionary_literal)
++  (array_literal)
++] @fold
+diff --git a/crates/grammars/src/objc/highlights.scm b/crates/grammars/src/objc/highlights.scm
+new file mode 100644
+index 0000000..6a16814
+--- /dev/null
++++ b/crates/grammars/src/objc/highlights.scm
+@@ -0,0 +1,372 @@
++; The original Source/Author https://github.com/blacktop/zed-objc
++; MIT License
++
++; Copyright (c) 2025 blacktop
++
++; Permission is hereby granted, free of charge, to any person obtaining a copy
++; of this software and associated documentation files (the "Software"), to deal
++; in the Software without restriction, including without limitation the rights
++; to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++; copies of the Software, and to permit persons to whom the Software is
++; furnished to do so, subject to the following conditions:
++
++; The above copyright notice and this permission notice shall be included in all
++; copies or substantial portions of the Software.
++
++; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++; IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++; FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++; AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++; LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++; SOFTWARE.
++
++[
++  "const"
++  "enum"
++  "extern"
++  "inline"
++  "sizeof"
++  "static"
++  "struct"
++  "typedef"
++  "union"
++  "volatile"
++] @keyword
++
++[
++  "break"
++  "case"
++  "continue"
++  "default"
++  "do"
++  "else"
++  "for"
++  "goto"
++  "if"
++  "return"
++  "switch"
++  "while"
++] @keyword.control
++
++[
++  "#define"
++  "#elif"
++  "#else"
++  "#endif"
++  "#if"
++  "#ifdef"
++  "#ifndef"
++  "#include"
++  (preproc_directive)
++] @keyword
++
++[
++  "="
++  "+="
++  "-="
++  "*="
++  "/="
++  "%="
++  "&="
++  "|="
++  "^="
++  "<<="
++  ">>="
++  "++"
++  "--"
++  "+"
++  "-"
++  "*"
++  "/"
++  "%"
++  "~"
++  "&"
++  "|"
++  "^"
++  "<<"
++  ">>"
++  "!"
++  "&&"
++  "||"
++  "=="
++  "!="
++  "<"
++  ">"
++  "<="
++  ">="
++  "->"
++  "?"
++  ":"
++] @operator
++
++[
++  "."
++  ";"
++  ","
++] @punctuation.delimiter
++
++[
++  "{"
++  "}"
++  "("
++  ")"
++  "["
++  "]"
++] @punctuation.bracket
++
++[
++  (string_literal)
++  (system_lib_string)
++  (char_literal)
++] @string
++
++(comment) @comment
++
++(number_literal) @number
++
++[
++  (true)
++  (false)
++] @boolean
++
++(null) @constant.builtin
++
++(identifier) @variable
++
++((identifier) @constant
++ (#match? @constant "^_*[A-Z][A-Z\\d_]*$"))
++
++(call_expression
++  function: (identifier) @function)
++(call_expression
++  function: (field_expression
++    field: (field_identifier) @function))
++(function_declarator
++  declarator: (identifier) @function)
++(preproc_function_def
++  name: (identifier) @function.special)
++
++(field_identifier) @property
++(statement_identifier) @label
++
++[
++  (type_identifier)
++  (primitive_type)
++  (sized_type_specifier)
++] @type
++
++; Preprocs
++
++(preproc_undef
++  name: (_) @constant) @preproc
++
++; Includes
++
++(module_import "@import" @include path: (identifier) @namespace)
++
++((preproc_include
++  _ @include path: (_))
++  (#any-of? @include "#include" "#import"))
++
++; Type Qualifiers
++
++[
++  "@optional"
++  "@required"
++  "__covariant"
++  "__contravariant"
++  (visibility_specification)
++] @type.qualifier
++
++; Storageclasses
++
++[
++  "@autoreleasepool"
++  "@synthesize"
++  "@dynamic"
++  "volatile"
++  (protocol_qualifier)
++] @keyword
++
++; Keywords
++
++[
++  "@protocol"
++  "@interface"
++  "@implementation"
++  "@compatibility_alias"
++  "@property"
++  "@selector"
++  "@defs"
++  "availability"
++  "@end"
++] @keyword
++
++(class_declaration "@" @keyword "class" @keyword) ; I hate Obj-C for allowing "@ class" :)
++
++(method_definition ["+" "-"] @keyword.function)
++(method_declaration ["+" "-"] @keyword.function)
++
++[
++  "__typeof__"
++  "__typeof"
++  "typeof"
++  "in"
++] @keyword.operator
++
++[
++  "@synchronized"
++  "oneway"
++] @keyword.coroutine
++
++; Exceptions
++
++[
++  "@try"
++  "__try"
++  "@catch"
++  "__catch"
++  "@finally"
++  "__finally"
++  "@throw"
++] @exception
++
++; Variables
++
++((identifier) @variable.builtin
++  (#any-of? @variable.builtin "self" "super"))
++
++; Functions & Methods
++
++[
++  "objc_bridge_related"
++  "@available"
++  "__builtin_available"
++  "va_arg"
++  "asm"
++] @function.builtin
++
++(method_definition (identifier) @method)
++
++(method_declaration (identifier) @method)
++
++(method_identifier (identifier)? @method ":" @method (identifier)? @method)
++
++(message_expression method: (identifier) @method.call)
++
++; Constructors
++
++((message_expression method: (identifier) @constructor)
++  (#eq? @constructor "init"))
++
++; Attributes
++
++(availability_attribute_specifier
++  [
++    "CF_FORMAT_FUNCTION" "NS_AVAILABLE" "__IOS_AVAILABLE" "NS_AVAILABLE_IOS"
++    "API_AVAILABLE" "API_UNAVAILABLE" "API_DEPRECATED" "NS_ENUM_AVAILABLE_IOS"
++    "NS_DEPRECATED_IOS" "NS_ENUM_DEPRECATED_IOS" "NS_FORMAT_FUNCTION" "DEPRECATED_MSG_ATTRIBUTE"
++    "__deprecated_msg" "__deprecated_enum_msg" "NS_SWIFT_NAME" "NS_SWIFT_UNAVAILABLE"
++    "NS_EXTENSION_UNAVAILABLE_IOS" "NS_CLASS_AVAILABLE_IOS" "NS_CLASS_DEPRECATED_IOS" "__OSX_AVAILABLE_STARTING"
++    "NS_ROOT_CLASS" "NS_UNAVAILABLE" "NS_REQUIRES_NIL_TERMINATION" "CF_RETURNS_RETAINED"
++    "CF_RETURNS_NOT_RETAINED" "DEPRECATED_ATTRIBUTE" "UI_APPEARANCE_SELECTOR" "UNAVAILABLE_ATTRIBUTE"
++  ]) @attribute
++
++; Macros
++
++(type_qualifier
++  [
++    "_Complex"
++    "_Nonnull"
++    "_Nullable"
++    "_Nullable_result"
++    "_Null_unspecified"
++    "__autoreleasing"
++    "__block"
++    "__bridge"
++    "__bridge_retained"
++    "__bridge_transfer"
++    "__complex"
++    "__kindof"
++    "__nonnull"
++    "__nullable"
++    "__ptrauth_objc_class_ro"
++    "__ptrauth_objc_isa_pointer"
++    "__ptrauth_objc_super_pointer"
++    "__strong"
++    "__thread"
++    "__unsafe_unretained"
++    "__unused"
++    "__weak"
++  ]) @function.macro.builtin
++
++[ "__real" "__imag" ] @function.macro.builtin
++
++((call_expression function: (identifier) @function.macro)
++  (#eq? @function.macro "testassert"))
++
++; Types
++
++(class_declaration (identifier) @type)
++
++(class_interface "@interface" . (identifier) @type superclass: _? @type category: _? @namespace)
++
++(class_implementation "@implementation" . (identifier) @type superclass: _? @type category: _? @namespace)
++
++(protocol_forward_declaration (identifier) @type) ; @interface :(
++
++(protocol_reference_list (identifier) @type) ; ^
++
++[
++  "BOOL"
++  "IMP"
++  "SEL"
++  "Class"
++  "id"
++] @type.builtin
++
++; Constants
++
++(property_attribute (identifier) @constant "="?)
++
++[ "__asm" "__asm__" ] @constant.macro
++
++; Properties
++
++(property_implementation "@synthesize" (identifier) @property)
++
++((identifier) @property
++  (#has-ancestor? @property struct_declaration))
++
++; Parameters
++
++(method_parameter ":" @method (identifier) @parameter)
++
++(method_parameter declarator: (identifier) @parameter)
++
++(parameter_declaration
++  declarator: (function_declarator
++                declarator: (parenthesized_declarator
++                              (block_pointer_declarator
++                                declarator: (identifier) @parameter))))
++
++"..." @parameter.builtin
++
++; Operators
++
++[
++  "^"
++] @operator
++
++; Literals
++
++(platform) @string.special
++
++(version_number) @text.uri @number
++
++; Punctuation
++
++"@" @punctuation.special
++
++[ "<" ">" ] @punctuation.bracket
+diff --git a/crates/grammars/src/objc/imports.scm b/crates/grammars/src/objc/imports.scm
+new file mode 100644
+index 0000000..62c90c3
+--- /dev/null
++++ b/crates/grammars/src/objc/imports.scm
+@@ -0,0 +1,30 @@
++; The original Source/Author https://github.com/blacktop/zed-objc
++; MIT License
++
++; Copyright (c) 2025 blacktop
++
++; Permission is hereby granted, free of charge, to any person obtaining a copy
++; of this software and associated documentation files (the "Software"), to deal
++; in the Software without restriction, including without limitation the rights
++; to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++; copies of the Software, and to permit persons to whom the Software is
++; furnished to do so, subject to the following conditions:
++
++; The above copyright notice and this permission notice shall be included in all
++; copies or substantial portions of the Software.
++
++; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++; IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++; FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++; AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++; LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++; SOFTWARE.
++
++(preproc_include
++    path: [
++        (
++            (system_lib_string) @source @wildcard
++            (#strip! @source "[<>]"))
++        (string_literal (string_content) @source @wildcard)
++    ]) @import
+diff --git a/crates/grammars/src/objc/indents.scm b/crates/grammars/src/objc/indents.scm
+new file mode 100644
+index 0000000..a8c3029
+--- /dev/null
++++ b/crates/grammars/src/objc/indents.scm
+@@ -0,0 +1,42 @@
++; The original Source/Author https://github.com/blacktop/zed-objc
++; MIT License
++
++; Copyright (c) 2025 blacktop
++
++; Permission is hereby granted, free of charge, to any person obtaining a copy
++; of this software and associated documentation files (the "Software"), to deal
++; in the Software without restriction, including without limitation the rights
++; to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++; copies of the Software, and to permit persons to whom the Software is
++; furnished to do so, subject to the following conditions:
++
++; The above copyright notice and this permission notice shall be included in all
++; copies or substantial portions of the Software.
++
++; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++; IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++; FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++; AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++; LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++; SOFTWARE.
++
++[
++  (field_expression)
++  (assignment_expression)
++  (if_statement)
++  (for_statement)
++  (while_statement)
++  (do_statement)
++  (else_clause)
++] @indent
++
++(_ "{" "}" @end) @indent
++(_ "(" ")" @end) @indent
++
++(if_statement) @start.if
++(for_statement) @start.for
++(while_statement) @start.while
++(do_statement) @start.do
++(switch_statement) @start.switch
++(else_clause) @start.else
+diff --git a/crates/grammars/src/objc/injections.scm b/crates/grammars/src/objc/injections.scm
+new file mode 100644
+index 0000000..4dac9bd
+--- /dev/null
++++ b/crates/grammars/src/objc/injections.scm
+@@ -0,0 +1,34 @@
++; The original Source/Author https://github.com/blacktop/zed-objc
++; MIT License
++
++; Copyright (c) 2025 blacktop
++
++; Permission is hereby granted, free of charge, to any person obtaining a copy
++; of this software and associated documentation files (the "Software"), to deal
++; in the Software without restriction, including without limitation the rights
++; to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++; copies of the Software, and to permit persons to whom the Software is
++; furnished to do so, subject to the following conditions:
++
++; The above copyright notice and this permission notice shall be included in all
++; copies or substantial portions of the Software.
++
++; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++; IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++; FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++; AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++; LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++; SOFTWARE.
++
++((comment) @injection.content
++ (#set! injection.language "comment")
++)
++
++(preproc_def
++    value: (preproc_arg) @injection.content
++    (#set! injection.language "c"))
++
++(preproc_function_def
++    value: (preproc_arg) @injection.content
++    (#set! injection.language "c"))
+diff --git a/crates/grammars/src/objc/runnables.scm b/crates/grammars/src/objc/runnables.scm
+new file mode 100644
+index 0000000..5c75759
+--- /dev/null
++++ b/crates/grammars/src/objc/runnables.scm
+@@ -0,0 +1,33 @@
++; The original Source/Author https://github.com/blacktop/zed-objc
++; MIT License
++
++; Copyright (c) 2025 blacktop
++
++; Permission is hereby granted, free of charge, to any person obtaining a copy
++; of this software and associated documentation files (the "Software"), to deal
++; in the Software without restriction, including without limitation the rights
++; to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++; copies of the Software, and to permit persons to whom the Software is
++; furnished to do so, subject to the following conditions:
++
++; The above copyright notice and this permission notice shall be included in all
++; copies or substantial portions of the Software.
++
++; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++; IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++; FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++; AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++; LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++; SOFTWARE.
++
++; Tag the main function
++(
++  (function_definition
++    declarator: (function_declarator
++      declarator: (identifier) @run
++    )
++  ) @_c-main
++  (#eq? @run "main")
++  (#set! tag c-main)
++)
+diff --git a/crates/grammars/src/objc/textobjects.scm b/crates/grammars/src/objc/textobjects.scm
+new file mode 100644
+index 0000000..09da9d2
+--- /dev/null
++++ b/crates/grammars/src/objc/textobjects.scm
+@@ -0,0 +1,48 @@
++; The original Source/Author https://github.com/blacktop/zed-objc
++; MIT License
++
++; Copyright (c) 2025 blacktop
++
++; Permission is hereby granted, free of charge, to any person obtaining a copy
++; of this software and associated documentation files (the "Software"), to deal
++; in the Software without restriction, including without limitation the rights
++; to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++; copies of the Software, and to permit persons to whom the Software is
++; furnished to do so, subject to the following conditions:
++
++; The above copyright notice and this permission notice shall be included in all
++; copies or substantial portions of the Software.
++
++; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++; IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++; FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++; AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++; LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++; SOFTWARE.
++
++(declaration
++    declarator: (function_declarator)) @function.around
++
++(function_definition
++    body: (_
++        "{"
++        (_)* @function.inside
++        "}" )) @function.around
++
++(preproc_function_def
++    value: (_) @function.inside) @function.around
++
++(comment) @comment.around
++
++(struct_specifier
++    body: (_
++        "{"
++        (_)* @class.inside
++        "}")) @class.around
++
++(enum_specifier
++    body: (_
++        "{"
++        [(_) ","?]* @class.inside
++        "}")) @class.around
+diff --git a/crates/language/src/language.rs b/crates/language/src/language.rs
+index 2daca9b..fd169f0 100644
+--- a/crates/language/src/language.rs
++++ b/crates/language/src/language.rs
+@@ -133,20 +133,27 @@ pub(crate) fn to_settings_soft_wrap(value: language_core::SoftWrap) -> settings:
+ }
+ 
+ static QUERY_CURSORS: Mutex<Vec<QueryCursor>> = Mutex::new(vec![]);
+-static PARSERS: Mutex<Vec<Parser>> = Mutex::new(vec![]);
++static PARSERS: Mutex<Vec<(Parser, bool)>> = Mutex::new(vec![]);
++static HAS_WASM_GRAMMARS: std::sync::atomic::AtomicBool =
++    std::sync::atomic::AtomicBool::new(false);
++
++pub(crate) fn mark_wasm_grammars_registered() {
++    HAS_WASM_GRAMMARS.store(true, std::sync::atomic::Ordering::Release);
++}
+ 
+ #[ztracing::instrument(skip_all)]
+ pub fn with_parser<F, R>(func: F) -> R
+ where
+     F: FnOnce(&mut Parser) -> R,
+ {
+-    let mut parser = PARSERS.lock().pop().unwrap_or_else(|| {
+-        let mut parser = Parser::new();
++    let needs_wasm = HAS_WASM_GRAMMARS.load(std::sync::atomic::Ordering::Acquire);
++    let (mut parser, mut has_wasm) = PARSERS.lock().pop().unwrap_or_else(|| (Parser::new(), false));
++    if needs_wasm && !has_wasm {
+         parser
+             .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
+             .unwrap();
+-        parser
+-    });
++        has_wasm = true;
++    }
+     // Tree-sitter auto-resets the parser at the end of a successful parse,
+     // but the cancellation paths (progress callback returning `Break`,
+     // cancelled balancing) leave outstanding state on the parser. The next
+@@ -155,7 +162,7 @@ where
+     parser.reset();
+     parser.set_included_ranges(&[]).unwrap();
+     let result = func(&mut parser);
+-    PARSERS.lock().push(parser);
++    PARSERS.lock().push((parser, has_wasm));
+     result
+ }
+ 
+diff --git a/crates/language/src/language_registry.rs b/crates/language/src/language_registry.rs
+index 87deed1..1fc6e13 100644
+--- a/crates/language/src/language_registry.rs
++++ b/crates/language/src/language_registry.rs
+@@ -553,6 +553,7 @@ impl LanguageRegistry {
+         if grammars.is_empty() {
+             return;
+         }
++        crate::mark_wasm_grammars_registered();
+ 
+         let mut state = self.state.write();
+         for (name, path) in grammars {
+diff --git a/crates/languages/src/lib.rs b/crates/languages/src/lib.rs
+index a84d168..39697ae 100644
+--- a/crates/languages/src/lib.rs
++++ b/crates/languages/src/lib.rs
+@@ -55,7 +55,53 @@ pub static LANGUAGE_GIT_COMMIT: std::sync::LazyLock<Arc<Language>> =
+         ))
+     });
+ 
++const BUILT_IN_LANGUAGE_NAMES: &[&str] = &[
++    "bash",
++    "c",
++    "objc",
++    "cpp",
++    "css",
++    "diff",
++    "env",
++    "go",
++    "gomod",
++    "gowork",
++    "json",
++    "jsonc",
++    "markdown",
++    "markdown-inline",
++    "python",
++    "rust",
++    "tsx",
++    "typescript",
++    "javascript",
++    "jsdoc",
++    "regex",
++    "yaml",
++    "gitcommit",
++    "zed-keybind-context",
++];
++
++/// Pre-parses built-in language TOML configurations off the main thread so
++/// `init_with_preloaded` does not block startup.
++pub fn preload_builtin_configs() -> collections::HashMap<&'static str, LanguageConfig> {
++    BUILT_IN_LANGUAGE_NAMES
++        .iter()
++        .map(|&name| (name, load_config(name)))
++        .collect()
++}
++
+ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime, cx: &mut App) {
++    init_with_preloaded(languages, fs, node, None, cx);
++}
++
++pub fn init_with_preloaded(
++    languages: Arc<LanguageRegistry>,
++    fs: Arc<dyn Fs>,
++    node: NodeRuntime,
++    mut preloaded_configs: Option<collections::HashMap<&'static str, LanguageConfig>>,
++    cx: &mut App,
++) {
+     #[cfg(feature = "load-grammars")]
+     languages.register_native_grammars(grammars::native_grammars());
+ 
+@@ -100,6 +146,11 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
+             adapters: vec![c_lsp_adapter.clone()],
+             ..Default::default()
+         },
++        LanguageInfo {
++            name: "objc",
++            adapters: vec![c_lsp_adapter.clone()],
++            ..Default::default()
++        },
+         LanguageInfo {
+             name: "cpp",
+             adapters: vec![c_lsp_adapter],
+@@ -229,9 +280,13 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
+     ];
+ 
+     for registration in built_in_languages {
++        let preloaded = preloaded_configs
++            .as_mut()
++            .and_then(|configs| configs.remove(registration.name));
+         register_language(
+             &languages,
+             registration.name,
++            preloaded,
+             registration.adapters,
+             registration.context,
+             registration.toolchain,
+@@ -348,6 +403,7 @@ struct LanguageInfo {
+ fn register_language(
+     languages: &LanguageRegistry,
+     name: &'static str,
++    preloaded_config: Option<LanguageConfig>,
+     adapters: Vec<Arc<dyn LspAdapter>>,
+     context: Option<Arc<dyn ContextProvider>>,
+     toolchain: Option<Arc<dyn ToolchainLister>>,
+@@ -355,7 +411,7 @@ fn register_language(
+     semantic_token_rules: Option<SemanticTokenRules>,
+     cx: &mut App,
+ ) {
+-    let config = load_config(name);
++    let config = preloaded_config.unwrap_or_else(|| load_config(name));
+     if let Some(rules) = &semantic_token_rules {
+         SettingsStore::update_global(cx, |store, _| {
+             store.set_language_semantic_token_rules(config.name.0.clone(), rules.clone());
+-- 
+2.54.0 (Apple Git-157)
+

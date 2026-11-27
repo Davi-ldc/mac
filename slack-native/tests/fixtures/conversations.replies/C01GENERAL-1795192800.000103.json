@@ -1,0 +1,102 @@
+{
+  "ok": true,
+  "messages": [
+    {
+      "user": "U01ALEX",
+      "type": "message",
+      "ts": "1795192800.000103",
+      "client_msg_id": "9286f600-0000-4000-8000-0c6c349e1809",
+      "text": "Design review notes are up in the doc",
+      "team": "T0NORTHWND",
+      "blocks": [
+        {
+          "type": "rich_text",
+          "block_id": "b1272",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                {
+                  "type": "text",
+                  "text": "Design review notes are up in the doc"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "thread_ts": "1795192800.000103",
+      "reply_count": 2,
+      "reply_users_count": 2,
+      "latest_reply": "1795194600.000107",
+      "reply_users": [
+        "U03PRIYA",
+        "U02SAM"
+      ]
+    },
+    {
+      "user": "U03PRIYA",
+      "type": "message",
+      "ts": "1795193520.000106",
+      "client_msg_id": "f86a7e79-0000-4000-8000-0e718ae0d2ac",
+      "text": "Thanks! Left two comments on the empty states",
+      "team": "T0NORTHWND",
+      "blocks": [
+        {
+          "type": "rich_text",
+          "block_id": "b3276",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                {
+                  "type": "text",
+                  "text": "Thanks! Left two comments on the empty states"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "thread_ts": "1795192800.000103",
+      "parent_user_id": "U01ALEX"
+    },
+    {
+      "user": "U02SAM",
+      "type": "message",
+      "ts": "1795194600.000107",
+      "client_msg_id": "6397c8e9-0000-4000-8000-12b7a9e8077e",
+      "text": "Updated the mockups with both",
+      "team": "T0NORTHWND",
+      "blocks": [
+        {
+          "type": "rich_text",
+          "block_id": "b3447",
+          "elements": [
+            {
+              "type": "rich_text_section",
+              "elements": [
+                {
+                  "type": "text",
+                  "text": "Updated the mockups with both"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "thread_ts": "1795192800.000103",
+      "parent_user_id": "U01ALEX",
+      "reactions": [
+        {
+          "name": "white_check_mark",
+          "users": [
+            "U01ALEX"
+          ],
+          "count": 1
+        }
+      ]
+    }
+  ],
+  "has_more": false
+}

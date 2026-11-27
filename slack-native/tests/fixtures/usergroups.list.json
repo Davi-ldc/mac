@@ -1,0 +1,14 @@
+{
+  "ok": true,
+  "usergroups": [
+    {
+      "id": "S01DESIGNERS",
+      "team_id": "T0NORTHWND",
+      "is_usergroup": true,
+      "name": "Design team",
+      "description": "Everyone who reviews designs",
+      "handle": "design-team",
+      "date_delete": 0
+    }
+  ]
+}

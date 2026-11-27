@@ -1,0 +1,19 @@
+# Ghostty configuration — managed by ~/Desktop/mac/shell.
+
+# Wrap interactive zsh in ttyhints so command output feeds zsh-autosuggestions.
+# install.sh substitutes __HOME__ with $HOME when installing.
+command = direct:__HOME__/.local/bin/ttyhints --login /bin/zsh
+
+# Look & feel
+theme = Catppuccin Mocha
+font-size = 14
+window-padding-x = 14
+window-padding-y = 10
+window-padding-balance = true
+background-opacity = 1
+background-blur = 20
+macos-titlebar-style = tabs
+cursor-style = bar
+mouse-hide-while-typing = true
+confirm-close-surface = false
+undo-timeout = 1h

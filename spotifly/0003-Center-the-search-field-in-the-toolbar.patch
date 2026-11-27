@@ -1,0 +1,33 @@
+From 8b534a3fc45247a038bad82a10d714a583ff26de Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Sun, 22 Nov 2026 12:37:48 -0300
+Subject: [PATCH 3/4] Center the search field in the toolbar
+
+---
+ Spotifly/Views/LoggedInView.swift | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/Spotifly/Views/LoggedInView.swift b/Spotifly/Views/LoggedInView.swift
+index 855b018..ebecca5 100644
+--- a/Spotifly/Views/LoggedInView.swift
++++ b/Spotifly/Views/LoggedInView.swift
+@@ -67,9 +67,14 @@ struct LoggedInView: View {
+                 .navigationSplitViewStyle(.automatic)
+                 // Always-visible search field, attached to the NavigationSplitView
+                 // itself — attaching it to an inner view inside the detail column
+-                // does not surface the field in the window toolbar.
++                // does not surface the field in the window toolbar. Centered in the
++                // toolbar, as in Spotify's own app.
+                 // On Favorites the field filters the list, and Return searches nothing.
+-                .searchable(text: $searchText, prompt: Text(isFilteringFavorites ? "favorites.filter_prompt" : "search.prompt"))
++                .searchable(
++                    text: $searchText,
++                    placement: .toolbarPrincipal,
++                    prompt: Text(isFilteringFavorites ? "favorites.filter_prompt" : "search.prompt"),
++                )
+                 .onSubmit(of: .search) {
+                     if !isFilteringFavorites {
+                         performSearch()
+-- 
+2.54.0 (Apple Git-157)
+

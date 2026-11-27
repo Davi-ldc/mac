@@ -1,0 +1,377 @@
+From f2043ad10c3966d270593568a25d7db134727396 Mon Sep 17 00:00:00 2001
+From: patched <patched@local>
+Date: Thu, 26 Nov 2026 22:27:00 -0300
+Subject: [PATCH 16/19] Decode each image once, at the size it is drawn, for
+ all the views showing it
+
+---
+ Spotifly/Views/Components/Artwork.swift       |   2 +-
+ .../Views/Components/RetryingAsyncImage.swift |  86 +++--------
+ Spotifly/Views/Components/SharedImage.swift   | 146 ++++++++++++++++++
+ Spotifly/Views/NowPlayingBarView.swift        |  51 ++----
+ Spotifly/Views/SidebarView.swift              |   2 +-
+ 5 files changed, 189 insertions(+), 98 deletions(-)
+ create mode 100644 Spotifly/Views/Components/SharedImage.swift
+
+diff --git a/Spotifly/Views/Components/Artwork.swift b/Spotifly/Views/Components/Artwork.swift
+index 9b2bcd8..55ad91c 100644
+--- a/Spotifly/Views/Components/Artwork.swift
++++ b/Spotifly/Views/Components/Artwork.swift
+@@ -29,7 +29,7 @@ struct Artwork: View {
+ 
+     var body: some View {
+         if let url = images.url(for: size, scale: displayScale) {
+-            RetryingAsyncImage(url: url) { phase in
++            RetryingAsyncImage(url: url, points: size) { phase in
+                 switch phase {
+                 case .empty:
+                     // Offline, the request waits for a connection that is gone, and nothing loads
+diff --git a/Spotifly/Views/Components/RetryingAsyncImage.swift b/Spotifly/Views/Components/RetryingAsyncImage.swift
+index e3a8178..9326d81 100644
+--- a/Spotifly/Views/Components/RetryingAsyncImage.swift
++++ b/Spotifly/Views/Components/RetryingAsyncImage.swift
+@@ -2,79 +2,41 @@
+ //  RetryingAsyncImage.swift
+ //  Spotifly
+ //
+-//  An AsyncImage that asks again when the network comes back, and a few times after it failed.
++//  An image the size it is drawn, which asks again when the network comes back, and a few times
++//  after it failed.
+ //
+ 
+ import SwiftUI
+ 
+-/// `AsyncImage`, loaded again when the network returns if its image has not arrived, and a few
+-/// times after a failure the network never noticed.
++/// The image at `url`, decoded at the size it is drawn and shared with every view showing the same
++/// one (`SharedImage`), in `AsyncImage`'s phases.
+ ///
+-/// `AsyncImage` loads its url once for as long as the view keeps its identity. Artwork asked
+-/// for while the network was down stayed a spinner, its request waiting on a connection that
+-/// had gone, or a placeholder once it failed, until the view happened to be rebuilt: an album's
+-/// Try again brought back its tracks, and its cover went on spinning. So every artwork in the
+-/// app goes through this, which gives the `AsyncImage` a new identity on each of
+-/// `NetworkMonitor`'s returns. An image that has arrived keeps it, so a return does not make
+-/// the artwork on screen flash.
+-///
+-/// **A failure while the network stays up**, a CDN's 5xx or a captive portal, counts no return.
+-/// So a failed image is also asked for again after `retryPauses`, and then left, until the
+-/// network returns or its url changes: one the CDN answers 404 for would fail every time.
++/// Artwork asked for while the network was down would otherwise stay a spinner, or a placeholder
++/// once it failed, until the view happened to be rebuilt: an album's Try again brought back its
++/// tracks, and its cover went on spinning. So an image that has not arrived is asked for again on
++/// each of `NetworkMonitor`'s returns, and a failed one also after `SharedImage.retryPauses`, for
++/// the failures while the network stays up, a CDN's 5xx or a captive portal.
+ struct RetryingAsyncImage<Content: View>: View {
+     let url: URL
++    /// The side it is drawn at, which it is decoded at.
++    let points: CGFloat
+     @ViewBuilder let content: (AsyncImagePhase) -> Content
+ 
+-    /// The pauses before a failed image is asked for again, one per retry.
+-    static var retryPauses: [Duration] {
+-        [.seconds(5), .seconds(30), .seconds(180)]
+-    }
+-
+-    private enum Status {
+-        case loading, loaded, failed
+-    }
+-
+-    @State private var attempt = 0
+-    @State private var status = Status.loading
+-    /// The retries after a failure so far, for this url since the network last returned.
+-    @State private var retries = 0
++    @Environment(\.displayScale) private var displayScale
++    /// Held while the view is on screen, which is what keeps the image.
++    @State private var image: SharedImage?
+ 
+     var body: some View {
+-        AsyncImage(url: url) { phase in
+-            content(phase)
+-                // Follows the phase, a new url's included, which starts over empty. A failure
+-                // with no network at all waits for its return.
+-                .onChange(of: Self.status(of: phase), initial: true) { _, now in
+-                    status = now
+-                }
+-        }
+-        .id(attempt)
+-        .retryingWhenNetworkReturns(if: status != .loaded) {
+-            retries = 0
+-            attempt += 1
+-        }
+-        .task(id: status) {
+-            guard status == .failed, retries < Self.retryPauses.count else { return }
+-            // Cancelled when a return or a new url starts the image over, or the view goes.
+-            do {
+-                try await Task.sleep(for: Self.retryPauses[retries])
+-            } catch {
+-                return
++        let key = SharedImage.Key(url: url, points: points, scale: displayScale)
++        // One that another view shows draws in this view's first frame, not a spinner first.
++        let shown = image?.key == key ? image : SharedImage.existing(key)
++        content(shown?.phase ?? .empty)
++            .onChange(of: key, initial: true) {
++                image = SharedImage.of(key)
++                image?.loadIfNeeded()
++            }
++            .retryingWhenNetworkReturns(if: shown?.image == nil) {
++                image?.networkReturned()
+             }
+-            retries += 1
+-            attempt += 1
+-        }
+-        .onChange(of: url) { retries = 0 }
+-    }
+-
+-    /// An image with no network at all counts as loading: the network's return asks again.
+-    private static func status(of phase: AsyncImagePhase) -> Status {
+-        if phase.image != nil {
+-            return .loaded
+-        }
+-        guard let error = phase.error, (error as? URLError)?.code != .notConnectedToInternet else {
+-            return .loading
+-        }
+-        return .failed
+     }
+ }
+diff --git a/Spotifly/Views/Components/SharedImage.swift b/Spotifly/Views/Components/SharedImage.swift
+new file mode 100644
+index 0000000..b8fff79
+--- /dev/null
++++ b/Spotifly/Views/Components/SharedImage.swift
+@@ -0,0 +1,146 @@
++//
++//  SharedImage.swift
++//  Spotifly
++//
++//  One image at one size, fetched and decoded once for everything that shows it.
++//
++
++import ImageIO
++import SwiftUI
++
++/// An image decoded at the size it is drawn, shared by every view showing it.
++///
++/// Not a cache: the registry holds it weakly, so it lives exactly as long as a view on screen
++/// holds it. The next to ask after that fetches it again, usually from the system's
++/// HTTP cache.
++@Observable
++final class SharedImage {
++    nonisolated struct Key: Hashable {
++        let url: URL
++        let pixels: Int
++
++        init(url: URL, points: CGFloat, scale: CGFloat) {
++            self.url = url
++            pixels = Int((points * scale).rounded(.up))
++        }
++    }
++
++    private final class Entry {
++        weak var image: SharedImage?
++
++        init(_ image: SharedImage) {
++            self.image = image
++        }
++    }
++
++    private static var shown: [Key: Entry] = [:]
++
++    /// The pauses before a failed image is asked for again, one per retry. Then it is left until
++    /// the network returns: one the CDN answers 404 for would fail every time.
++    static let retryPauses: [Duration] = [.seconds(5), .seconds(30), .seconds(180)]
++
++    let key: Key
++    private(set) var image: CGImage?
++    private(set) var failed = false
++    @ObservationIgnored private var load: Task<Void, Never>?
++    @ObservationIgnored private var answeredReturn = NetworkMonitor.shared.returns
++
++    /// The one already shown, if any.
++    static func existing(_ key: Key) -> SharedImage? {
++        shown[key]?.image
++    }
++
++    static func of(_ key: Key) -> SharedImage {
++        if let image = existing(key) {
++            return image
++        }
++        let image = SharedImage(key: key)
++        shown[key] = Entry(image)
++        return image
++    }
++
++    private init(key: Key) {
++        self.key = key
++    }
++
++    isolated deinit {
++        load?.cancel()
++        Self.forget(key)
++    }
++
++    /// Unless another has taken its place. A function of its own: Swift 6.4 crashes compiling a
++    /// deinit that reaches into the registry itself with code coverage on, as Xcode's tests build.
++    private static func forget(_ key: Key) {
++        if shown[key]?.image == nil {
++            shown[key] = nil
++        }
++    }
++
++    /// As `AsyncImage` gives it, which the views showing it switch over.
++    var phase: AsyncImagePhase {
++        if let image {
++            return .success(Image(decorative: image, scale: 1))
++        }
++        return failed ? .failure(URLError(.cannotDecodeContentData)) : .empty
++    }
++
++    func loadIfNeeded() {
++        if image == nil, load == nil {
++            start()
++        }
++    }
++
++    /// Asks again at once, once per return of the network however many views show it.
++    func networkReturned() {
++        let returns = NetworkMonitor.shared.returns
++        guard image == nil, returns != answeredReturn else { return }
++        answeredReturn = returns
++        load?.cancel()
++        start()
++    }
++
++    /// Holds itself weakly, so an image nobody shows any more is freed, and its load cancelled,
++    /// mid-request or mid-pause.
++    private func start() {
++        failed = false
++        load = Task { [weak self, key] in
++            for pause in [.zero] + Self.retryPauses {
++                if pause > .zero {
++                    guard (try? await Task.sleep(for: pause)) != nil else { return }
++                }
++                do {
++                    let image = try await Self.fetch(key)
++                    guard !Task.isCancelled, let self else { return }
++                    self.image = image
++                    self.load = nil
++                    return
++                } catch {
++                    guard !Task.isCancelled, let self else { return }
++                    // With no network at all it is still loading, and the network's return asks.
++                    if (error as? URLError)?.code == .notConnectedToInternet {
++                        self.load = nil
++                        return
++                    }
++                    self.failed = true
++                }
++            }
++            self?.load = nil
++        }
++    }
++
++    /// Off the main actor, at most `pixels` a side: a cover comes at up to 640, and a 32-point row
++    /// draws 64.
++    @concurrent nonisolated private static func fetch(_ key: Key) async throws -> CGImage {
++        let (data, _) = try await URLSession.shared.data(from: key.url)
++        let options: [CFString: Any] = [
++            kCGImageSourceCreateThumbnailFromImageAlways: true,
++            kCGImageSourceCreateThumbnailWithTransform: true,
++            kCGImageSourceShouldCacheImmediately: true,
++            kCGImageSourceThumbnailMaxPixelSize: key.pixels,
++        ]
++        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
++              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
++        else { throw URLError(.cannotDecodeContentData) }
++        return image
++    }
++}
+diff --git a/Spotifly/Views/NowPlayingBarView.swift b/Spotifly/Views/NowPlayingBarView.swift
+index e331d72..5b1e1fe 100644
+--- a/Spotifly/Views/NowPlayingBarView.swift
++++ b/Spotifly/Views/NowPlayingBarView.swift
+@@ -17,9 +17,7 @@ struct NowPlayingBarView: View {
+     @Environment(PlayerModel.self) private var player
+     @Environment(WindowState.self) private var windowState
+ 
+-    @State private var cachedAlbumArtImage: Image?
+     private let network = NetworkMonitor.shared
+-    @State private var cachedAlbumArtURL: String?
+     @State private var showNewPlaylistDialog = false
+     @State private var showPlaylistAddedSuccess = false
+     /// What the bar's own width leaves room for. A tier rather than the width, so a resize
+@@ -141,41 +139,26 @@ struct NowPlayingBarView: View {
+     @ViewBuilder
+     private func albumArt(size: CGFloat) -> some View {
+         if let url = playbackViewModel.currentTrack?.images.url(for: size, scale: displayScale) {
+-            let urlString = url.absoluteString
+-            if let cachedImage = cachedAlbumArtImage, cachedAlbumArtURL == urlString {
+-                // Use cached image
+-                cachedImage
+-                    .resizable()
+-                    .aspectRatio(contentMode: .fill)
+-                    .frame(width: size, height: size)
+-                    .clipShape(.rect(cornerRadius: 6))
+-            } else {
+-                // Load new image
+-                RetryingAsyncImage(url: url) { phase in
+-                    switch phase {
+-                    case .empty:
+-                        // Offline, nothing loads until the network returns; see `Artwork`.
+-                        if network.isOnline {
+-                            ProgressView()
+-                                .frame(width: size, height: size)
+-                        } else {
+-                            placeholderAlbumArt(size: size)
+-                        }
+-                    case let .success(image):
+-                        image
+-                            .resizable()
+-                            .aspectRatio(contentMode: .fill)
++            RetryingAsyncImage(url: url, points: size) { phase in
++                switch phase {
++                case .empty:
++                    // Offline, nothing loads until the network returns; see `Artwork`.
++                    if network.isOnline {
++                        ProgressView()
+                             .frame(width: size, height: size)
+-                            .clipShape(.rect(cornerRadius: 6))
+-                            .onAppear {
+-                                cachedAlbumArtImage = image
+-                                cachedAlbumArtURL = urlString
+-                            }
+-                    case .failure:
++                    } else {
+                         placeholderAlbumArt(size: size)
+-                    @unknown default:
+-                        EmptyView()
+                     }
++                case let .success(image):
++                    image
++                        .resizable()
++                        .aspectRatio(contentMode: .fill)
++                        .frame(width: size, height: size)
++                        .clipShape(.rect(cornerRadius: 6))
++                case .failure:
++                    placeholderAlbumArt(size: size)
++                @unknown default:
++                    EmptyView()
+                 }
+             }
+         } else {
+diff --git a/Spotifly/Views/SidebarView.swift b/Spotifly/Views/SidebarView.swift
+index 6ee81b2..5542ac7 100644
+--- a/Spotifly/Views/SidebarView.swift
++++ b/Spotifly/Views/SidebarView.swift
+@@ -191,7 +191,7 @@ struct ProfileAvatarView: View {
+ 
+     var body: some View {
+         if let imageURL = userProfile?.imageURL {
+-            RetryingAsyncImage(url: imageURL) { phase in
++            RetryingAsyncImage(url: imageURL, points: size) { phase in
+                 if let image = phase.image {
+                     image
+                         .resizable()
+-- 
+2.54.0 (Apple Git-157)
+

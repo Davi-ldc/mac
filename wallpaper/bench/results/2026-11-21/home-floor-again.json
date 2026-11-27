@@ -1,0 +1,19 @@
+{
+ "label": "home-floor-again",
+ "seconds": 45.0,
+ "n": 225,
+ "ws_cpu_pct": 33.90290430068985,
+ "sys_power": 6.195653248888888,
+ "sys_power_sd": 1.205581868317204,
+ "cpu_power": 0.5333663333333333,
+ "cpu_power_sd": 0.4052899347090892,
+ "gpu_power": 0.57504948,
+ "gpu_power_sd": 0.47914108606060285,
+ "display_power": 2.427085751111111,
+ "display_power_sd": 0.2166045981680194,
+ "dcs_power": 0.1335468088888889,
+ "dcs_power_sd": 0.10858116277277528,
+ "ram_power": 0.20362625333333334,
+ "ram_power_sd": 0.13460539314677566,
+ "sys_power_median": 6.306263
+}

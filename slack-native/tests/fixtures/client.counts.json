@@ -1,0 +1,52 @@
+{
+  "ok": true,
+  "channels": [
+    {
+      "id": "C01GENERAL",
+      "last_read": "1795192800.000103",
+      "latest": "1795442100.000105",
+      "updated": "1795442100.000105",
+      "history_invalid": "1795442100.000105",
+      "mention_count": 1,
+      "has_unreads": true
+    },
+    {
+      "id": "C02RANDOM",
+      "last_read": "1795294800.000110",
+      "latest": "1795294800.000110",
+      "updated": "1795294800.000110",
+      "history_invalid": "1795294800.000110",
+      "mention_count": 0,
+      "has_unreads": false
+    }
+  ],
+  "mpims": [
+    {
+      "id": "G07MPDM",
+      "last_read": "0000000000.000000",
+      "latest": "1795111200.000111",
+      "updated": "1795111200.000111",
+      "history_invalid": "1795111200.000111",
+      "mention_count": 0,
+      "has_unreads": true
+    }
+  ],
+  "ims": [
+    {
+      "id": "D05SAM",
+      "last_read": "1795389600.000108",
+      "latest": "1795389840.000109",
+      "updated": "1795389840.000109",
+      "history_invalid": "1795389840.000109",
+      "mention_count": 1,
+      "has_unreads": true
+    }
+  ],
+  "channel_badges": {
+    "channels": 1,
+    "dms": 1,
+    "app_dms": 0,
+    "thread_mentions": 0,
+    "thread_unreads": 0
+  }
+}
